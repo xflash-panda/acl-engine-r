@@ -12,6 +12,9 @@ use crate::matcher::{AllMatcher, CidrMatcher, DomainMatcher, HostMatcher, IpMatc
 use crate::parser::parse_proto_port;
 use crate::types::{CacheKey, HostInfo, MatchResult, Protocol, TextRule};
 
+/// Cache value type: outbound and optional hijacked IP
+type CacheValue<O> = Option<(O, Option<IpAddr>)>;
+
 /// A compiled rule ready for matching
 pub struct CompiledRule<O> {
     /// The outbound for this rule
@@ -49,7 +52,7 @@ impl<O> CompiledRule<O> {
 /// Compiled rule set with LRU caching
 pub struct CompiledRuleSet<O: Clone> {
     rules: Vec<CompiledRule<O>>,
-    cache: Mutex<LruCache<CacheKey, Option<(O, Option<IpAddr>)>>>,
+    cache: Mutex<LruCache<CacheKey, CacheValue<O>>>,
 }
 
 impl<O: Clone> CompiledRuleSet<O> {

@@ -13,6 +13,9 @@ use crate::matcher::{DomainEntry, GeoIpMatcher, GeoSiteMatcher};
 use super::format::{GeoIpFormat, GeoSiteFormat};
 use super::{dat, metadb, mmdb, singsite};
 
+/// Logger callback type for logging geo data updates
+type LoggerCallback = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Default update interval: 7 days
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -180,7 +183,7 @@ pub struct AutoGeoLoader {
     pub update_interval: Duration,
 
     // Logger
-    pub logger: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub logger: Option<LoggerCallback>,
 
     // Cached data
     geoip_data: RwLock<Option<HashMap<String, Vec<IpNet>>>>,
