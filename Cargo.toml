@@ -13,7 +13,7 @@ categories = ["network-programming"]
 ipnet = "2.9"
 
 # LRU cache
-lru = "0.12"
+lru = "0.16"
 
 # Regex for rule parsing and domain matching
 regex = "1.10"
