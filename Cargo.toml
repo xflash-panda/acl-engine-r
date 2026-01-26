@@ -19,7 +19,7 @@ lru = "0.12"
 regex = "1.10"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 
 # MaxMind GeoIP database
 maxminddb = "0.24"
