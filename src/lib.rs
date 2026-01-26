@@ -12,8 +12,8 @@
 //!
 //! ```rust
 //! use std::collections::HashMap;
-//! use acl_engine::{parse_rules, compile, Protocol, HostInfo};
-//! use acl_engine::geo::NilGeoLoader;
+//! use acl_engine_r::{parse_rules, compile, Protocol, HostInfo};
+//! use acl_engine_r::geo::NilGeoLoader;
 //!
 //! let rules_text = "
 //! direct(192.168.0.0/16)  # Private networks

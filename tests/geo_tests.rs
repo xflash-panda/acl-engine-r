@@ -3,10 +3,10 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use acl_engine::geo::{dat, mmdb, singsite, GeoIpFormat, GeoSiteFormat};
-use acl_engine::geo::{FileGeoLoader, GeoLoader};
-use acl_engine::matcher::{GeoIpMatcher, GeoSiteMatcher, HostMatcher};
-use acl_engine::HostInfo;
+use acl_engine_r::geo::{dat, mmdb, singsite, GeoIpFormat, GeoSiteFormat};
+use acl_engine_r::geo::{FileGeoLoader, GeoLoader};
+use acl_engine_r::matcher::{GeoIpMatcher, GeoSiteMatcher, HostMatcher};
+use acl_engine_r::HostInfo;
 
 fn testdata_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -151,7 +151,7 @@ mod geoip_mmdb_tests {
 
 mod geoip_metadb_tests {
     use super::*;
-    use acl_engine::geo::metadb;
+    use acl_engine_r::geo::metadb;
 
     #[test]
     fn test_metadb_verify() {
@@ -520,8 +520,8 @@ mod format_detection_tests {
 
 mod router_tests {
     use super::*;
-    use acl_engine::resolver::NilResolver;
-    use acl_engine::{Direct, OutboundEntry, Reject, Router, RouterOptions};
+    use acl_engine_r::resolver::NilResolver;
+    use acl_engine_r::{Direct, OutboundEntry, Reject, Router, RouterOptions};
     use std::sync::Arc;
 
     #[test]
@@ -722,7 +722,7 @@ mod router_tests {
 
 mod compiled_ruleset_tests {
     use super::*;
-    use acl_engine::{compile, parse_rules, Protocol};
+    use acl_engine_r::{compile, parse_rules, Protocol};
 
     #[test]
     fn test_compiled_ruleset_with_real_geoip() {
