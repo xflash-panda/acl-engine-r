@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package geodat;
+
+// Domain for GeoSite matching
+message Domain {
+    // Domain matching type
+    enum Type {
+        Plain = 0;      // Substring match
+        Regex = 1;      // Regex pattern match
+        RootDomain = 2; // Domain suffix match
+        Full = 3;       // Exact domain match
+    }
+
+    // Domain attribute (for filtering)
+    message Attribute {
+        string key = 1;
+
+        oneof typed_value {
+            bool bool_value = 2;
+            int64 int_value = 3;
+        }
+    }
+
+    Type type = 1;
+    string value = 2;
+    repeated Attribute attribute = 3;
+}
+
+// CIDR block for GeoIP matching
+message CIDR {
+    bytes ip = 1;       // 4 bytes for IPv4, 16 bytes for IPv6
+    uint32 prefix = 2;  // CIDR prefix length
+}
+
+// GeoIP entry for a country
+message GeoIP {
+    string country_code = 1;
+    repeated CIDR cidr = 2;
+    bool inverse_match = 3;
+    bytes resource_hash = 4;
+    string code = 5;
+}
+
+// GeoSite entry for a site/category
+message GeoSite {
+    string country_code = 1;
+    repeated Domain domain = 2;
+    bytes resource_hash = 3;
+    string code = 4;
+}
+
+// List of GeoIP entries
+message GeoIPList {
+    repeated GeoIP entry = 1;
+}
+
+// List of GeoSite entries
+message GeoSiteList {
+    repeated GeoSite entry = 1;
+}

@@ -1,0 +1,19 @@
+warning: failed to auto-clean cache data
+
+failed to clean entries from the global cache
+
+Caused by:
+  failed to remove file `/Users/alex/.cargo/registry/src/index.crates.io-6f17d22bba15001f/utf8parse-0.2.2/Cargo.toml`
+
+Caused by:
+  Permission denied (os error 13)
+   0.168070541s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint: dependency on `build_script_build` is newer than we are 1769263311.219331185s > 1769245464.552800543s "/Users/alex/code/go/xflash-panda/acl-engine-r"
+   0.168423250s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint: fingerprint dirty for acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("acl_engine", ["lib"], "/Users/alex/code/go/xflash-panda/acl-engine-r/src/lib.rs", Edition2021) }
+   0.168457583s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint:     dirty: UnitDependencyInfoChanged { old_name: "build_script_build", old_fingerprint: 13836508207911777049, new_name: "build_script_build", new_fingerprint: 13701456462020588168 }
+   0.185991500s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint: dependency on `build_script_build` is newer than we are 1769263311.219331185s > 1769245464.552838918s "/Users/alex/code/go/xflash-panda/acl-engine-r"
+   0.186288666s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint: fingerprint dirty for acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("acl_engine", ["lib"], "/Users/alex/code/go/xflash-panda/acl-engine-r/src/lib.rs", Edition2021) }
+   0.186300791s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="acl_engine"}: cargo::core::compiler::fingerprint:     dirty: UnitDependencyInfoChanged { old_name: "build_script_build", old_fingerprint: 13836508207911777049, new_name: "build_script_build", new_fingerprint: 13701456462020588168 }
+   0.187328000s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="geo_tests"}: cargo::core::compiler::fingerprint: fingerprint dirty for acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r)/Check { test: true }/TargetInner { kind: "test", name: "geo_tests", benched: false, ..: with_path("/Users/alex/code/go/xflash-panda/acl-engine-r/tests/geo_tests.rs", Edition2021) }
+   0.187337666s  INFO prepare_target{force=false package_id=acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r) target="geo_tests"}: cargo::core::compiler::fingerprint:     dirty: UnitDependencyInfoChanged { old_name: "acl_engine", old_fingerprint: 12716042386513440842, new_name: "acl_engine", new_fingerprint: 17432928877948571893 }
+    Checking acl-engine v0.1.0 (/Users/alex/code/go/xflash-panda/acl-engine-r)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.75s

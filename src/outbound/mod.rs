@@ -1,0 +1,282 @@
+//! Outbound connection implementations.
+//!
+//! This module provides various outbound connection types:
+//! - `Direct`: Direct connection with dual-stack support
+//! - `Reject`: Reject all connections
+//! - `Socks5`: SOCKS5 proxy connection
+//! - `Http`: HTTP/HTTPS proxy connection (CONNECT method)
+
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::time::Duration;
+
+use crate::error::{AclError, Result};
+
+mod direct;
+mod http;
+mod reject;
+mod socks5;
+
+pub use direct::{Direct, DirectMode, DirectOptions};
+pub use http::Http;
+pub use reject::Reject;
+pub use socks5::Socks5;
+
+/// Default dialer timeout
+pub const DEFAULT_DIALER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Network address with optional DNS resolution info.
+#[derive(Debug, Clone)]
+pub struct Addr {
+    /// Hostname or IP address
+    pub host: String,
+    /// Port number
+    pub port: u16,
+    /// Optional DNS resolution result
+    pub resolve_info: Option<ResolveInfo>,
+}
+
+impl Addr {
+    /// Create a new Addr
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            resolve_info: None,
+        }
+    }
+
+    /// Create a new Addr with resolve info
+    pub fn with_resolve_info(mut self, info: ResolveInfo) -> Self {
+        self.resolve_info = Some(info);
+        self
+    }
+
+    /// Get the address string in host:port format
+    pub fn addr_string(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Get the network address for dialing.
+    /// If ResolveInfo contains an IPv4 address, it returns that.
+    /// Otherwise, if it contains an IPv6 address, it returns that.
+    /// If no resolved address is available, it falls back to Host.
+    pub fn network_addr(&self) -> String {
+        if let Some(ref info) = self.resolve_info {
+            if let Some(ipv4) = info.ipv4 {
+                return SocketAddr::new(IpAddr::V4(ipv4), self.port).to_string();
+            }
+            if let Some(ipv6) = info.ipv6 {
+                return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
+            }
+        }
+        self.addr_string()
+    }
+}
+
+impl std::fmt::Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+/// DNS resolution results.
+#[derive(Debug, Clone, Default)]
+pub struct ResolveInfo {
+    /// Resolved IPv4 address, if any
+    pub ipv4: Option<std::net::Ipv4Addr>,
+    /// Resolved IPv6 address, if any
+    pub ipv6: Option<std::net::Ipv6Addr>,
+    /// Error message that occurred during resolution, if any
+    pub error: Option<String>,
+}
+
+impl ResolveInfo {
+    /// Create a new empty ResolveInfo
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create ResolveInfo from IPv4 address
+    pub fn from_ipv4(ipv4: std::net::Ipv4Addr) -> Self {
+        Self {
+            ipv4: Some(ipv4),
+            ipv6: None,
+            error: None,
+        }
+    }
+
+    /// Create ResolveInfo from IPv6 address
+    pub fn from_ipv6(ipv6: std::net::Ipv6Addr) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: Some(ipv6),
+            error: None,
+        }
+    }
+
+    /// Create ResolveInfo with error
+    pub fn from_error(error: impl Into<String>) -> Self {
+        Self {
+            ipv4: None,
+            ipv6: None,
+            error: Some(error.into()),
+        }
+    }
+
+    /// Check if any address is available
+    pub fn has_address(&self) -> bool {
+        self.ipv4.is_some() || self.ipv6.is_some()
+    }
+}
+
+/// Outbound connection interface.
+pub trait Outbound: Send + Sync {
+    /// Establish a TCP connection to the given address.
+    fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>>;
+
+    /// Create a UDP connection for the given address.
+    fn dial_udp(&self, addr: &mut Addr) -> Result<Box<dyn UdpConn>>;
+}
+
+/// TCP connection interface.
+pub trait TcpConn: Read + Write + Send + Sync {
+    /// Get the local address
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Get the peer address
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Set read timeout
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+
+    /// Set write timeout
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+
+    /// Shutdown the connection
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>;
+}
+
+/// Standard TcpStream wrapper implementing TcpConn
+pub struct StdTcpConn {
+    inner: TcpStream,
+}
+
+impl StdTcpConn {
+    pub fn new(stream: TcpStream) -> Self {
+        Self { inner: stream }
+    }
+
+    pub fn into_inner(self) -> TcpStream {
+        self.inner
+    }
+}
+
+impl Read for StdTcpConn {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for StdTcpConn {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl TcpConn for StdTcpConn {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.peer_addr()
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(dur)
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(dur)
+    }
+
+    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        self.inner.shutdown(how)
+    }
+}
+
+/// UDP connection interface.
+pub trait UdpConn: Send + Sync {
+    /// Read from the UDP connection
+    fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)>;
+
+    /// Write to the UDP connection
+    fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
+
+    /// Close the connection
+    fn close(&self) -> Result<()>;
+}
+
+/// Standard UdpSocket wrapper implementing UdpConn
+pub struct StdUdpConn {
+    inner: UdpSocket,
+}
+
+impl StdUdpConn {
+    pub fn new(socket: UdpSocket) -> Self {
+        Self { inner: socket }
+    }
+
+    pub fn into_inner(self) -> UdpSocket {
+        self.inner
+    }
+}
+
+impl UdpConn for StdUdpConn {
+    fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
+        let (n, addr) = self
+            .inner
+            .recv_from(buf)
+            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
+    }
+
+    fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+        let socket_addr: SocketAddr = addr
+            .network_addr()
+            .parse()
+            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
+        self.inner
+            .send_to(buf, socket_addr)
+            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+    }
+
+    fn close(&self) -> Result<()> {
+        // UdpSocket doesn't have explicit close, it closes on drop
+        Ok(())
+    }
+}
+
+/// Split IP addresses into IPv4 and IPv6
+pub fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) if ipv4.is_none() => ipv4 = Some(*v4),
+            IpAddr::V6(v6) if ipv6.is_none() => ipv6 = Some(*v6),
+            _ => {}
+        }
+        if ipv4.is_some() && ipv6.is_some() {
+            break;
+        }
+    }
+
+    (ipv4, ipv6)
+}
