@@ -47,7 +47,7 @@ socket2 = "0.6"
 base64 = "0.22"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [dev-dependencies]
 # For testing
