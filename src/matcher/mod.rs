@@ -1,9 +1,11 @@
-mod domain;
+pub mod domain;
+mod domain_simple;
 mod geoip;
 mod geosite;
 mod ip;
 
-pub use domain::DomainMatcher;
+pub use domain::SuccinctMatcher;
+pub use domain_simple::DomainMatcher;
 pub use geoip::GeoIpMatcher;
 pub use geosite::{DomainEntry, DomainType, GeoSiteMatcher};
 pub use ip::{CidrMatcher, IpMatcher};

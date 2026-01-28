@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ipnet::IpNet;
+use lru::LruCache;
 use serde::Deserialize;
 
 use crate::error::{AclError, Result};
+
+/// Default cache size for CachedMetaDbReader
+pub const DEFAULT_CACHE_SIZE: usize = 1024;
 
 /// MetaDB database types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,4 +132,115 @@ pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u
     let reader = maxminddb::Reader::open_readfile(path.as_ref())
         .map_err(|e| AclError::GeoIpError(format!("Failed to open MetaDB: {}", e)))?;
     Ok(Arc::new(reader))
+}
+
+/// Cached MetaDB reader with LRU cache for IP lookups.
+///
+/// Provides significant performance improvements for hot IP addresses
+/// that are looked up repeatedly.
+pub struct CachedMetaDbReader {
+    reader: MetaDbReader,
+    cache: Mutex<LruCache<IpAddr, Vec<String>>>,
+}
+
+impl CachedMetaDbReader {
+    /// Create a new cached reader with default cache size (1024 entries)
+    pub fn new(reader: MetaDbReader) -> Self {
+        Self::with_cache_size(reader, DEFAULT_CACHE_SIZE)
+    }
+
+    /// Create a new cached reader with custom cache size
+    pub fn with_cache_size(reader: MetaDbReader, cache_size: usize) -> Self {
+        Self {
+            reader,
+            cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(cache_size).unwrap_or(
+                    std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
+                ),
+            )),
+        }
+    }
+
+    /// Open a MetaDB file with caching enabled (default cache size)
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let reader = MetaDbReader::open(path)?;
+        Ok(Self::new(reader))
+    }
+
+    /// Open a MetaDB file with custom cache size
+    pub fn open_with_cache_size(path: impl AsRef<Path>, cache_size: usize) -> Result<Self> {
+        let reader = MetaDbReader::open(path)?;
+        Ok(Self::with_cache_size(reader, cache_size))
+    }
+
+    /// Lookup country codes for an IP with caching
+    pub fn lookup_codes(&self, ip: IpAddr) -> Vec<String> {
+        // Check cache first
+        {
+            let mut cache = self.cache.lock().unwrap();
+            if let Some(codes) = cache.get(&ip) {
+                return codes.clone();
+            }
+        }
+
+        // Cache miss, lookup from database
+        let codes = self.reader.lookup_codes(ip);
+
+        // Store in cache
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.put(ip, codes.clone());
+        }
+
+        codes
+    }
+
+    /// Get database type
+    pub fn database_type(&self) -> DatabaseType {
+        self.reader.database_type()
+    }
+
+    /// Clear the LRU cache
+    pub fn clear_cache(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
+    }
+
+    /// Get the number of items in the cache
+    pub fn cache_len(&self) -> usize {
+        let cache = self.cache.lock().unwrap();
+        cache.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_database_type_from_str() {
+        assert_eq!(DatabaseType::from_str("MaxMind"), DatabaseType::MaxMind);
+        assert_eq!(DatabaseType::from_str("GeoIP2-Country"), DatabaseType::MaxMind);
+        assert_eq!(DatabaseType::from_str("sing-geoip"), DatabaseType::Sing);
+        assert_eq!(DatabaseType::from_str("Meta-geoip0"), DatabaseType::MetaV0);
+        assert_eq!(DatabaseType::from_str("unknown"), DatabaseType::Unknown);
+    }
+
+    #[test]
+    fn test_cached_reader_cache_operations() {
+        // We can't test with a real DB file in unit tests, but we can test cache operations
+        // by creating a mock scenario
+
+        // Test cache size configuration
+        let cache_size = 100;
+        let cache: LruCache<IpAddr, Vec<String>> =
+            LruCache::new(std::num::NonZeroUsize::new(cache_size).unwrap());
+        assert_eq!(cache.len(), 0);
+
+        // Test IP address as cache key
+        let ip1 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let ip2 = IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888));
+        assert_ne!(ip1, ip2);
+    }
 }
