@@ -11,6 +11,7 @@ use crate::error::{AclError, Result};
 use crate::matcher::{DomainEntry, GeoIpMatcher, GeoSiteMatcher};
 
 use super::format::{GeoIpFormat, GeoSiteFormat};
+use super::singsite::SingSiteReader;
 use super::{dat, metadb, mmdb, singsite};
 
 /// Logger callback type for logging geo data updates
@@ -164,7 +165,7 @@ impl GeoLoader for FileGeoLoader {
     }
 }
 
-/// Auto GeoLoader with download support
+/// Auto GeoLoader with download support and lazy loading
 pub struct AutoGeoLoader {
     // Paths
     pub geoip_path: Option<PathBuf>,
@@ -187,7 +188,10 @@ pub struct AutoGeoLoader {
 
     // Cached data
     geoip_data: RwLock<Option<HashMap<String, Vec<IpNet>>>>,
-    geosite_data: RwLock<Option<HashMap<String, Vec<DomainEntry>>>>,
+    // Lazy-loaded geosite data: only loads requested codes
+    geosite_cache: RwLock<HashMap<String, Vec<DomainEntry>>>,
+    // Persistent reader for sing-geosite format (opened once, reused for all reads)
+    geosite_reader: Mutex<Option<SingSiteReader>>,
     download_lock: Mutex<()>,
 }
 
@@ -205,7 +209,8 @@ impl AutoGeoLoader {
             update_interval: DEFAULT_UPDATE_INTERVAL,
             logger: None,
             geoip_data: RwLock::new(None),
-            geosite_data: RwLock::new(None),
+            geosite_cache: RwLock::new(HashMap::new()),
+            geosite_reader: Mutex::new(None),
             download_lock: Mutex::new(()),
         }
     }
@@ -376,9 +381,13 @@ impl AutoGeoLoader {
             .get_geoip_path()
             .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
 
+        eprintln!("[geoip] Checking geoip file: {}", path.display());
+
         // Try to download if needed
         if self.should_download(&path) {
+            eprintln!("[geoip] File needs download/update");
             if let Some(ref url) = self.geoip_url {
+                eprintln!("[geoip] Downloading from: {}", url);
                 let verify = |p: &Path| verify_geoip_file(p, format);
                 if let Err(e) = self.download(&path, url, verify) {
                     // If download fails but file exists, try to use it
@@ -395,15 +404,23 @@ impl AutoGeoLoader {
         Ok(())
     }
 
-    /// Load GeoSite data with auto-download
-    fn ensure_geosite_loaded(&self) -> Result<()> {
-        if self.geosite_data.read().unwrap().is_some() {
+    /// Ensure geosite reader is initialized (opens file once)
+    fn ensure_geosite_reader(&self) -> Result<()> {
+        let mut reader_guard = self.geosite_reader.lock().unwrap();
+        if reader_guard.is_some() {
             return Ok(());
         }
 
         let format = self
             .geosite_format
             .ok_or_else(|| AclError::GeoSiteError("GeoSite format not configured".to_string()))?;
+
+        // Currently only Sing format supports lazy loading
+        if format != GeoSiteFormat::Sing {
+            return Err(AclError::GeoSiteError(
+                "Lazy loading only supported for Sing format".to_string(),
+            ));
+        }
 
         let path = self
             .get_geosite_path()
@@ -422,9 +439,41 @@ impl AutoGeoLoader {
             }
         }
 
-        let data = load_geosite_file(&path, format)?;
-        *self.geosite_data.write().unwrap() = Some(data);
+        let (reader, _codes) = SingSiteReader::open(&path)?;
+        *reader_guard = Some(reader);
         Ok(())
+    }
+
+    /// Load a single geosite code lazily
+    fn load_geosite_code(&self, code: &str) -> Result<Vec<DomainEntry>> {
+        let code_lower = code.to_lowercase();
+
+        // Check cache first
+        {
+            let cache = self.geosite_cache.read().unwrap();
+            if let Some(domains) = cache.get(&code_lower) {
+                return Ok(domains.clone());
+            }
+        }
+
+        // Ensure reader is initialized
+        self.ensure_geosite_reader()?;
+
+        // Load from reader
+        let domains = {
+            let mut reader_guard = self.geosite_reader.lock().unwrap();
+            let reader = reader_guard.as_mut().unwrap();
+            let items = reader.read(&code_lower)?;
+            singsite::convert_items_to_entries(items)
+        };
+
+        // Cache the result
+        {
+            let mut cache = self.geosite_cache.write().unwrap();
+            cache.insert(code_lower, domains.clone());
+        }
+
+        Ok(domains)
     }
 }
 
@@ -447,13 +496,10 @@ impl GeoLoader for AutoGeoLoader {
     }
 
     fn load_geosite(&self, site_name: &str) -> Result<GeoSiteMatcher> {
-        self.ensure_geosite_loaded()?;
-
         let (name, attrs) = GeoSiteMatcher::parse_pattern(site_name);
-        let guard = self.geosite_data.read().unwrap();
-        let data = guard.as_ref().unwrap();
 
-        let domains = data.get(&name).cloned().unwrap_or_default();
+        // Use lazy loading - only load the requested code
+        let domains = self.load_geosite_code(&name)?;
         Ok(GeoSiteMatcher::new(&name, domains).with_attributes(attrs))
     }
 }

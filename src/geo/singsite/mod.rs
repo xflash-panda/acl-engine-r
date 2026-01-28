@@ -167,41 +167,54 @@ impl SingSiteReader {
     }
 }
 
-/// Load GeoSite data from sing-geosite format
+/// Load GeoSite data from sing-geosite format (loads ALL codes - slow!)
 pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<DomainEntry>>> {
     let (mut reader, codes) = SingSiteReader::open(path)?;
 
     let mut result = HashMap::new();
 
-    for code in codes {
-        let items = reader.read(&code)?;
-        let mut domains = Vec::with_capacity(items.len());
-
-        for item in items {
-            let domain_type = match item.item_type {
-                ItemType::Domain => DomainType::Full(item.value.to_lowercase()),
-                ItemType::DomainSuffix => {
-                    // sing-geosite stores suffix with leading dot, remove it
-                    let value = item.value.trim_start_matches('.').to_lowercase();
-                    DomainType::RootDomain(value)
-                }
-                ItemType::DomainKeyword => DomainType::Plain(item.value.to_lowercase()),
-                ItemType::DomainRegex => match regex::Regex::new(&item.value) {
-                    Ok(re) => DomainType::Regex(re),
-                    Err(_) => continue,
-                },
-            };
-
-            domains.push(DomainEntry {
-                domain_type,
-                attributes: HashMap::new(),
-            });
-        }
-
+    for code in &codes {
+        let items = reader.read(code)?;
+        let domains = convert_items_to_entries(items);
         result.insert(code.to_lowercase(), domains);
     }
 
     Ok(result)
+}
+
+/// Load a single GeoSite code from sing-geosite format (fast - lazy loading)
+pub fn load_geosite_code(path: impl AsRef<Path>, code: &str) -> Result<Vec<DomainEntry>> {
+    let (mut reader, _codes) = SingSiteReader::open(path)?;
+    let items = reader.read(&code.to_lowercase())?;
+    Ok(convert_items_to_entries(items))
+}
+
+/// Convert DomainItems to DomainEntries
+pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
+    let mut domains = Vec::with_capacity(items.len());
+
+    for item in items {
+        let domain_type = match item.item_type {
+            ItemType::Domain => DomainType::Full(item.value.to_lowercase()),
+            ItemType::DomainSuffix => {
+                // sing-geosite stores suffix with leading dot, remove it
+                let value = item.value.trim_start_matches('.').to_lowercase();
+                DomainType::RootDomain(value)
+            }
+            ItemType::DomainKeyword => DomainType::Plain(item.value.to_lowercase()),
+            ItemType::DomainRegex => match regex::Regex::new(&item.value) {
+                Ok(re) => DomainType::Regex(re),
+                Err(_) => continue,
+            },
+        };
+
+        domains.push(DomainEntry {
+            domain_type,
+            attributes: HashMap::new(),
+        });
+    }
+
+    domains
 }
 
 /// Verify sing-geosite file integrity
