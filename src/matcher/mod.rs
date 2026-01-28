@@ -30,6 +30,7 @@ impl HostMatcher for AllMatcher {
 
 /// Enum wrapper for all matcher types
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Matcher {
     All(AllMatcher),
     Ip(IpMatcher),

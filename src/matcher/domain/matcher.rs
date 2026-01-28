@@ -2,7 +2,6 @@
 ///
 /// Uses HashSet for exact matches and sorted suffix list for suffix matching,
 /// providing efficient O(1) exact lookup and O(log n) suffix lookup.
-
 use std::collections::HashSet;
 
 /// High-performance domain matcher

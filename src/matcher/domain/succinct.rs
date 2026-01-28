@@ -1,9 +1,9 @@
-/// Succinct Trie data structure for memory-efficient domain matching.
-///
-/// Uses bitmap-based compression with rank/select indices to dramatically
-/// reduce memory overhead compared to traditional pointer-based tries.
-///
-/// This is a port of the Go implementation from sing-box/sing-trie.
+//! Succinct Trie data structure for memory-efficient domain matching.
+//!
+//! Uses bitmap-based compression with rank/select indices to dramatically
+//! reduce memory overhead compared to traditional pointer-based tries.
+//!
+//! This is a port of the Go implementation from sing-box/sing-trie.
 
 /// Succinct set data structure
 #[derive(Debug, Clone, Default)]
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn test_multiple_keys() {
         let mut keys = vec![
-            "moc.elgoog".to_string(), // google.com reversed
+            "moc.elgoog".to_string(),   // google.com reversed
             "moc.koobecaf".to_string(), // facebook.com reversed
         ];
         keys.sort();

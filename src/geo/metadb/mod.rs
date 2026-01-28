@@ -154,9 +154,8 @@ impl CachedMetaDbReader {
         Self {
             reader,
             cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(cache_size).unwrap_or(
-                    std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
-                ),
+                std::num::NonZeroUsize::new(cache_size)
+                    .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap()),
             )),
         }
     }
@@ -221,7 +220,10 @@ mod tests {
     #[test]
     fn test_database_type_from_str() {
         assert_eq!(DatabaseType::from_str("MaxMind"), DatabaseType::MaxMind);
-        assert_eq!(DatabaseType::from_str("GeoIP2-Country"), DatabaseType::MaxMind);
+        assert_eq!(
+            DatabaseType::from_str("GeoIP2-Country"),
+            DatabaseType::MaxMind
+        );
         assert_eq!(DatabaseType::from_str("sing-geoip"), DatabaseType::Sing);
         assert_eq!(DatabaseType::from_str("Meta-geoip0"), DatabaseType::MetaV0);
         assert_eq!(DatabaseType::from_str("unknown"), DatabaseType::Unknown);

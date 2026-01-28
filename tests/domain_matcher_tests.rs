@@ -64,7 +64,10 @@ fn test_mining_pool_suffix_matching() {
     assert!(matcher.matches("antpool.com"), "antpool.com should match");
     assert!(matcher.matches("binance.com"), "binance.com should match");
     assert!(matcher.matches("google.com"), "google.com should match");
-    assert!(matcher.matches("ethermine.org"), "ethermine.org should match");
+    assert!(
+        matcher.matches("ethermine.org"),
+        "ethermine.org should match"
+    );
     assert!(matcher.matches("f2pool.com"), "f2pool.com should match");
 
     // Test subdomain matches
