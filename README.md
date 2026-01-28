@@ -363,8 +363,6 @@ let resolver = NilResolver::new();
 
 ## 性能优化
 
-本库实现了与 Go 版本 `feat/performance-optimize-domain-matcher` 分支对齐的性能优化：
-
 ### 高性能域名匹配器 (SuccinctMatcher)
 
 基于 HashSet 的高性能域名匹配器，提供：
