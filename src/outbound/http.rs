@@ -12,13 +12,13 @@ use crate::error::{AclError, Result};
 use super::{Addr, Outbound, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
 #[cfg(feature = "async")]
+use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 #[cfg(feature = "async")]
 use tokio::net::TcpStream as TokioTcpStream;
-#[cfg(feature = "async")]
-use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
 
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -297,10 +297,13 @@ impl AsyncOutbound for Http {
 
         let mut reader = TokioBufReader::new(stream);
 
-        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.get_mut().write_all(request.as_bytes()))
-            .await
-            .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
+        tokio::time::timeout(
+            HTTP_REQUEST_TIMEOUT,
+            reader.get_mut().write_all(request.as_bytes()),
+        )
+        .await
+        .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
+        .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
 
         let mut status_line = String::new();
         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.read_line(&mut status_line))

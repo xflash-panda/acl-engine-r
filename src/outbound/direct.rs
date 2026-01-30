@@ -15,11 +15,11 @@ use super::{
 };
 
 #[cfg(feature = "async")]
+use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
 use tokio::net::{TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket};
-#[cfg(feature = "async")]
-use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
 
 /// IP version preference for direct connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -284,7 +284,9 @@ impl Direct {
                         socket2::Type::STREAM,
                         Some(socket2::Protocol::TCP),
                     )
-                    .map_err(|e| AclError::OutboundError(format!("Failed to create socket: {}", e)))?;
+                    .map_err(|e| {
+                        AclError::OutboundError(format!("Failed to create socket: {}", e))
+                    })?;
                     socket
                         .bind(&bind_addr.into())
                         .map_err(|e| AclError::OutboundError(format!("Failed to bind: {}", e)))?;
@@ -297,7 +299,9 @@ impl Direct {
                         socket2::Type::STREAM,
                         Some(socket2::Protocol::TCP),
                     )
-                    .map_err(|e| AclError::OutboundError(format!("Failed to create socket: {}", e)))?;
+                    .map_err(|e| {
+                        AclError::OutboundError(format!("Failed to create socket: {}", e))
+                    })?;
                     socket
                         .bind(&bind_addr.into())
                         .map_err(|e| AclError::OutboundError(format!("Failed to bind: {}", e)))?;
@@ -480,7 +484,8 @@ impl AsyncOutbound for Direct {
         let stream = match self.mode {
             DirectMode::Auto => {
                 if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
-                    self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port).await?
+                    self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port)
+                        .await?
                 } else if let Some(ipv4) = info.ipv4 {
                     self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
                 } else if let Some(ipv6) = info.ipv6 {
@@ -511,14 +516,18 @@ impl AsyncOutbound for Direct {
                 if let Some(ipv6) = info.ipv6 {
                     self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
                 } else {
-                    return Err(AclError::OutboundError("No IPv6 address available".to_string()));
+                    return Err(AclError::OutboundError(
+                        "No IPv6 address available".to_string(),
+                    ));
                 }
             }
             DirectMode::Only4 => {
                 if let Some(ipv4) = info.ipv4 {
                     self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
                 } else {
-                    return Err(AclError::OutboundError("No IPv4 address available".to_string()));
+                    return Err(AclError::OutboundError(
+                        "No IPv4 address available".to_string(),
+                    ));
                 }
             }
         };
@@ -682,14 +691,18 @@ impl AsyncDirectUdpConn {
                     if let Some(ipv6) = info.ipv6 {
                         IpAddr::V6(ipv6)
                     } else {
-                        return Err(AclError::OutboundError("No IPv6 address available".to_string()));
+                        return Err(AclError::OutboundError(
+                            "No IPv6 address available".to_string(),
+                        ));
                     }
                 }
                 DirectMode::Only4 => {
                     if let Some(ipv4) = info.ipv4 {
                         IpAddr::V4(ipv4)
                     } else {
-                        return Err(AclError::OutboundError("No IPv4 address available".to_string()));
+                        return Err(AclError::OutboundError(
+                            "No IPv4 address available".to_string(),
+                        ));
                     }
                 }
             };
@@ -781,9 +794,7 @@ mod async_tests {
         let direct = Direct::new();
         let mut addr = Addr::new("127.0.0.1", port);
 
-        let accept_handle = tokio::spawn(async move {
-            listener.accept().await.ok()
-        });
+        let accept_handle = tokio::spawn(async move { listener.accept().await.ok() });
 
         let result = AsyncOutbound::dial_tcp(&direct, &mut addr).await;
         assert!(result.is_ok());

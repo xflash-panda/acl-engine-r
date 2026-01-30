@@ -5,9 +5,9 @@
 use crate::error::{AclError, Result};
 
 #[cfg(feature = "async")]
-use async_trait::async_trait;
-#[cfg(feature = "async")]
 use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn};
+#[cfg(feature = "async")]
+use async_trait::async_trait;
 
 use super::{Addr, Outbound, TcpConn, UdpConn};
 

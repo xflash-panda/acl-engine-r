@@ -260,7 +260,9 @@ mod async_tests {
         let resolver = SystemResolver::new();
 
         // Test IPv4
-        let result = AsyncResolver::resolve(&resolver, "127.0.0.1").await.unwrap();
+        let result = AsyncResolver::resolve(&resolver, "127.0.0.1")
+            .await
+            .unwrap();
         assert_eq!(result.0, Some(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(result.1.is_none());
 
@@ -273,7 +275,9 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_nil_resolver() {
         let resolver = NilResolver::new();
-        let result = AsyncResolver::resolve(&resolver, "example.com").await.unwrap();
+        let result = AsyncResolver::resolve(&resolver, "example.com")
+            .await
+            .unwrap();
         assert!(result.0.is_none());
         assert!(result.1.is_none());
     }
@@ -286,7 +290,9 @@ mod async_tests {
             None,
         );
 
-        let result = AsyncResolver::resolve(&resolver, "example.com").await.unwrap();
+        let result = AsyncResolver::resolve(&resolver, "example.com")
+            .await
+            .unwrap();
         assert_eq!(result.0, Some(Ipv4Addr::new(93, 184, 216, 34)));
         assert!(result.1.is_none());
 
@@ -298,7 +304,9 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_static_resolver_ip_passthrough() {
         let resolver = StaticResolver::new();
-        let result = AsyncResolver::resolve(&resolver, "192.168.1.1").await.unwrap();
+        let result = AsyncResolver::resolve(&resolver, "192.168.1.1")
+            .await
+            .unwrap();
         assert_eq!(result.0, Some(Ipv4Addr::new(192, 168, 1, 1)));
     }
 }

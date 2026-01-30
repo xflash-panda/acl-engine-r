@@ -11,13 +11,13 @@ use crate::error::{AclError, Result};
 use super::{Addr, Outbound, StdTcpConn, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
 #[cfg(feature = "async")]
+use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "async")]
 use tokio::net::{TcpStream as TokioTcpStream, UdpSocket as TokioUdpSocket};
-#[cfg(feature = "async")]
-use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const SOCKS5_AUTH_NONE: u8 = 0x00;
@@ -445,66 +445,63 @@ impl Socks5 {
             )));
         }
 
-        let (bound_host, bound_port) = match resp_header[3] {
-            SOCKS5_ATYP_IPV4 => {
-                let mut addr_buf = [0u8; 4];
-                stream.read_exact(&mut addr_buf).await.map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read IPv4 address: {}", e))
-                })?;
-                let ip = IpAddr::V4(std::net::Ipv4Addr::new(
-                    addr_buf[0],
-                    addr_buf[1],
-                    addr_buf[2],
-                    addr_buf[3],
-                ));
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .await
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                (ip.to_string(), u16::from_be_bytes(port_buf))
-            }
-            SOCKS5_ATYP_IPV6 => {
-                let mut addr_buf = [0u8; 16];
-                stream.read_exact(&mut addr_buf).await.map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read IPv6 address: {}", e))
-                })?;
-                let ip = IpAddr::V6(std::net::Ipv6Addr::from(addr_buf));
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .await
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                (ip.to_string(), u16::from_be_bytes(port_buf))
-            }
-            SOCKS5_ATYP_DOMAIN => {
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).await.map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read domain length: {}", e))
-                })?;
-                let len = len_buf[0] as usize;
-                let mut domain = vec![0u8; len];
-                stream
-                    .read_exact(&mut domain)
-                    .await
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read domain: {}", e)))?;
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .await
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                (
-                    String::from_utf8_lossy(&domain).to_string(),
-                    u16::from_be_bytes(port_buf),
-                )
-            }
-            atyp => {
-                return Err(AclError::OutboundError(format!(
-                    "Unknown address type: {}",
-                    atyp
-                )));
-            }
-        };
+        let (bound_host, bound_port) =
+            match resp_header[3] {
+                SOCKS5_ATYP_IPV4 => {
+                    let mut addr_buf = [0u8; 4];
+                    stream.read_exact(&mut addr_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read IPv4 address: {}", e))
+                    })?;
+                    let ip = IpAddr::V4(std::net::Ipv4Addr::new(
+                        addr_buf[0],
+                        addr_buf[1],
+                        addr_buf[2],
+                        addr_buf[3],
+                    ));
+                    let mut port_buf = [0u8; 2];
+                    stream.read_exact(&mut port_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read port: {}", e))
+                    })?;
+                    (ip.to_string(), u16::from_be_bytes(port_buf))
+                }
+                SOCKS5_ATYP_IPV6 => {
+                    let mut addr_buf = [0u8; 16];
+                    stream.read_exact(&mut addr_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read IPv6 address: {}", e))
+                    })?;
+                    let ip = IpAddr::V6(std::net::Ipv6Addr::from(addr_buf));
+                    let mut port_buf = [0u8; 2];
+                    stream.read_exact(&mut port_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read port: {}", e))
+                    })?;
+                    (ip.to_string(), u16::from_be_bytes(port_buf))
+                }
+                SOCKS5_ATYP_DOMAIN => {
+                    let mut len_buf = [0u8; 1];
+                    stream.read_exact(&mut len_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read domain length: {}", e))
+                    })?;
+                    let len = len_buf[0] as usize;
+                    let mut domain = vec![0u8; len];
+                    stream.read_exact(&mut domain).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read domain: {}", e))
+                    })?;
+                    let mut port_buf = [0u8; 2];
+                    stream.read_exact(&mut port_buf).await.map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read port: {}", e))
+                    })?;
+                    (
+                        String::from_utf8_lossy(&domain).to_string(),
+                        u16::from_be_bytes(port_buf),
+                    )
+                }
+                atyp => {
+                    return Err(AclError::OutboundError(format!(
+                        "Unknown address type: {}",
+                        atyp
+                    )));
+                }
+            };
 
         Ok((bound_host, bound_port))
     }
