@@ -47,14 +47,20 @@ socket2 = "0.6"
 # Base64 encoding for HTTP proxy auth
 base64 = "0.22"
 
+# Async runtime (optional, for async API)
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
 [build-dependencies]
 prost-build = "0.14"
 
 [dev-dependencies]
 # For testing
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 
 [features]
-default = ["geoip", "geosite"]
+default = ["async", "geoip", "geosite"]
+async = ["tokio", "async-trait"]
+sync = []
 geoip = []
 geosite = []
