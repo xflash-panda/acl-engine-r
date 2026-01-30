@@ -12,6 +12,11 @@ use std::time::Duration;
 
 use crate::error::{AclError, Result};
 
+#[cfg(feature = "async")]
+use async_trait::async_trait;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncRead, AsyncWrite};
+
 mod direct;
 mod http;
 mod reject;
@@ -139,6 +144,17 @@ pub trait Outbound: Send + Sync {
     fn dial_udp(&self, addr: &mut Addr) -> Result<Box<dyn UdpConn>>;
 }
 
+/// Async outbound connection interface.
+#[cfg(feature = "async")]
+#[async_trait]
+pub trait AsyncOutbound: Send + Sync {
+    /// Establish an async TCP connection to the given address.
+    async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>>;
+
+    /// Create an async UDP connection for the given address.
+    async fn dial_udp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>>;
+}
+
 /// TCP connection interface.
 pub trait TcpConn: Read + Write + Send + Sync {
     /// Get the local address
@@ -155,6 +171,16 @@ pub trait TcpConn: Read + Write + Send + Sync {
 
     /// Shutdown the connection
     fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>;
+}
+
+/// Async TCP connection interface.
+#[cfg(feature = "async")]
+pub trait AsyncTcpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    /// Get the local address
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Get the peer address
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
 }
 
 /// Standard TcpStream wrapper implementing TcpConn
@@ -222,6 +248,20 @@ pub trait UdpConn: Send + Sync {
     fn close(&self) -> Result<()>;
 }
 
+/// Async UDP connection interface.
+#[cfg(feature = "async")]
+#[async_trait]
+pub trait AsyncUdpConn: Send + Sync {
+    /// Read from the UDP connection
+    async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)>;
+
+    /// Write to the UDP connection
+    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
+
+    /// Close the connection
+    async fn close(&self) -> Result<()>;
+}
+
 /// Standard UdpSocket wrapper implementing UdpConn
 pub struct StdUdpConn {
     inner: UdpSocket,
@@ -258,6 +298,115 @@ impl UdpConn for StdUdpConn {
 
     fn close(&self) -> Result<()> {
         // UdpSocket doesn't have explicit close, it closes on drop
+        Ok(())
+    }
+}
+
+/// Tokio TcpStream wrapper implementing AsyncTcpConn
+#[cfg(feature = "async")]
+pub struct TokioTcpConn {
+    inner: tokio::net::TcpStream,
+}
+
+#[cfg(feature = "async")]
+impl TokioTcpConn {
+    pub fn new(stream: tokio::net::TcpStream) -> Self {
+        Self { inner: stream }
+    }
+
+    pub fn into_inner(self) -> tokio::net::TcpStream {
+        self.inner
+    }
+}
+
+#[cfg(feature = "async")]
+impl AsyncRead for TokioTcpConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "async")]
+impl AsyncWrite for TokioTcpConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "async")]
+impl AsyncTcpConn for TokioTcpConn {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.peer_addr()
+    }
+}
+
+/// Tokio UdpSocket wrapper implementing AsyncUdpConn
+#[cfg(feature = "async")]
+pub struct TokioUdpConn {
+    inner: tokio::net::UdpSocket,
+}
+
+#[cfg(feature = "async")]
+impl TokioUdpConn {
+    pub fn new(socket: tokio::net::UdpSocket) -> Self {
+        Self { inner: socket }
+    }
+
+    pub fn into_inner(self) -> tokio::net::UdpSocket {
+        self.inner
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncUdpConn for TokioUdpConn {
+    async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
+        let (n, addr) = self
+            .inner
+            .recv_from(buf)
+            .await
+            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
+    }
+
+    async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
+        let socket_addr: SocketAddr = addr
+            .network_addr()
+            .parse()
+            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
+        self.inner
+            .send_to(buf, socket_addr)
+            .await
+            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+    }
+
+    async fn close(&self) -> Result<()> {
         Ok(())
     }
 }
