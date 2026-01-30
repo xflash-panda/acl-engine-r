@@ -11,6 +11,15 @@ use crate::error::{AclError, Result};
 
 use super::{Addr, Outbound, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
+#[cfg(feature = "async")]
+use async_trait::async_trait;
+#[cfg(feature = "async")]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+#[cfg(feature = "async")]
+use tokio::net::TcpStream as TokioTcpStream;
+#[cfg(feature = "async")]
+use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
+
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// HTTP/HTTPS proxy outbound.
@@ -146,6 +155,28 @@ impl Http {
 
         Ok(stream)
     }
+
+    /// Connect to the proxy server asynchronously.
+    #[cfg(feature = "async")]
+    async fn async_dial(&self) -> Result<TokioTcpStream> {
+        let addr: SocketAddr = self
+            .addr
+            .parse()
+            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+
+        let stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
+            .await
+            .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
+            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
+
+        if self.https {
+            return Err(AclError::OutboundError(
+                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            ));
+        }
+
+        Ok(stream)
+    }
 }
 
 impl Outbound for Http {
@@ -238,6 +269,87 @@ impl Outbound for Http {
     }
 
     fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn UdpConn>> {
+        Err(AclError::OutboundError(
+            "UDP not supported by HTTP proxy".to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncOutbound for Http {
+    async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
+        let stream = self.async_dial().await?;
+
+        let target = format!("{}:{}", addr.host, addr.port);
+        let mut request = format!(
+            "CONNECT {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Proxy-Connection: Keep-Alive\r\n",
+            target, target
+        );
+
+        if let Some(ref auth) = self.basic_auth {
+            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+        }
+
+        request.push_str("\r\n");
+
+        let mut reader = TokioBufReader::new(stream);
+
+        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.get_mut().write_all(request.as_bytes()))
+            .await
+            .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
+            .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
+
+        let mut status_line = String::new();
+        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.read_line(&mut status_line))
+            .await
+            .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
+            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+
+        let parts: Vec<&str> = status_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(AclError::OutboundError(format!(
+                "Invalid HTTP response: {}",
+                status_line.trim()
+            )));
+        }
+
+        let status_code: u16 = parts[1]
+            .parse()
+            .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
+
+        if status_code != 200 {
+            return Err(AclError::OutboundError(format!(
+                "HTTP CONNECT failed: {} {}",
+                status_code,
+                parts.get(2..).unwrap_or(&[]).join(" ")
+            )));
+        }
+
+        loop {
+            let mut line = String::new();
+            reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        let buffered = reader.buffer();
+        if !buffered.is_empty() {
+            let buffered_data = buffered.to_vec();
+            let stream = reader.into_inner();
+            return Ok(Box::new(AsyncBufferedTcpConn::new(stream, buffered_data)));
+        }
+
+        Ok(Box::new(TokioTcpConn::new(reader.into_inner())))
+    }
+
+    async fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>> {
         Err(AclError::OutboundError(
             "UDP not supported by HTTP proxy".to_string(),
         ))
@@ -357,6 +469,82 @@ impl TcpConn for BufferedTcpConn {
     }
 }
 
+/// Async TCP connection with buffered data from initial response.
+#[cfg(feature = "async")]
+struct AsyncBufferedTcpConn {
+    stream: TokioTcpStream,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+}
+
+#[cfg(feature = "async")]
+impl AsyncBufferedTcpConn {
+    fn new(stream: TokioTcpStream, buffer: Vec<u8>) -> Self {
+        Self {
+            stream,
+            buffer,
+            buffer_pos: 0,
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl tokio::io::AsyncRead for AsyncBufferedTcpConn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.buffer_pos < self.buffer.len() {
+            let remaining = &self.buffer[self.buffer_pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.buffer_pos += to_copy;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "async")]
+impl tokio::io::AsyncWrite for AsyncBufferedTcpConn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "async")]
+impl Unpin for AsyncBufferedTcpConn {}
+
+#[cfg(feature = "async")]
+impl AsyncTcpConn for AsyncBufferedTcpConn {
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.stream.peer_addr()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,7 +575,45 @@ mod tests {
     fn test_http_udp_not_supported() {
         let http = Http::new("127.0.0.1:8080", false);
         let mut addr = Addr::new("example.com", 53);
-        let result = http.dial_udp(&mut addr);
+        let result = Outbound::dial_udp(&http, &mut addr);
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+mod async_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_async_http_from_url() {
+        let http = Http::from_url("http://proxy.example.com:8080").unwrap();
+        assert_eq!(http.addr, "proxy.example.com:8080");
+        assert!(!http.https);
+    }
+
+    #[tokio::test]
+    async fn test_async_http_from_url_with_auth() {
+        let http = Http::from_url("http://user:pass@proxy.example.com:8080").unwrap();
+        assert!(http.basic_auth.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_async_http_udp_not_supported() {
+        let http = Http::new("127.0.0.1:8080", false);
+        let mut addr = Addr::new("example.com", 53);
+        let result = AsyncOutbound::dial_udp(&http, &mut addr).await;
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("UDP not supported")),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_http_dial_tcp_connection_refused() {
+        let http = Http::new("127.0.0.1:59997", false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
         assert!(result.is_err());
     }
 }
