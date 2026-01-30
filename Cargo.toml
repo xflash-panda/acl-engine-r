@@ -48,7 +48,7 @@ socket2 = "0.6"
 base64 = "0.22"
 
 # Async runtime (optional, for async API)
-tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt"], optional = true }
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"], optional = true }
 async-trait = { version = "0.1", optional = true }
 
 [build-dependencies]
