@@ -74,20 +74,18 @@ impl GeoIpMatcher {
             iso_code: Option<String>,
         }
 
-        match reader.lookup::<Country>(ip) {
-            Ok(result) => {
-                let matches = result
-                    .country
-                    .and_then(|c| c.iso_code)
-                    .map(|code| code.to_uppercase() == self.country_code)
-                    .unwrap_or(false);
-                if self.inverse {
-                    !matches
-                } else {
-                    matches
-                }
-            }
-            Err(_) => self.inverse,
+        let matches = reader
+            .lookup(ip)
+            .ok()
+            .and_then(|r| r.decode::<Country>().ok().flatten())
+            .and_then(|r| r.country)
+            .and_then(|c| c.iso_code)
+            .map(|code| code.to_uppercase() == self.country_code)
+            .unwrap_or(false);
+        if self.inverse {
+            !matches
+        } else {
+            matches
         }
     }
 
