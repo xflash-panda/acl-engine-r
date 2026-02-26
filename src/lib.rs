@@ -90,7 +90,7 @@ pub use matcher::{
     AllMatcher, CidrMatcher, DomainEntry, DomainMatcher, DomainType, GeoIpMatcher, GeoSiteMatcher,
     HostMatcher, IpMatcher, Matcher,
 };
-pub use parser::{parse_proto_port, parse_rules};
+pub use parser::{parse_proto_port, parse_rules, parse_rules_from_file};
 pub use types::{HostInfo, MatchResult, Protocol, TextRule};
 
 // Re-export outbound types

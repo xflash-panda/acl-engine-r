@@ -1,5 +1,7 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::fs;
+use std::path::Path;
 
 use crate::error::{AclError, Result};
 use crate::types::{Protocol, TextRule};
@@ -9,7 +11,9 @@ use crate::types::{Protocol, TextRule};
 static RULE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\w+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$").unwrap());
 
-/// Parse ACL rules from text
+/// Parse ACL rules from text.
+///
+/// Supports `file: /path/to/rules.acl` directive to include rules from an external file.
 pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
     let mut rules = Vec::new();
 
@@ -29,12 +33,29 @@ pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
             continue;
         }
 
+        // Handle file include directive
+        if let Some(path) = line.strip_prefix("file:") {
+            let path = path.trim();
+            let file_rules = parse_rules_from_file(path)?;
+            rules.extend(file_rules);
+            continue;
+        }
+
         // Parse the rule
         let rule = parse_single_rule(line, line_num)?;
         rules.push(rule);
     }
 
     Ok(rules)
+}
+
+/// Parse ACL rules from a file.
+pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path).map_err(|e| {
+        AclError::ParseError(format!("Failed to read rules file '{}': {}", path.display(), e))
+    })?;
+    parse_rules(&text)
 }
 
 /// Parse a single rule line
@@ -208,5 +229,38 @@ proxy(all)
         let rules = parse_rules(text).unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].address, "192.168.0.0/16");
+    }
+
+    #[test]
+    fn test_parse_file_directive() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("acl_engine_test");
+        let _ = fs::create_dir_all(&dir);
+        let file_path = dir.join("test_rules.acl");
+        let mut f = fs::File::create(&file_path).unwrap();
+        writeln!(f, "proxy(*.google.com)").unwrap();
+        writeln!(f, "direct(10.0.0.0/8)").unwrap();
+        drop(f);
+
+        let text = format!(
+            "direct(192.168.0.0/16)\nfile: {}\nreject(all)",
+            file_path.display()
+        );
+        let rules = parse_rules(&text).unwrap();
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0].address, "192.168.0.0/16");
+        assert_eq!(rules[1].address, "*.google.com");
+        assert_eq!(rules[2].address, "10.0.0.0/8");
+        assert_eq!(rules[3].address, "all");
+
+        let _ = fs::remove_file(&file_path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_parse_file_directive_not_found() {
+        let text = "file: /nonexistent/path/rules.acl";
+        let result = parse_rules(text);
+        assert!(result.is_err());
     }
 }
