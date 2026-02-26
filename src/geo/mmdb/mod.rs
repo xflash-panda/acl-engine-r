@@ -54,12 +54,7 @@ pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u
 
 /// Lookup country code for an IP address
 pub fn lookup_ip(reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> Option<String> {
-    reader
-        .lookup(ip)
-        .ok()?
-        .decode::<MmdbRecord>()
-        .ok()
-        .flatten()
-        .and_then(|r| r.country)
-        .and_then(|c| c.iso_code)
+    let result = reader.lookup(ip).ok()?;
+    let record: MmdbRecord = result.decode().ok()??;
+    record.country.and_then(|c| c.iso_code)
 }

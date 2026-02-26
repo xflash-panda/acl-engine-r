@@ -1,0 +1,245 @@
+# =============================================================================
+# ACL Engine R - Example Configuration
+# =============================================================================
+#
+# This file demonstrates all supported features of acl-engine-r.
+#
+# Rule format: outbound(address[, proto/port][, hijack_address])
+#
+# Built-in outbounds (always available, no need to define):
+#   - direct  : connect directly to the target (can be overridden)
+#   - reject  : reject/block the connection
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Outbound Definitions
+# -----------------------------------------------------------------------------
+# Custom outbounds for routing traffic through proxies.
+# The first defined outbound is the "default" outbound.
+
+outbounds:
+  # Direct outbound (overrides built-in direct with custom settings)
+  - name: direct
+    type: direct
+    direct:
+      # IP version preference mode:
+      #   auto - Dual-stack "happy eyeballs", try both IPv4 and IPv6 simultaneously
+      #   64   - Prefer IPv6, fallback to IPv4
+      #   46   - Prefer IPv4, fallback to IPv6
+      #   6    - IPv6 only, fail if unavailable
+      #   4    - IPv4 only, fail if unavailable
+      mode: auto
+
+      # Bind outgoing connections to a specific local IPv4 address
+      # bindIPv4: 2.4.6.8
+
+      # Bind outgoing connections to a specific local IPv6 address
+      # bindIPv6: "::1"
+
+      # Bind outgoing connections to a specific network device (Linux only)
+      # NOTE: bindDevice is mutually exclusive with bindIPv4/bindIPv6
+      # bindDevice: eth0
+
+      # Enable TCP Fast Open for optimized connection establishment (Linux/macOS)
+      fastOpen: false
+
+  # SOCKS5 proxy outbound
+  - name: proxy
+    type: socks5
+    socks5:
+      addr: 127.0.0.1:1080
+
+  # SOCKS5 with authentication
+  - name: proxy-auth
+    type: socks5
+    socks5:
+      addr: 192.168.1.100:1080
+      username: user
+      password: pass
+
+  # HTTP proxy outbound (CONNECT method)
+  - name: http-proxy
+    type: http
+    http:
+      url: http://192.168.1.100:8080
+
+  # HTTPS proxy with authentication
+  - name: https-proxy
+    type: http
+    http:
+      url: https://user:pass@proxy.example.com:443
+      insecure: false  # set true to skip TLS verification
+
+# -----------------------------------------------------------------------------
+# ACL Rules
+# -----------------------------------------------------------------------------
+# Rules are matched top-to-bottom, first match wins.
+# Lines starting with # are comments; inline comments with # are also supported.
+#
+# Rule syntax:
+#   outbound(address)
+#   outbound(address, proto/port)
+#   outbound(address, proto/port, hijack_ip)
+
+acl:
+  # You can load rules from an external file:
+  # file: /etc/acl-engine/rules.acl
+
+  # Or define rules inline:
+  inline:
+    # ==========================================================================
+    # 1. IP Address Matching
+    # ==========================================================================
+
+    # Single IP address (exact match)
+    - direct(192.168.1.1)
+    - direct(10.0.0.1)
+
+    # CIDR range matching
+    - direct(192.168.0.0/16)        # Class C private network
+    - direct(10.0.0.0/8)            # Class A private network
+    - direct(172.16.0.0/12)         # Class B private network
+    - direct(127.0.0.0/8)           # Loopback
+    - direct(100.64.0.0/10)         # Carrier-grade NAT
+
+    # IPv6 CIDR
+    - direct(fc00::/7)              # IPv6 unique local
+    - direct(fe80::/10)             # IPv6 link-local
+    - direct(::1/128)               # IPv6 loopback
+
+    # ==========================================================================
+    # 2. Domain Matching
+    # ==========================================================================
+
+    # Exact domain match (only matches this exact domain)
+    - direct(example.com)
+    - direct(localhost)
+
+    # Wildcard domain match (matches any subdomain, recursive)
+    #   *.example.com matches:
+    #     - www.example.com
+    #     - mail.example.com
+    #     - a.b.c.example.com
+    #   Does NOT match: example.com
+    - proxy(*.google.com)
+    - proxy(*.youtube.com)
+
+    # Suffix domain match (matches domain + all subdomains)
+    #   suffix:example.com matches:
+    #     - example.com       (the domain itself)
+    #     - www.example.com   (subdomains)
+    #     - a.b.example.com   (nested subdomains)
+    - proxy(suffix:github.com)
+    - proxy(suffix:stackoverflow.com)
+    - direct(suffix:baidu.com)
+    - direct(suffix:qq.com)
+
+    # ==========================================================================
+    # 3. GeoIP Matching (country-based IP routing)
+    # ==========================================================================
+    # Requires GeoIP data (dat/mmdb/metadb format)
+
+    - direct(geoip:cn)              # Chinese IPs -> direct
+    - direct(geoip:private)         # Private/reserved IPs -> direct
+    - proxy(geoip:us)               # US IPs -> proxy
+    - reject(geoip:ru)              # Russian IPs -> reject
+
+    # ==========================================================================
+    # 4. GeoSite Matching (domain list-based routing)
+    # ==========================================================================
+    # Requires GeoSite data (dat/sing format)
+    # Common GeoSite categories: google, netflix, disney, tiktok, openai,
+    #   cn, category-porn, category-ads, etc.
+
+    - proxy(geosite:google)          # All Google-related domains
+    - proxy(geosite:netflix)         # Netflix domains
+    - proxy(geosite:disney)          # Disney+ domains
+    - proxy(geosite:openai)          # OpenAI / ChatGPT domains
+    - proxy(geosite:tiktok)          # TikTok domains
+    - proxy(geosite:reddit)          # Reddit domains
+    - direct(geosite:cn)             # Chinese websites -> direct
+
+    # GeoSite with attribute filtering
+    #   geosite:name@attr - only entries with the specified attribute
+    - proxy(geosite:google@cn)       # Google domains tagged with @cn
+    - reject(geosite:category-ads)   # Block ad domains
+    - reject(geosite:category-porn)  # Block adult content
+
+    # ==========================================================================
+    # 5. Protocol and Port Filtering
+    # ==========================================================================
+    # Format: proto/port or proto/start-end
+    # Protocols: tcp, udp, * (both)
+
+    # Block QUIC protocol (UDP port 443)
+    - reject(all, udp/443)
+
+    # Specific protocol/port combinations
+    - proxy(all, tcp/22)             # SSH traffic -> proxy
+    - proxy(all, tcp/25)             # SMTP
+    - proxy(all, tcp/465)            # SMTPS
+    - proxy(all, tcp/587)            # SMTP Submission
+    - proxy(all, tcp/993)            # IMAPS
+    - proxy(all, tcp/995)            # POP3S
+    - proxy(all, tcp/3389)           # RDP
+
+    # Port range matching
+    - direct(all, tcp/80-90)         # TCP ports 80-90 -> direct
+    - reject(all, udp/1-1024)        # Block all UDP low ports
+
+    # Any protocol, specific port
+    - proxy(all, */8080)             # Any protocol on port 8080
+
+    # ==========================================================================
+    # 6. DNS Hijacking
+    # ==========================================================================
+    # Third parameter: redirect DNS queries to a specific IP
+    # Format: outbound(address, proto/port, hijack_ip)
+
+    - direct(all, udp/53, 114.114.114.114)   # Hijack DNS to 114DNS
+    - direct(all, tcp/53, 114.114.114.114)    # TCP DNS hijack
+
+    # ==========================================================================
+    # 7. Combining Address + Port Rules
+    # ==========================================================================
+
+    # Route specific domain + port combinations
+    - proxy(suffix:example.com, tcp/443)      # HTTPS to example.com via proxy
+    - direct(geoip:cn, tcp/80)                # HTTP to Chinese IPs -> direct
+
+    # ==========================================================================
+    # 8. Catch-all / Default Rule (should be LAST)
+    # ==========================================================================
+    # "all" or "*" matches everything not caught by above rules
+
+    - proxy(all)                     # Everything else -> proxy
+    # - direct(all)                  # Or: everything else -> direct
+    # - reject(all)                  # Or: block everything else
+
+# =============================================================================
+# Quick Reference
+# =============================================================================
+#
+# Address Types:
+#   1.2.3.4           - Exact IP
+#   192.168.0.0/16    - CIDR range
+#   example.com       - Exact domain
+#   *.example.com     - Wildcard domain (subdomains only)
+#   suffix:example.com- Domain + all subdomains
+#   geoip:cn          - Country-based IP matching
+#   geosite:google    - Domain list matching
+#   geosite:name@attr - Domain list with attribute filter
+#   all / *           - Match everything (catch-all)
+#
+# Protocol/Port:
+#   tcp/443           - TCP port 443
+#   udp/53            - UDP port 53
+#   */80              - Any protocol, port 80
+#   tcp/8000-9000     - TCP port range
+#
+# Outbound Types:   direct, reject, socks5, http/https
+#
+# Direct Mode:     auto, 64, 46, 6, 4
+# Direct Options:  mode, bindIPv4, bindIPv6, bindDevice (Linux), fastOpen (Linux/macOS)
+# =============================================================================

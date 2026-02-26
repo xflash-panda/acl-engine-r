@@ -62,6 +62,11 @@ impl MetaDbReader {
 
     /// Lookup country codes for an IP
     pub fn lookup_codes(&self, ip: IpAddr) -> Vec<String> {
+        let result = match self.reader.lookup(ip) {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+
         match self.db_type {
             DatabaseType::MaxMind => {
                 #[derive(Deserialize)]
@@ -73,33 +78,21 @@ impl MetaDbReader {
                     iso_code: Option<String>,
                 }
 
-                match self
-                    .reader
-                    .lookup(ip)
-                    .ok()
-                    .and_then(|r| r.decode::<Country>().ok().flatten())
-                {
-                    Some(record) => {
+                match result.decode::<Country>() {
+                    Ok(Some(record)) => {
                         if let Some(code) = record.country.and_then(|c| c.iso_code) {
                             vec![code]
                         } else {
                             vec![]
                         }
                     }
-                    None => vec![],
-                }
-            }
-            DatabaseType::Sing => {
-                match self
-                    .reader
-                    .lookup(ip)
-                    .ok()
-                    .and_then(|r| r.decode::<String>().ok().flatten())
-                {
-                    Some(code) if !code.is_empty() => vec![code],
                     _ => vec![],
                 }
             }
+            DatabaseType::Sing => match result.decode::<String>() {
+                Ok(Some(code)) if !code.is_empty() => vec![code],
+                _ => vec![],
+            },
             DatabaseType::MetaV0 => {
                 // MetaV0 can return multiple codes
                 #[derive(Deserialize)]
@@ -109,14 +102,9 @@ impl MetaDbReader {
                     Multiple(Vec<String>),
                 }
 
-                match self
-                    .reader
-                    .lookup(ip)
-                    .ok()
-                    .and_then(|r| r.decode::<MetaV0Result>().ok().flatten())
-                {
-                    Some(MetaV0Result::Single(code)) if !code.is_empty() => vec![code],
-                    Some(MetaV0Result::Multiple(codes)) => {
+                match result.decode::<MetaV0Result>() {
+                    Ok(Some(MetaV0Result::Single(code))) if !code.is_empty() => vec![code],
+                    Ok(Some(MetaV0Result::Multiple(codes))) => {
                         codes.into_iter().filter(|c| !c.is_empty()).collect()
                     }
                     _ => vec![],

@@ -76,7 +76,6 @@ pub mod geo;
 pub mod matcher;
 pub mod outbound;
 pub mod parser;
-pub mod resolver;
 pub mod router;
 pub mod types;
 
@@ -91,7 +90,7 @@ pub use matcher::{
     AllMatcher, CidrMatcher, DomainEntry, DomainMatcher, DomainType, GeoIpMatcher, GeoSiteMatcher,
     HostMatcher, IpMatcher, Matcher,
 };
-pub use parser::{parse_proto_port, parse_rules};
+pub use parser::{parse_proto_port, parse_rules, parse_rules_from_file};
 pub use types::{HostInfo, MatchResult, Protocol, TextRule};
 
 // Re-export outbound types
@@ -103,13 +102,6 @@ pub use outbound::{
 // Re-export async outbound types
 #[cfg(feature = "async")]
 pub use outbound::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn, TokioUdpConn};
-
-// Re-export resolver types
-pub use resolver::{NilResolver, Resolver, StaticResolver, SystemResolver};
-
-// Re-export async resolver types
-#[cfg(feature = "async")]
-pub use resolver::AsyncResolver;
 
 // Re-export router types
 pub use router::{OutboundEntry, Router, RouterOptions, DEFAULT_CACHE_SIZE};

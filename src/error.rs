@@ -30,6 +30,9 @@ pub enum AclError {
     #[error("GeoSite error: {0}")]
     GeoSiteError(String),
 
+    #[error("Config error: {0}")]
+    ConfigError(String),
+
     #[error("Outbound error: {0}")]
     OutboundError(String),
 

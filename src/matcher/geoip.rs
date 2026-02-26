@@ -77,8 +77,8 @@ impl GeoIpMatcher {
         let matches = reader
             .lookup(ip)
             .ok()
-            .and_then(|r| r.decode::<Country>().ok().flatten())
-            .and_then(|r| r.country)
+            .and_then(|result| result.decode::<Country>().ok()?)
+            .and_then(|record| record.country)
             .and_then(|c| c.iso_code)
             .map(|code| code.to_uppercase() == self.country_code)
             .unwrap_or(false);

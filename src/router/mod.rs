@@ -4,16 +4,17 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::compile::{compile, CompiledRuleSet};
 use crate::error::{AclError, Result};
 use crate::geo::GeoLoader;
-use crate::outbound::{Addr, Direct, DirectMode, Outbound, Reject, ResolveInfo, TcpConn, UdpConn};
+use crate::outbound::{
+    split_ipv4_ipv6, Addr, Direct, DirectMode, Outbound, Reject, ResolveInfo, TcpConn, UdpConn,
+};
 use crate::parser::parse_rules;
-use crate::resolver::Resolver;
 use crate::types::Protocol;
 
 /// Default LRU cache size
@@ -22,10 +23,10 @@ pub const DEFAULT_CACHE_SIZE: usize = 1024;
 /// Router routes connections to different outbounds based on ACL rules.
 ///
 /// It implements the Outbound interface, allowing it to be used as an outbound itself.
-pub struct Router<R: Resolver> {
+/// DNS resolution uses the system resolver.
+pub struct Router {
     rule_set: CompiledRuleSet<Arc<dyn Outbound>>,
     default_outbound: Arc<dyn Outbound>,
-    resolver: Option<R>,
 }
 
 /// Named outbound entry.
@@ -47,23 +48,20 @@ impl OutboundEntry {
 }
 
 /// Router builder options.
-pub struct RouterOptions<R: Resolver> {
+pub struct RouterOptions {
     /// LRU cache size for rule matching results
     pub cache_size: usize,
-    /// Custom DNS resolver
-    pub resolver: Option<R>,
 }
 
-impl<R: Resolver> Default for RouterOptions<R> {
+impl Default for RouterOptions {
     fn default() -> Self {
         Self {
             cache_size: DEFAULT_CACHE_SIZE,
-            resolver: None,
         }
     }
 }
 
-impl<R: Resolver> RouterOptions<R> {
+impl RouterOptions {
     /// Create new router options.
     pub fn new() -> Self {
         Self::default()
@@ -74,21 +72,15 @@ impl<R: Resolver> RouterOptions<R> {
         self.cache_size = size;
         self
     }
-
-    /// Set custom resolver.
-    pub fn with_resolver(mut self, resolver: R) -> Self {
-        self.resolver = Some(resolver);
-        self
-    }
 }
 
-impl<R: Resolver> Router<R> {
+impl Router {
     /// Create a new router from ACL rules string.
     pub fn new(
         rules: &str,
         outbounds: Vec<OutboundEntry>,
         geo_loader: &dyn GeoLoader,
-        options: RouterOptions<R>,
+        options: RouterOptions,
     ) -> Result<Self> {
         let text_rules = parse_rules(rules)?;
         let ob_map = outbounds_to_map(outbounds);
@@ -102,7 +94,6 @@ impl<R: Resolver> Router<R> {
         Ok(Self {
             rule_set,
             default_outbound,
-            resolver: options.resolver,
         })
     }
 
@@ -111,40 +102,45 @@ impl<R: Resolver> Router<R> {
         path: impl AsRef<Path>,
         outbounds: Vec<OutboundEntry>,
         geo_loader: &dyn GeoLoader,
-        options: RouterOptions<R>,
+        options: RouterOptions,
     ) -> Result<Self> {
         let rules = fs::read_to_string(path.as_ref())
             .map_err(|e| AclError::ParseError(format!("Failed to read rules file: {}", e)))?;
         Self::new(&rules, outbounds, geo_loader, options)
     }
 
-    /// Resolve the address using the configured resolver.
+    /// Resolve the address using system DNS.
     fn resolve(&self, addr: &mut Addr) {
-        if let Some(ref resolver) = self.resolver {
-            // Check if host is already an IP address
-            if let Ok(ip) = addr.host.parse::<IpAddr>() {
-                match ip {
-                    IpAddr::V4(v4) => {
-                        addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-                    }
-                    IpAddr::V6(v6) => {
-                        addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-                    }
+        // Check if host is already an IP address
+        if let Ok(ip) = addr.host.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(v4) => {
+                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
                 }
-                return;
+                IpAddr::V6(v6) => {
+                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
+                }
             }
+            return;
+        }
 
-            match resolver.resolve(&addr.host) {
-                Ok((ipv4, ipv6)) => {
+        // Resolve using system DNS
+        match (addr.host.as_str(), 0u16).to_socket_addrs() {
+            Ok(addrs) => {
+                let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
+                if ipv4.is_none() && ipv6.is_none() {
+                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
+                } else {
                     addr.resolve_info = Some(ResolveInfo {
                         ipv4,
                         ipv6,
                         error: None,
                     });
                 }
-                Err(e) => {
-                    addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
-                }
+            }
+            Err(e) => {
+                addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
             }
         }
     }
@@ -183,7 +179,7 @@ impl<R: Resolver> Router<R> {
     }
 }
 
-impl<R: Resolver + 'static> Outbound for Router<R> {
+impl Outbound for Router {
     fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
         self.resolve(addr);
         let outbound = self.match_outbound(addr, Protocol::TCP);
@@ -232,7 +228,6 @@ fn outbounds_to_map(outbounds: Vec<OutboundEntry>) -> HashMap<String, Arc<dyn Ou
 mod tests {
     use super::*;
     use crate::geo::NilGeoLoader;
-    use crate::resolver::NilResolver;
 
     #[test]
     fn test_outbounds_to_map() {
@@ -256,7 +251,7 @@ mod tests {
 
         let outbounds = vec![];
         let geo_loader = NilGeoLoader;
-        let options: RouterOptions<NilResolver> = RouterOptions::new();
+        let options = RouterOptions::new();
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(router.is_ok());

@@ -349,7 +349,8 @@ impl AutoGeoLoader {
             .map_err(|e| AclError::GeoIpError(format!("Download failed: {}", e)))?;
 
         let mut file = fs::File::create(&tmp_path)?;
-        let mut reader = response.into_reader();
+        let (_, body) = response.into_parts();
+        let mut reader = body.into_reader();
         std::io::copy(&mut reader, &mut file)?;
         file.flush()?;
         drop(file);
