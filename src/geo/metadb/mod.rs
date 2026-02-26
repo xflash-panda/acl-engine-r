@@ -62,6 +62,11 @@ impl MetaDbReader {
 
     /// Lookup country codes for an IP
     pub fn lookup_codes(&self, ip: IpAddr) -> Vec<String> {
+        let result = match self.reader.lookup(ip) {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+
         match self.db_type {
             DatabaseType::MaxMind => {
                 #[derive(Deserialize)]
@@ -73,19 +78,19 @@ impl MetaDbReader {
                     iso_code: Option<String>,
                 }
 
-                match self.reader.lookup::<Country>(ip) {
-                    Ok(record) => {
+                match result.decode::<Country>() {
+                    Ok(Some(record)) => {
                         if let Some(code) = record.country.and_then(|c| c.iso_code) {
                             vec![code]
                         } else {
                             vec![]
                         }
                     }
-                    Err(_) => vec![],
+                    _ => vec![],
                 }
             }
-            DatabaseType::Sing => match self.reader.lookup::<String>(ip) {
-                Ok(code) if !code.is_empty() => vec![code],
+            DatabaseType::Sing => match result.decode::<String>() {
+                Ok(Some(code)) if !code.is_empty() => vec![code],
                 _ => vec![],
             },
             DatabaseType::MetaV0 => {
@@ -97,9 +102,9 @@ impl MetaDbReader {
                     Multiple(Vec<String>),
                 }
 
-                match self.reader.lookup::<MetaV0Result>(ip) {
-                    Ok(MetaV0Result::Single(code)) if !code.is_empty() => vec![code],
-                    Ok(MetaV0Result::Multiple(codes)) => {
+                match result.decode::<MetaV0Result>() {
+                    Ok(Some(MetaV0Result::Single(code))) if !code.is_empty() => vec![code],
+                    Ok(Some(MetaV0Result::Multiple(codes))) => {
                         codes.into_iter().filter(|c| !c.is_empty()).collect()
                     }
                     _ => vec![],
