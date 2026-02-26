@@ -520,7 +520,6 @@ mod format_detection_tests {
 
 mod router_tests {
     use super::*;
-    use acl_engine_r::resolver::NilResolver;
     use acl_engine_r::{Direct, OutboundEntry, Reject, Router, RouterOptions};
     use std::sync::Arc;
 
@@ -549,7 +548,7 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new())),
         ];
 
-        let options: RouterOptions<NilResolver> = RouterOptions::new().with_cache_size(1024);
+        let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -585,7 +584,7 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new())),
         ];
 
-        let options: RouterOptions<NilResolver> = RouterOptions::new().with_cache_size(1024);
+        let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -638,7 +637,7 @@ mod router_tests {
             OutboundEntry::new("reject", Arc::new(Reject::new())),
         ];
 
-        let options: RouterOptions<NilResolver> = RouterOptions::new().with_cache_size(2048);
+        let options: RouterOptions = RouterOptions::new().with_cache_size(2048);
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -672,7 +671,7 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new())),
         ];
 
-        let options: RouterOptions<NilResolver> = RouterOptions::new();
+        let options: RouterOptions = RouterOptions::new();
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -709,7 +708,7 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new())),
         ];
 
-        let options: RouterOptions<NilResolver> = RouterOptions::new();
+        let options: RouterOptions = RouterOptions::new();
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
