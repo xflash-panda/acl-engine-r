@@ -39,7 +39,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # HTTP client for auto-download
-ureq = "2.9"
+ureq = "3.2"
 
 # Socket control for bind IP and advanced socket options
 socket2 = "0.6"
