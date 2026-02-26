@@ -53,7 +53,11 @@ pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
 pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|e| {
-        AclError::ParseError(format!("Failed to read rules file '{}': {}", path.display(), e))
+        AclError::ParseError(format!(
+            "Failed to read rules file '{}': {}",
+            path.display(),
+            e
+        ))
     })?;
     parse_rules(&text)
 }

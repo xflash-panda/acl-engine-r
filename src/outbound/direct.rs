@@ -164,9 +164,7 @@ impl Direct {
         };
         let socket =
             socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to create socket: {}", e))
-                })?;
+                .map_err(|e| AclError::OutboundError(format!("Failed to create socket: {}", e)))?;
 
         // Bind to IP address
         if let Some(bind_ip) = self.get_bind_ip(ip) {
@@ -567,8 +565,9 @@ impl AsyncOutbound for Direct {
                 AclError::OutboundError(format!("Failed to set nonblocking: {}", e))
             })?;
             let std_socket: std::net::UdpSocket = socket.into();
-            TokioUdpSocket::from_std(std_socket)
-                .map_err(|e| AclError::OutboundError(format!("Failed to create UDP socket: {}", e)))?
+            TokioUdpSocket::from_std(std_socket).map_err(|e| {
+                AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
+            })?
         } else if use_ipv6 {
             let bind_addr = self
                 .bind_ip6
