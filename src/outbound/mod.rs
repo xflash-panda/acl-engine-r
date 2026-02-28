@@ -51,6 +51,20 @@ impl Addr {
         }
     }
 
+    /// Create an Addr from a SocketAddr, pre-populating resolve info.
+    /// This avoids redundant DNS resolution for addresses from UDP recv_from.
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        let resolve_info = match addr.ip() {
+            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
+            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
+        };
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            resolve_info: Some(resolve_info),
+        }
+    }
+
     /// Create a new Addr with resolve info
     pub fn with_resolve_info(mut self, info: ResolveInfo) -> Self {
         self.resolve_info = Some(info);
@@ -283,7 +297,7 @@ impl UdpConn for StdUdpConn {
             .inner
             .recv_from(buf)
             .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
-        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
+        Ok((n, Addr::from_socket_addr(addr)))
     }
 
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
@@ -392,7 +406,7 @@ impl AsyncUdpConn for TokioUdpConn {
             .recv_from(buf)
             .await
             .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
-        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
+        Ok((n, Addr::from_socket_addr(addr)))
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
@@ -428,4 +442,50 @@ pub fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<st
     }
 
     (ipv4, ipv6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn test_addr_from_socket_addr_v4() {
+        let sock_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let addr = Addr::from_socket_addr(sock_addr);
+
+        assert_eq!(addr.host, "192.168.1.1");
+        assert_eq!(addr.port, 8080);
+        assert!(addr.resolve_info.is_some());
+        let info = addr.resolve_info.unwrap();
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_addr_from_socket_addr_v6() {
+        let sock_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let addr = Addr::from_socket_addr(sock_addr);
+
+        assert_eq!(addr.host, "::1");
+        assert_eq!(addr.port, 443);
+        assert!(addr.resolve_info.is_some());
+        let info = addr.resolve_info.unwrap();
+        assert!(info.ipv4.is_none());
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_addr_new_basic() {
+        let addr = Addr::new("example.com", 80);
+        assert_eq!(addr.host, "example.com");
+        assert_eq!(addr.port, 80);
+        assert!(addr.resolve_info.is_none());
+    }
+
+    #[test]
+    fn test_addr_display() {
+        let addr = Addr::new("example.com", 443);
+        assert_eq!(format!("{}", addr), "example.com:443");
+    }
 }
