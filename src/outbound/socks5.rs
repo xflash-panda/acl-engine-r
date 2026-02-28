@@ -63,17 +63,17 @@ impl Socks5 {
     }
 
     /// Create a new SOCKS5 outbound with authentication.
+    ///
+    /// # Panics
+    /// Panics if username or password exceeds 255 bytes (RFC 1929 limit).
+    /// Use [`try_with_auth`](Self::try_with_auth) for a fallible alternative.
     pub fn with_auth(
         addr: impl Into<String>,
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
-        Self {
-            addr: addr.into(),
-            username: Some(username.into()),
-            password: Some(password.into()),
-            timeout: DEFAULT_DIALER_TIMEOUT,
-        }
+        Self::try_with_auth(addr, username, password)
+            .expect("SOCKS5 credential validation failed")
     }
 
     /// Create a new SOCKS5 outbound with authentication, validating credential lengths.
@@ -974,6 +974,33 @@ mod tests {
         let max_pass = "b".repeat(255);
         let result = Socks5::try_with_auth("127.0.0.1:1080", &max_user, &max_pass);
         assert!(result.is_ok(), "255-byte credentials should be accepted");
+    }
+
+    #[test]
+    #[should_panic(expected = "SOCKS5 username too long")]
+    fn test_with_auth_panics_on_oversized_username() {
+        // Bug: with_auth() silently accepts >255 byte credentials, causing
+        // `len() as u8` truncation in dial_and_negotiate() which corrupts
+        // the SOCKS5 auth protocol stream.
+        let long_user = "a".repeat(256);
+        let _ = Socks5::with_auth("127.0.0.1:1080", &long_user, "pass");
+    }
+
+    #[test]
+    #[should_panic(expected = "SOCKS5 password too long")]
+    fn test_with_auth_panics_on_oversized_password() {
+        let long_pass = "b".repeat(256);
+        let _ = Socks5::with_auth("127.0.0.1:1080", "user", &long_pass);
+    }
+
+    #[test]
+    fn test_with_auth_accepts_max_length_credentials() {
+        // 255 bytes is the RFC 1929 maximum - should NOT panic
+        let max_user = "a".repeat(255);
+        let max_pass = "b".repeat(255);
+        let socks5 = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass);
+        assert_eq!(socks5.username.as_ref().unwrap().len(), 255);
+        assert_eq!(socks5.password.as_ref().unwrap().len(), 255);
     }
 
     #[test]
