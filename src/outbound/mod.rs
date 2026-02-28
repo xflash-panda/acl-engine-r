@@ -42,13 +42,44 @@ pub struct Addr {
 }
 
 impl Addr {
-    /// Create a new Addr
+    /// Create a new Addr.
+    ///
+    /// Control characters (bytes < 0x20 and 0x7F) are stripped from the host
+    /// to prevent injection attacks in downstream protocols (HTTP CONNECT, SOCKS5).
+    /// Use [`try_new`](Self::try_new) for strict validation that rejects bad input.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
+        let host: String = host
+            .into()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
         Self {
-            host: host.into(),
+            host,
             port,
             resolve_info: None,
         }
+    }
+
+    /// Create a new Addr with strict validation.
+    ///
+    /// Returns an error if:
+    /// - host is empty
+    /// - host contains control characters (bytes < 0x20 or 0x7F)
+    pub fn try_new(host: impl Into<String>, port: u16) -> Result<Self> {
+        let host = host.into();
+        if host.is_empty() {
+            return Err(AclError::InvalidAddress("host must not be empty".to_string()));
+        }
+        if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(AclError::InvalidAddress(
+                "host contains control characters".to_string(),
+            ));
+        }
+        Ok(Self {
+            host,
+            port,
+            resolve_info: None,
+        })
     }
 
     /// Create an Addr from a SocketAddr, pre-populating resolve info.
@@ -83,6 +114,8 @@ impl Addr {
     /// If ResolveInfo contains an IPv4 address, it returns that.
     /// Otherwise, if it contains an IPv6 address, it returns that.
     /// If no resolved address is available, it falls back to Host.
+    ///
+    /// Returns `"0.0.0.0:{port}"` if host is empty (defensive fallback).
     pub fn network_addr(&self) -> String {
         if let Some(ref info) = self.resolve_info {
             if let Some(ipv4) = info.ipv4 {
@@ -91,6 +124,14 @@ impl Addr {
             if let Some(ipv6) = info.ipv6 {
                 return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
             }
+        }
+        if self.host.is_empty() {
+            return SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), self.port)
+                .to_string();
+        }
+        // If host is an IPv6 literal, format as [ip]:port via SocketAddr
+        if let Ok(ipv6) = self.host.parse::<std::net::Ipv6Addr>() {
+            return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
         }
         self.to_string()
     }
@@ -598,5 +639,60 @@ mod tests {
         assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 0, 1)));
         assert!(info.ipv6.is_none());
         assert!(info.error.is_none());
+    }
+
+    // ===== Bug verification tests =====
+
+    #[test]
+    fn test_addr_empty_host_network_addr_should_be_valid() {
+        // P0-2: Addr::new("", 80) creates ":80" which is not a valid address.
+        // network_addr() should produce a parseable SocketAddr or host:port.
+        let addr = Addr::new("", 80);
+        let network = addr.network_addr();
+        // ":80" is not valid — this exposes the lack of validation
+        assert_ne!(network, ":80", "empty host should not produce ':port' address");
+    }
+
+    #[test]
+    fn test_addr_control_chars_in_host() {
+        // P0-2: Addr accepts control chars in host, can cause injection downstream
+        let addr = Addr::new("evil\r\nHost: injected\r\n", 80);
+        // Host should not contain control characters
+        assert!(
+            !addr.host.bytes().any(|b| b < 0x20),
+            "Addr should reject control characters in host"
+        );
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_ipv6_literal_without_resolve_info() {
+        // BUG B1: Addr::new("::1", 80) without resolve_info
+        // to_socket_addr() calls network_addr() which falls back to Display
+        // Display produces "::1:80" which is NOT a valid SocketAddr.
+        // Should produce "[::1]:80" instead.
+        let addr = Addr::new("::1", 80);
+        let result = addr.to_socket_addr();
+        assert!(
+            result.is_ok(),
+            "to_socket_addr should parse IPv6 literal '::1' without resolve_info, got: {:?}",
+            result
+        );
+        let sock = result.unwrap();
+        assert_eq!(sock.port(), 80);
+        assert!(sock.ip().is_loopback());
+    }
+
+    #[test]
+    fn test_addr_network_addr_ipv6_literal_without_resolve_info() {
+        // BUG B1: network_addr() for IPv6 literal without resolve_info
+        // falls back to self.to_string() = "::1:80" which is unparseable.
+        let addr = Addr::new("2001:db8::1", 443);
+        let network = addr.network_addr();
+        // Must be parseable as a SocketAddr
+        assert!(
+            network.parse::<std::net::SocketAddr>().is_ok(),
+            "network_addr for IPv6 literal should be parseable, got: {}",
+            network
+        );
     }
 }

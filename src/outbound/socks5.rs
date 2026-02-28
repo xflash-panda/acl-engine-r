@@ -206,22 +206,8 @@ impl Socks5 {
 
     /// Create a new SOCKS5 outbound with authentication.
     ///
-    /// # Panics
-    /// Panics if username or password exceeds 255 bytes (RFC 1929 limit).
-    /// Use [`try_with_auth`](Self::try_with_auth) for a fallible alternative.
-    #[track_caller]
+    /// Returns an error if username or password exceeds 255 bytes (RFC 1929 limit).
     pub fn with_auth(
-        addr: impl Into<String>,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Self {
-        Self::try_with_auth(addr, username, password)
-            .unwrap_or_else(|e| panic!("{e}"))
-    }
-
-    /// Create a new SOCKS5 outbound with authentication, validating credential lengths.
-    /// RFC 1929 limits username and password to 255 bytes each.
-    pub fn try_with_auth(
         addr: impl Into<String>,
         username: impl Into<String>,
         password: impl Into<String>,
@@ -246,6 +232,16 @@ impl Socks5 {
             password: Some(password),
             timeout: DEFAULT_DIALER_TIMEOUT,
         })
+    }
+
+    /// Deprecated: Use [`with_auth`](Self::with_auth) instead (same signature now).
+    #[deprecated(since = "0.3.3", note = "Use with_auth() instead, which now returns Result")]
+    pub fn try_with_auth(
+        addr: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        Self::with_auth(addr, username, password)
     }
 
     /// Set connection timeout.
@@ -871,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_socks5_with_auth() {
-        let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass");
+        let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass").unwrap();
         assert_eq!(socks5.addr, "127.0.0.1:1080");
         assert_eq!(socks5.username, Some("user".to_string()));
         assert_eq!(socks5.password, Some("pass".to_string()));
@@ -923,28 +919,33 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "SOCKS5 username too long")]
-    fn test_with_auth_panics_on_oversized_username() {
-        // Bug: with_auth() silently accepts >255 byte credentials, causing
-        // `len() as u8` truncation in dial_and_negotiate() which corrupts
-        // the SOCKS5 auth protocol stream.
+    fn test_with_auth_returns_error_on_oversized_username() {
         let long_user = "a".repeat(256);
-        let _ = Socks5::with_auth("127.0.0.1:1080", &long_user, "pass");
+        let result = Socks5::with_auth("127.0.0.1:1080", &long_user, "pass");
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("too long")),
+            Ok(_) => panic!("expected error"),
+        }
     }
 
     #[test]
-    #[should_panic(expected = "SOCKS5 password too long")]
-    fn test_with_auth_panics_on_oversized_password() {
+    fn test_with_auth_returns_error_on_oversized_password() {
         let long_pass = "b".repeat(256);
-        let _ = Socks5::with_auth("127.0.0.1:1080", "user", &long_pass);
+        let result = Socks5::with_auth("127.0.0.1:1080", "user", &long_pass);
+        assert!(result.is_err());
+        match result {
+            Err(e) => assert!(e.to_string().contains("too long")),
+            Ok(_) => panic!("expected error"),
+        }
     }
 
     #[test]
     fn test_with_auth_accepts_max_length_credentials() {
-        // 255 bytes is the RFC 1929 maximum - should NOT panic
+        // 255 bytes is the RFC 1929 maximum
         let max_user = "a".repeat(255);
         let max_pass = "b".repeat(255);
-        let socks5 = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass);
+        let socks5 = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass).unwrap();
         assert_eq!(socks5.username.as_ref().unwrap().len(), 255);
         assert_eq!(socks5.password.as_ref().unwrap().len(), 255);
     }
@@ -1330,6 +1331,23 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().is_err());
     }
+
+    // ===== Bug verification tests =====
+
+    #[test]
+    fn test_with_auth_long_username_returns_result_not_panic() {
+        // P0-1 fix: with_auth now returns Result instead of panicking
+        let long_user = "a".repeat(256);
+        let result = Socks5::with_auth("127.0.0.1:1080", long_user, "pass");
+        assert!(result.is_err(), "with_auth should return Err for long credentials");
+    }
+
+    #[test]
+    fn test_with_auth_long_password_returns_result_not_panic() {
+        let long_pass = "b".repeat(256);
+        let result = Socks5::with_auth("127.0.0.1:1080", "user", long_pass);
+        assert!(result.is_err(), "with_auth should return Err for long credentials");
+    }
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -1345,7 +1363,7 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_socks5_with_auth() {
-        let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass");
+        let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass").unwrap();
         assert_eq!(socks5.username, Some("user".to_string()));
         assert_eq!(socks5.password, Some("pass".to_string()));
     }
@@ -1398,6 +1416,7 @@ mod async_tests {
         });
 
         let socks5 = Socks5::with_auth(format!("127.0.0.1:{}", port), "user", "pass")
+            .unwrap()
             .with_timeout(Duration::from_secs(5));
 
         // The auth exchange should timeout, not hang forever.

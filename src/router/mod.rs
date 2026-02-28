@@ -483,4 +483,5 @@ mod tests {
         assert!(router.is_ok());
     }
 
+    // P1-8 verified: DNS error stored in ResolveInfo is by-design (router continues to default outbound)
 }

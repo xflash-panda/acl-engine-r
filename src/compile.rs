@@ -195,7 +195,16 @@ pub fn compile<O: Clone>(
     let mut compiled_rules = Vec::with_capacity(rules.len());
 
     for rule in rules {
-        let compiled = compile_rule(rule, outbounds, geo_loader)?;
+        let compiled = compile_rule(rule, outbounds, geo_loader).map_err(|e| {
+            if rule.line_num > 0 {
+                AclError::ParseErrorAtLine {
+                    line: rule.line_num,
+                    message: e.to_string(),
+                }
+            } else {
+                e
+            }
+        })?;
         compiled_rules.push(compiled);
     }
 
@@ -658,5 +667,32 @@ proxy(all)
 
         let result = compiled.match_host(&host, Protocol::TCP, 80);
         assert_eq!(result.unwrap().outbound, "PROXY");
+    }
+
+    // P1-4 verified: cache_size=0 → 1 is acceptable (NonZeroUsize fallback works fine)
+
+    #[test]
+    fn test_compile_unknown_outbound_error_includes_line_number() {
+        // BUG B2: When a rule references an unknown outbound, the error just says
+        // "Unknown outbound: typo_proxy" with no line number. TextRule has line_num
+        // but compile() doesn't use it. Third-party developers with large rule sets
+        // can't find which rule has the typo.
+        let text = "direct(all)\ntypo_proxy(example.com)\n";
+        let rules = parse_rules(text).unwrap();
+        let mut outbounds = HashMap::new();
+        outbounds.insert("direct".to_string(), "DIRECT");
+
+        let result = compile(&rules, &outbounds, 1024, &NilGeoLoader);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("line") || err_msg.contains("2"),
+                    "UnknownOutbound error should include line number context, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected UnknownOutbound error"),
+        }
     }
 }

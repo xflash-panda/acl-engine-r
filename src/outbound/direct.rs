@@ -257,27 +257,42 @@ impl Direct {
 
         let clone_v4 = self.clone();
         let tx_v4 = tx.clone();
+        let ip_v4 = IpAddr::V4(ipv4);
         thread::spawn(move || {
-            let _ = tx_v4.send(clone_v4.dial_tcp_ip(IpAddr::V4(ipv4), port));
+            let _ = tx_v4.send((ip_v4, clone_v4.dial_tcp_ip(ip_v4, port)));
         });
 
         let clone_v6 = self.clone();
+        let ip_v6 = IpAddr::V6(ipv6);
         thread::spawn(move || {
-            let _ = tx.send(clone_v6.dial_tcp_ip(IpAddr::V6(ipv6), port));
+            let _ = tx.send((ip_v6, clone_v6.dial_tcp_ip(ip_v6, port)));
         });
 
         // Get first result
-        let first = rx
+        let (first_ip, first) = rx
             .recv()
             .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
 
         if first.is_ok() {
             return first;
         }
+        let first_err = first.unwrap_err();
 
         // First failed, try second
-        rx.recv()
-            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?
+        let (second_ip, second) = rx
+            .recv()
+            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
+
+        if second.is_ok() {
+            return second;
+        }
+        let second_err = second.unwrap_err();
+
+        // Both failed — combine errors so the caller sees both attempts
+        Err(AclError::OutboundError(format!(
+            "dual-stack connection failed: {} ({}), {} ({})",
+            first_ip, first_err, second_ip, second_err
+        )))
     }
 
     /// Async resolve the address using system DNS if ResolveInfo is not available.
@@ -330,19 +345,28 @@ impl Direct {
         ipv6: Ipv6Addr,
         port: u16,
     ) -> Result<TokioTcpStream> {
-        tokio::select! {
+        let (first_ip, first_err, fallback_ip) = tokio::select! {
             result = self.async_dial_tcp_ip(IpAddr::V4(ipv4), port) => {
                 if result.is_ok() {
                     return result;
                 }
-                self.async_dial_tcp_ip(IpAddr::V6(ipv6), port).await
+                (IpAddr::V4(ipv4), result.unwrap_err(), IpAddr::V6(ipv6))
             }
             result = self.async_dial_tcp_ip(IpAddr::V6(ipv6), port) => {
                 if result.is_ok() {
                     return result;
                 }
-                self.async_dial_tcp_ip(IpAddr::V4(ipv4), port).await
+                (IpAddr::V6(ipv6), result.unwrap_err(), IpAddr::V4(ipv4))
             }
+        };
+
+        let fallback = self.async_dial_tcp_ip(fallback_ip, port).await;
+        match fallback {
+            Ok(stream) => Ok(stream),
+            Err(second_err) => Err(AclError::OutboundError(format!(
+                "dual-stack connection failed: {} ({}), {} ({})",
+                first_ip, first_err, fallback_ip, second_err
+            ))),
         }
     }
 }
@@ -811,6 +835,42 @@ mod tests {
         }).unwrap();
         let addr = direct.udp_bind_addr(true);
         assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 0));
+    }
+
+    #[test]
+    fn test_dual_stack_both_fail_error_includes_context() {
+        // BUG B3: dual_stack_dial_tcp silently discards the first error.
+        // When both v4 and v6 fail, the error should mention both attempts.
+        use super::Outbound;
+
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        }).unwrap();
+        let mut addr = Addr::new("test.invalid", 1);
+        // Both loopback on port 1 → "connection refused"
+        addr.resolve_info = Some(ResolveInfo {
+            ipv4: Some(Ipv4Addr::LOCALHOST),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        });
+
+        let result = Outbound::dial_tcp(&direct, &mut addr);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                // After fix: error should contain both addresses so the dev
+                // knows BOTH paths were tried and failed.
+                assert!(
+                    (err_msg.contains("127.0.0.1") && err_msg.contains("::1"))
+                        || err_msg.contains("dual")
+                        || err_msg.contains("both"),
+                    "Dual-stack failure should mention both addresses, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error on port 1"),
+        }
     }
 
 }

@@ -117,7 +117,12 @@ fn validate_connect_host(host: &str) -> Result<()> {
 
 /// Build an HTTP CONNECT request string.
 fn build_connect_request(host: &str, port: u16, basic_auth: Option<&str>) -> String {
-    let target = format!("{}:{}", host, port);
+    // IPv6 literals must be wrapped in brackets per RFC 7230 authority-form
+    let target = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
     let mut request = format!(
         "CONNECT {} HTTP/1.1\r\n\
          Host: {}\r\n\
@@ -654,6 +659,34 @@ mod tests {
     }
 
     #[test]
+    fn test_build_connect_request_ipv6_target() {
+        // BUG B4: build_connect_request formats IPv6 as "::1:80" (invalid).
+        // RFC 7230 requires authority-form with brackets: "[::1]:80".
+        let req = build_connect_request("::1", 80, None);
+        // The CONNECT target must use brackets for IPv6
+        assert!(
+            req.starts_with("CONNECT [::1]:80 HTTP/1.1\r\n"),
+            "IPv6 CONNECT target must use brackets, got: {}",
+            req.lines().next().unwrap_or("")
+        );
+        assert!(
+            req.contains("Host: [::1]:80\r\n"),
+            "Host header must use brackets for IPv6, got: {}",
+            req
+        );
+    }
+
+    #[test]
+    fn test_build_connect_request_ipv6_full_address() {
+        let req = build_connect_request("2001:db8::1", 443, None);
+        assert!(
+            req.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"),
+            "Full IPv6 CONNECT target must use brackets, got: {}",
+            req.lines().next().unwrap_or("")
+        );
+    }
+
+    #[test]
     fn test_parse_connect_status_success() {
         let line = "HTTP/1.1 200 Connection established\r\n";
         let result = parse_connect_status(line);
@@ -1015,43 +1048,20 @@ mod tests {
     }
 
     #[test]
-    fn test_http_connect_rejects_crlf_in_host() {
-        // BUG #9: HTTP CONNECT header injection via unsanitized host.
-        // If addr.host contains \r\n, arbitrary HTTP headers can be injected
-        // in the CONNECT request. For example:
-        //   host = "evil.com\r\nX-Injected: true\r\n\r\nGET / HTTP/1.1"
-        // This constructs a malformed CONNECT that smuggles extra headers/requests.
-        //
-        // dial_tcp must validate addr.host and reject CRLF characters
-        // BEFORE establishing any connection.
-        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
-        let mut addr = Addr::new("evil.com\r\nX-Injected: true", 80);
-        let result = Outbound::dial_tcp(&http, &mut addr);
-
-        // Should reject before even attempting to connect
-        match result {
-            Err(e) => {
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("invalid") || err_msg.contains("Invalid"),
-                    "Error should mention invalid host, got: {}",
-                    err_msg
-                );
-            }
-            Ok(_) => panic!("dial_tcp should reject host containing CRLF characters"),
-        }
+    fn test_addr_new_strips_crlf_preventing_http_injection() {
+        // CRLF injection is now prevented at the Addr layer:
+        // Addr::new() strips control characters, so CRLF never reaches HTTP.
+        let addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        assert_eq!(addr.host, "evil.comX-Injected: true");
+        assert!(!addr.host.contains('\r'));
+        assert!(!addr.host.contains('\n'));
     }
 
     #[test]
-    fn test_http_connect_rejects_cr_only_in_host() {
-        // Lone \r is also dangerous - reject any control characters
-        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
-        let mut addr = Addr::new("evil.com\rinjected", 80);
-        let result = Outbound::dial_tcp(&http, &mut addr);
-        assert!(
-            result.is_err(),
-            "dial_tcp should reject host containing CR character"
-        );
+    fn test_addr_new_strips_cr_only() {
+        let addr = Addr::new("evil.com\rinjected", 80);
+        assert_eq!(addr.host, "evil.cominjected");
+        assert!(!addr.host.contains('\r'));
     }
 
     #[test]
@@ -1148,6 +1158,8 @@ mod tests {
             Ok(_) => panic!("Expected connection error for non-listening port"),
         }
     }
+
+    // P1-5 verified: Http::new() without port already gives clear error at connect time
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -1333,31 +1345,12 @@ mod async_tests {
     }
 
     #[tokio::test]
-    async fn test_async_http_connect_rejects_crlf_in_host() {
-        // BUG #9 (async): Same CRLF injection vulnerability in async dial_tcp
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let _ = stream.read(&mut buf).await;
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-
-        let http = Http::new(format!("127.0.0.1:{}", port));
-        let mut addr = Addr::new("evil.com\r\nX-Injected: true", 80);
-        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
-
-        assert!(
-            result.is_err(),
-            "async dial_tcp should reject host containing CRLF characters"
-        );
-
-        server.abort();
+    async fn test_async_addr_strips_crlf_preventing_http_injection() {
+        // CRLF injection is now prevented at the Addr layer:
+        // Addr::new() strips control characters before reaching HTTP.
+        let addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        assert!(!addr.host.contains('\r'), "CRLF should be stripped by Addr::new");
+        assert!(!addr.host.contains('\n'), "CRLF should be stripped by Addr::new");
     }
 
     #[tokio::test]
