@@ -401,54 +401,14 @@ impl Outbound for Direct {
             ));
         }
 
-        let stream = match self.mode {
-            DirectMode::Auto => {
-                if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
-                    self.dual_stack_dial_tcp(ipv4, ipv6, addr.port)?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
+        let stream = if self.mode == DirectMode::Auto {
+            if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
+                self.dual_stack_dial_tcp(ipv4, ipv6, addr.port)?
+            } else {
+                self.dial_tcp_ip(select_ip(self.mode, info)?, addr.port)?
             }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
+        } else {
+            self.dial_tcp_ip(select_ip(self.mode, info)?, addr.port)?
         };
 
         Ok(Box::new(StdTcpConn::new(stream)))
@@ -500,55 +460,17 @@ impl AsyncOutbound for Direct {
             ));
         }
 
-        let stream = match self.mode {
-            DirectMode::Auto => {
-                if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
-                    self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port)
-                        .await?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
+        let stream = if self.mode == DirectMode::Auto {
+            if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
+                self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port)
+                    .await?
+            } else {
+                self.async_dial_tcp_ip(select_ip(self.mode, info)?, addr.port)
+                    .await?
             }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
+        } else {
+            self.async_dial_tcp_ip(select_ip(self.mode, info)?, addr.port)
+                .await?
         };
 
         Ok(Box::new(TokioTcpConn::new(stream)))
@@ -631,47 +553,37 @@ fn set_tcp_fastopen(_socket: &socket2::Socket) -> Result<()> {
     ))
 }
 
+/// Select an IP address based on DirectMode preference.
+///
+/// For Auto mode, behaves like Prefer46 (prefers IPv4, falls back to IPv6).
+/// TCP callers should handle Auto's dual-stack case separately before calling this.
+fn select_ip(mode: DirectMode, info: &ResolveInfo) -> Result<IpAddr> {
+    match mode {
+        DirectMode::Auto | DirectMode::Prefer46 => info
+            .ipv4
+            .map(IpAddr::V4)
+            .or(info.ipv6.map(IpAddr::V6))
+            .ok_or_else(|| AclError::OutboundError("No address available".to_string())),
+        DirectMode::Prefer64 => info
+            .ipv6
+            .map(IpAddr::V6)
+            .or(info.ipv4.map(IpAddr::V4))
+            .ok_or_else(|| AclError::OutboundError("No address available".to_string())),
+        DirectMode::Only6 => info
+            .ipv6
+            .map(IpAddr::V6)
+            .ok_or_else(|| AclError::OutboundError("No IPv6 address available".to_string())),
+        DirectMode::Only4 => info
+            .ipv4
+            .map(IpAddr::V4)
+            .ok_or_else(|| AclError::OutboundError("No IPv4 address available".to_string())),
+    }
+}
+
 /// Resolve UDP target address based on DirectMode preference.
 fn resolve_udp_addr(mode: DirectMode, addr: &Addr) -> Result<SocketAddr> {
     if let Some(ref info) = addr.resolve_info {
-        let ip = match mode {
-            DirectMode::Auto | DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
-        };
+        let ip = select_ip(mode, info)?;
         return Ok(SocketAddr::new(ip, addr.port));
     }
 
@@ -822,6 +734,103 @@ mod tests {
         let info = addr.resolve_info.unwrap();
         assert_eq!(info.ipv4, Some(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_select_ip_auto_both_prefers_v4() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_auto_v4_only() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_select_ip_auto_v6_only() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_auto_no_address() {
+        let info = ResolveInfo::new();
+        assert!(select_ip(DirectMode::Auto, &info).is_err());
+    }
+
+    #[test]
+    fn test_select_ip_prefer64_both_prefers_v6() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Prefer64, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_prefer64_v4_fallback() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let ip = select_ip(DirectMode::Prefer64, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_prefer46_both_prefers_v4() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Prefer46, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_only6_success() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let ip = select_ip(DirectMode::Only6, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_only6_fails_when_no_v6() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let err = select_ip(DirectMode::Only6, &info).unwrap_err();
+        assert!(err.to_string().contains("IPv6"));
+    }
+
+    #[test]
+    fn test_select_ip_only4_success() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let ip = select_ip(DirectMode::Only4, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_only4_fails_when_no_v4() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let err = select_ip(DirectMode::Only4, &info).unwrap_err();
+        assert!(err.to_string().contains("IPv4"));
+    }
+
+    #[test]
+    fn test_select_ip_empty_resolve_info() {
+        let info = ResolveInfo::new();
+        assert!(select_ip(DirectMode::Prefer46, &info).is_err());
+        assert!(select_ip(DirectMode::Prefer64, &info).is_err());
+        assert!(select_ip(DirectMode::Only4, &info).is_err());
+        assert!(select_ip(DirectMode::Only6, &info).is_err());
     }
 }
 

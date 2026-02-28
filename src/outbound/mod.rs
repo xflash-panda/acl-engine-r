@@ -426,7 +426,7 @@ impl AsyncUdpConn for TokioUdpConn {
 }
 
 /// Split IP addresses into IPv4 and IPv6
-pub fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+pub(crate) fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut ipv4 = None;
     let mut ipv6 = None;
 
@@ -487,5 +487,45 @@ mod tests {
     fn test_addr_display() {
         let addr = Addr::new("example.com", 443);
         assert_eq!(format!("{}", addr), "example.com:443");
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_basic() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(v6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_empty() {
+        let ips: Vec<IpAddr> = vec![];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert!(v4.is_none());
+        assert!(v6.is_none());
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_only_v4() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(v6.is_none());
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_takes_first() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        ];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(v6, Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
     }
 }
