@@ -72,31 +72,27 @@ impl<O: Clone> CompiledRuleSet<O> {
         proto: Protocol,
         port: u16,
     ) -> Option<MatchResult<O>> {
-        // Create cache key
         let key = CacheKey::from_host(host, proto, port);
 
+        let mut cache = self.cache.lock().unwrap();
+
         // Check cache first
-        {
-            let mut cache = self.cache.lock().unwrap();
-            if let Some(cached) = cache.get(&key) {
-                return cached.clone().map(|(outbound, hijack_ip)| MatchResult {
-                    outbound,
-                    hijack_ip,
-                });
-            }
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone().map(|(outbound, hijack_ip)| MatchResult {
+                outbound,
+                hijack_ip,
+            });
         }
 
-        // Find matching rule
+        // Cache miss — compute result while holding the lock.
+        // This prevents cache stampede (multiple threads computing the same key).
+        // The matching itself is CPU-only (no I/O), so holding the lock is acceptable.
         let result = self.find_match(host, proto, port);
 
-        // Cache the result
-        {
-            let mut cache = self.cache.lock().unwrap();
-            cache.put(
-                key,
-                result.as_ref().map(|r| (r.outbound.clone(), r.hijack_ip)),
-            );
-        }
+        cache.put(
+            key,
+            result.as_ref().map(|r| (r.outbound.clone(), r.hijack_ip)),
+        );
 
         result
     }
@@ -379,5 +375,68 @@ proxy(all)
 
         // Both results should be the same
         assert_eq!(result1.unwrap().outbound, result2.unwrap().outbound);
+    }
+
+    #[test]
+    fn test_cache_none_result() {
+        let text = "proxy(example.com)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        let host = HostInfo::from_name("unknown.com");
+        let result1 = compiled.match_host(&host, Protocol::TCP, 443);
+        assert!(result1.is_none());
+
+        let result2 = compiled.match_host(&host, Protocol::TCP, 443);
+        assert!(result2.is_none());
+    }
+
+    #[test]
+    fn test_cache_different_keys() {
+        let text = "proxy(example.com)\ndirect(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+        outbounds.insert("direct".to_string(), "DIRECT");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        let host1 = HostInfo::from_name("example.com");
+        let r1 = compiled.match_host(&host1, Protocol::TCP, 443);
+        assert_eq!(r1.unwrap().outbound, "PROXY");
+
+        let host2 = HostInfo::from_name("other.com");
+        let r2 = compiled.match_host(&host2, Protocol::TCP, 443);
+        assert_eq!(r2.unwrap().outbound, "DIRECT");
+
+        let r3 = compiled.match_host(&host1, Protocol::UDP, 443);
+        assert_eq!(r3.unwrap().outbound, "PROXY");
+
+        let r4 = compiled.match_host(&host1, Protocol::TCP, 80);
+        assert_eq!(r4.unwrap().outbound, "PROXY");
+    }
+
+    #[test]
+    fn test_cache_clear() {
+        let text = "proxy(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+
+        let compiled = compile(&rules, &outbounds, 2, &NilGeoLoader).unwrap();
+
+        let host = HostInfo::from_name("a.com");
+        compiled.match_host(&host, Protocol::TCP, 80);
+
+        compiled.clear_cache();
+
+        let result = compiled.match_host(&host, Protocol::TCP, 80);
+        assert_eq!(result.unwrap().outbound, "PROXY");
     }
 }

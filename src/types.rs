@@ -103,7 +103,7 @@ pub(crate) struct CacheKey {
 impl CacheKey {
     pub fn from_host(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
         Self {
-            name: host.name.to_lowercase(),
+            name: host.name.clone(), // already lowercased in HostInfo constructors
             ipv4: host.ipv4,
             ipv6: host.ipv6,
             protocol,
