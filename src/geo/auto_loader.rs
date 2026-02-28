@@ -20,26 +20,29 @@ use super::singsite::{self, SingSiteReader};
 /// Logger callback type for logging geo data updates
 type LoggerCallback = Box<dyn Fn(&str) + Send + Sync>;
 
-/// Auto GeoLoader with download support and lazy loading
+/// Auto GeoLoader with download support and lazy loading.
+///
+/// Use the builder methods (`with_data_dir()`, `with_geoip()`, etc.) to
+/// configure, and getter methods to inspect configuration.
 pub struct AutoGeoLoader {
     // Paths
-    pub geoip_path: Option<PathBuf>,
-    pub geosite_path: Option<PathBuf>,
-    pub data_dir: Option<PathBuf>,
+    geoip_path: Option<PathBuf>,
+    geosite_path: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
 
     // Formats
-    pub geoip_format: Option<GeoIpFormat>,
-    pub geosite_format: Option<GeoSiteFormat>,
+    geoip_format: Option<GeoIpFormat>,
+    geosite_format: Option<GeoSiteFormat>,
 
     // Download URLs
-    pub geoip_url: Option<String>,
-    pub geosite_url: Option<String>,
+    geoip_url: Option<String>,
+    geosite_url: Option<String>,
 
     // Update interval
-    pub update_interval: Duration,
+    update_interval: Duration,
 
     // Logger
-    pub logger: Option<LoggerCallback>,
+    logger: Option<LoggerCallback>,
 
     // Cached data for DAT format (pre-loaded CIDRs)
     geoip_data: RwLock<Option<HashMap<String, Vec<IpNet>>>>,
@@ -119,6 +122,58 @@ impl AutoGeoLoader {
     {
         self.logger = Some(Box::new(logger));
         self
+    }
+
+    /// Set custom GeoIP file path (overrides data_dir-based path)
+    pub fn with_geoip_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.geoip_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set custom GeoSite file path (overrides data_dir-based path)
+    pub fn with_geosite_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.geosite_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Get the configured GeoIP format
+    pub fn geoip_format(&self) -> Option<GeoIpFormat> {
+        self.geoip_format
+    }
+
+    /// Get the configured GeoSite format
+    pub fn geosite_format(&self) -> Option<GeoSiteFormat> {
+        self.geosite_format
+    }
+
+    /// Get the configured GeoIP URL
+    pub fn geoip_url(&self) -> Option<&str> {
+        self.geoip_url.as_deref()
+    }
+
+    /// Get the configured GeoSite URL
+    pub fn geosite_url(&self) -> Option<&str> {
+        self.geosite_url.as_deref()
+    }
+
+    /// Get the configured data directory
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    /// Get the configured GeoIP file path
+    pub fn geoip_path(&self) -> Option<&Path> {
+        self.geoip_path.as_deref()
+    }
+
+    /// Get the configured GeoSite file path
+    pub fn geosite_path(&self) -> Option<&Path> {
+        self.geosite_path.as_deref()
+    }
+
+    /// Get the configured update interval
+    pub fn update_interval(&self) -> Duration {
+        self.update_interval
     }
 
     fn log(&self, msg: &str) {
@@ -460,11 +515,44 @@ mod tests {
             .with_geosite_url("http://example.com/geosite.db")
             .with_update_interval(std::time::Duration::from_secs(3600));
 
-        assert_eq!(loader.geoip_format, Some(GeoIpFormat::Mmdb));
-        assert_eq!(loader.geosite_format, Some(GeoSiteFormat::Sing));
-        assert!(loader.geoip_url.is_some());
-        assert!(loader.geosite_url.is_some());
-        assert!(loader.data_dir.is_some());
+        // Use getter methods instead of direct field access
+        assert_eq!(loader.geoip_format(), Some(GeoIpFormat::Mmdb));
+        assert_eq!(loader.geosite_format(), Some(GeoSiteFormat::Sing));
+        assert!(loader.geoip_url().is_some());
+        assert!(loader.geosite_url().is_some());
+        assert!(loader.data_dir().is_some());
+    }
+
+    #[test]
+    fn test_auto_geoloader_default_has_no_config() {
+        let loader = AutoGeoLoader::new();
+        assert_eq!(loader.geoip_format(), None);
+        assert_eq!(loader.geosite_format(), None);
+        assert!(loader.geoip_url().is_none());
+        assert!(loader.geosite_url().is_none());
+        assert!(loader.data_dir().is_none());
+        assert_eq!(loader.update_interval(), DEFAULT_UPDATE_INTERVAL);
+    }
+
+    #[test]
+    fn test_auto_geoloader_custom_update_interval() {
+        let interval = std::time::Duration::from_secs(3600);
+        let loader = AutoGeoLoader::new().with_update_interval(interval);
+        assert_eq!(loader.update_interval(), interval);
+    }
+
+    #[test]
+    fn test_auto_geoloader_with_geoip_path() {
+        let loader = AutoGeoLoader::new()
+            .with_geoip_path("/custom/geoip.mmdb");
+        assert_eq!(loader.geoip_path(), Some(std::path::Path::new("/custom/geoip.mmdb")));
+    }
+
+    #[test]
+    fn test_auto_geoloader_with_geosite_path() {
+        let loader = AutoGeoLoader::new()
+            .with_geosite_path("/custom/geosite.db");
+        assert_eq!(loader.geosite_path(), Some(std::path::Path::new("/custom/geosite.db")));
     }
 
     #[test]

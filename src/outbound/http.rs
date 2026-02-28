@@ -126,6 +126,93 @@ fn validate_connect_host(host: &str) -> Result<()> {
     Ok(())
 }
 
+/// Build an HTTP CONNECT request string.
+fn build_connect_request(host: &str, port: u16, basic_auth: Option<&str>) -> String {
+    let target = format!("{}:{}", host, port);
+    let mut request = format!(
+        "CONNECT {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Proxy-Connection: Keep-Alive\r\n",
+        target, target
+    );
+
+    if let Some(auth) = basic_auth {
+        request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+    }
+
+    request.push_str("\r\n");
+    request
+}
+
+/// Parse an HTTP CONNECT response status line.
+/// Returns Ok(()) on 200, Err on any other status or malformed input.
+fn parse_connect_status(status_line: &str) -> Result<()> {
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(AclError::OutboundError(format!(
+            "Invalid HTTP response: {}",
+            status_line.trim()
+        )));
+    }
+
+    let status_code: u16 = parts[1]
+        .parse()
+        .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
+
+    if status_code != 200 {
+        return Err(AclError::OutboundError(format!(
+            "HTTP CONNECT failed: {} {}",
+            status_code,
+            parts.get(2..).unwrap_or(&[]).join(" ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// Read and discard HTTP response headers until empty line.
+/// Returns error if too many headers or line too long.
+fn drain_headers<R: BufRead>(reader: &mut R) -> Result<()> {
+    let mut header_count = 0;
+    loop {
+        let mut line = String::new();
+        read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
+            .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
+        if line.trim().is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_RESPONSE_HEADERS {
+            return Err(AclError::OutboundError(format!(
+                "Too many response headers (>{MAX_RESPONSE_HEADERS})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Async: read and discard HTTP response headers until empty line.
+#[cfg(feature = "async")]
+async fn async_drain_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<()> {
+    let mut header_count = 0;
+    loop {
+        let mut line = String::new();
+        async_read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
+            .await
+            .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
+        if line.trim().is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_RESPONSE_HEADERS {
+            return Err(AclError::OutboundError(format!(
+                "Too many response headers (>{MAX_RESPONSE_HEADERS})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// HTTP/HTTPS proxy outbound.
 ///
 /// Uses the HTTP CONNECT method to tunnel TCP connections.
@@ -317,86 +404,29 @@ impl Http {
 
 impl Outbound for Http {
     fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
-        // Validate host before connecting to prevent HTTP header injection
         validate_connect_host(&addr.host)?;
 
         let mut stream = self.dial()?;
-
         stream.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
         stream.set_write_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
 
-        // Build CONNECT request
-        let target = format!("{}:{}", addr.host, addr.port);
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Proxy-Connection: Keep-Alive\r\n",
-            target, target
-        );
-
-        if let Some(ref auth) = self.basic_auth {
-            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
-        }
-
-        request.push_str("\r\n");
-
-        // Send request
+        let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
         stream.write_all(request.as_bytes()).map_err(|e| {
             AclError::OutboundError(format!("Failed to send CONNECT request: {}", e))
         })?;
 
-        // Read response
         let mut reader = BufReader::new(&stream);
         let mut status_line = String::new();
         read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH)
             .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+        parse_connect_status(&status_line)?;
+        drain_headers(&mut reader)?;
 
-        // Parse status code
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(AclError::OutboundError(format!(
-                "Invalid HTTP response: {}",
-                status_line.trim()
-            )));
-        }
-
-        let status_code: u16 = parts[1]
-            .parse()
-            .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
-
-        if status_code != 200 {
-            return Err(AclError::OutboundError(format!(
-                "HTTP CONNECT failed: {} {}",
-                status_code,
-                parts.get(2..).unwrap_or(&[]).join(" ")
-            )));
-        }
-
-        // Read and discard headers until empty line
-        let mut header_count = 0;
-        loop {
-            let mut line = String::new();
-            read_line_limited(&mut reader, &mut line, MAX_LINE_LENGTH)
-                .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
-            if line.trim().is_empty() {
-                break;
-            }
-            header_count += 1;
-            if header_count > MAX_RESPONSE_HEADERS {
-                return Err(AclError::OutboundError(format!(
-                    "Too many response headers (>{MAX_RESPONSE_HEADERS})"
-                )));
-            }
-        }
-
-        // Reset timeout
         stream.set_read_timeout(None).ok();
         stream.set_write_timeout(None).ok();
 
-        // Check if there's buffered data
         let buffered = reader.buffer();
         if !buffered.is_empty() {
-            // Wrap connection with buffered data
             let buffered_data = buffered.to_vec();
             let stream = reader.into_inner();
             return Ok(Box::new(BufferedTcpConn::new(
@@ -423,25 +453,10 @@ impl Outbound for Http {
 #[async_trait]
 impl AsyncOutbound for Http {
     async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
-        // Validate host before connecting to prevent HTTP header injection
         validate_connect_host(&addr.host)?;
 
         let stream = self.async_dial().await?;
-
-        let target = format!("{}:{}", addr.host, addr.port);
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Proxy-Connection: Keep-Alive\r\n",
-            target, target
-        );
-
-        if let Some(ref auth) = self.basic_auth {
-            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
-        }
-
-        request.push_str("\r\n");
-
+        let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
         let mut reader = TokioBufReader::new(stream);
 
         tokio::time::timeout(
@@ -461,49 +476,11 @@ impl AsyncOutbound for Http {
         .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
         .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
 
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(AclError::OutboundError(format!(
-                "Invalid HTTP response: {}",
-                status_line.trim()
-            )));
-        }
+        parse_connect_status(&status_line)?;
 
-        let status_code: u16 = parts[1]
-            .parse()
-            .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
-
-        if status_code != 200 {
-            return Err(AclError::OutboundError(format!(
-                "HTTP CONNECT failed: {} {}",
-                status_code,
-                parts.get(2..).unwrap_or(&[]).join(" ")
-            )));
-        }
-
-        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async {
-            let mut header_count = 0;
-            loop {
-                let mut line = String::new();
-                async_read_line_limited(&mut reader, &mut line, MAX_LINE_LENGTH)
-                    .await
-                    .map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read headers: {}", e))
-                    })?;
-                if line.trim().is_empty() {
-                    break;
-                }
-                header_count += 1;
-                if header_count > MAX_RESPONSE_HEADERS {
-                    return Err(AclError::OutboundError(format!(
-                        "Too many response headers (>{MAX_RESPONSE_HEADERS})"
-                    )));
-                }
-            }
-            Ok::<_, AclError>(())
-        })
-        .await
-        .map_err(|_| AclError::OutboundError("Header read timeout".to_string()))??;
+        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async_drain_headers(&mut reader))
+            .await
+            .map_err(|_| AclError::OutboundError("Header read timeout".to_string()))??;
 
         let buffered = reader.buffer();
         if !buffered.is_empty() {
@@ -665,6 +642,50 @@ impl AsyncTcpConn for AsyncBufferedTcpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_connect_request_no_auth() {
+        let req = build_connect_request("example.com", 443, None);
+        assert!(req.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(req.contains("Host: example.com:443\r\n"));
+        assert!(req.contains("Proxy-Connection: Keep-Alive\r\n"));
+        assert!(!req.contains("Proxy-Authorization:"));
+        assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_build_connect_request_with_auth() {
+        let auth = "Basic dXNlcjpwYXNz".to_string();
+        let req = build_connect_request("example.com", 443, Some(&auth));
+        assert!(req.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[test]
+    fn test_parse_connect_status_success() {
+        let line = "HTTP/1.1 200 Connection established\r\n";
+        let result = parse_connect_status(line);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_connect_status_proxy_auth_required() {
+        let line = "HTTP/1.1 407 Proxy Authentication Required\r\n";
+        let result = parse_connect_status(line);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("407"));
+    }
+
+    #[test]
+    fn test_parse_connect_status_invalid_format() {
+        let result = parse_connect_status("garbage");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_connect_status_invalid_status_code() {
+        let result = parse_connect_status("HTTP/1.1 abc OK\r\n");
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_http_from_url() {

@@ -72,6 +72,96 @@ fn validate_socks5_response(ver: u8, rep: u8) -> Result<()> {
     Ok(())
 }
 
+/// Build a SOCKS5 request buffer: VER + CMD + RSV + ATYP + DST.ADDR + DST.PORT.
+fn build_socks5_request(cmd: u8, addr: &Addr) -> Result<Vec<u8>> {
+    let (atyp, dst_addr) = addr_to_socks5(&addr.host)?;
+    let mut req = vec![SOCKS5_VERSION, cmd, 0x00, atyp];
+    req.extend(&dst_addr);
+    req.push((addr.port >> 8) as u8);
+    req.push((addr.port & 0xFF) as u8);
+    Ok(req)
+}
+
+/// Build a SOCKS5 username/password auth request (RFC 1929).
+fn build_auth_request(username: &str, password: &str) -> Vec<u8> {
+    let mut req = vec![0x01]; // auth sub-negotiation version
+    req.push(username.len() as u8);
+    req.extend(username.as_bytes());
+    req.push(password.len() as u8);
+    req.extend(password.as_bytes());
+    req
+}
+
+/// Parse a SOCKS5 bound address from a byte buffer (after the 4-byte response header).
+/// Returns (host, port, bytes_consumed).
+fn parse_bound_addr(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
+    match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            if data.len() < 6 {
+                return Err(AclError::OutboundError(
+                    "Truncated IPv4 bound address".to_string(),
+                ));
+            }
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]));
+            let port = u16::from_be_bytes([data[4], data[5]]);
+            Ok((ip.to_string(), port, 6))
+        }
+        SOCKS5_ATYP_IPV6 => {
+            if data.len() < 18 {
+                return Err(AclError::OutboundError(
+                    "Truncated IPv6 bound address".to_string(),
+                ));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[..16]);
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(octets));
+            let port = u16::from_be_bytes([data[16], data[17]]);
+            Ok((ip.to_string(), port, 18))
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            if data.is_empty() {
+                return Err(AclError::OutboundError(
+                    "Truncated domain bound address".to_string(),
+                ));
+            }
+            let len = data[0] as usize;
+            if data.len() < 1 + len + 2 {
+                return Err(AclError::OutboundError(
+                    "Truncated domain bound address".to_string(),
+                ));
+            }
+            let domain = String::from_utf8_lossy(&data[1..1 + len]).to_string();
+            let port = u16::from_be_bytes([data[1 + len], data[1 + len + 1]]);
+            Ok((domain, port, 1 + len + 2))
+        }
+        _ => Err(AclError::OutboundError(format!(
+            "Unknown address type: {}",
+            atyp
+        ))),
+    }
+}
+
+/// Convert address to SOCKS5 format (free function).
+fn addr_to_socks5(host: &str) -> Result<(u8, Vec<u8>)> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => Ok((SOCKS5_ATYP_IPV4, v4.octets().to_vec())),
+            IpAddr::V6(v6) => Ok((SOCKS5_ATYP_IPV6, v6.octets().to_vec())),
+        }
+    } else {
+        let domain = host.as_bytes();
+        if domain.len() > 255 {
+            return Err(AclError::OutboundError(format!(
+                "Domain name too long for SOCKS5: {} bytes (max 255)",
+                domain.len()
+            )));
+        }
+        let mut addr = vec![domain.len() as u8];
+        addr.extend(domain);
+        Ok((SOCKS5_ATYP_DOMAIN, addr))
+    }
+}
+
 /// SOCKS5 proxy outbound.
 ///
 /// Since SOCKS5 supports using either IP or domain name as the target address,
@@ -210,12 +300,7 @@ impl Socks5 {
                 })?;
 
                 // Send auth request
-                let mut auth_req = vec![0x01]; // Version 1
-                auth_req.push(username.len() as u8);
-                auth_req.extend(username.as_bytes());
-                auth_req.push(password.len() as u8);
-                auth_req.extend(password.as_bytes());
-
+                let auth_req = build_auth_request(username, password);
                 stream
                     .write_all(&auth_req)
                     .map_err(|e| AclError::OutboundError(format!("Failed to send auth: {}", e)))?;
@@ -257,13 +342,7 @@ impl Socks5 {
         stream.set_read_timeout(Some(SOCKS5_REQUEST_TIMEOUT)).ok();
         stream.set_write_timeout(Some(SOCKS5_REQUEST_TIMEOUT)).ok();
 
-        // Build request
-        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host)?;
-        let mut req = vec![SOCKS5_VERSION, cmd, 0x00, atyp];
-        req.extend(&dst_addr);
-        req.push((addr.port >> 8) as u8);
-        req.push((addr.port & 0xFF) as u8);
-
+        let req = build_socks5_request(cmd, addr)?;
         stream
             .write_all(&req)
             .map_err(|e| AclError::OutboundError(format!("Failed to send request: {}", e)))?;
@@ -276,50 +355,18 @@ impl Socks5 {
 
         validate_socks5_response(resp_header[0], resp_header[1])?;
 
-        // Read bound address
-        let (bound_host, bound_port) = match resp_header[3] {
-            SOCKS5_ATYP_IPV4 => {
-                let mut addr = [0u8; 4];
-                stream.read_exact(&mut addr).map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read IPv4 address: {}", e))
-                })?;
-                let ip = IpAddr::V4(std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]));
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                let port = u16::from_be_bytes(port_buf);
-                (ip.to_string(), port)
-            }
-            SOCKS5_ATYP_IPV6 => {
-                let mut addr = [0u8; 16];
-                stream.read_exact(&mut addr).map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read IPv6 address: {}", e))
-                })?;
-                let ip = IpAddr::V6(std::net::Ipv6Addr::from(addr));
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                let port = u16::from_be_bytes(port_buf);
-                (ip.to_string(), port)
-            }
+        // Read bound address bytes and parse
+        let max_bound = 1 + 256 + 2; // max: domain len(1) + domain(255) + port(2)
+        let mut bound_buf = vec![0u8; max_bound];
+        let needed = match resp_header[3] {
+            SOCKS5_ATYP_IPV4 => 4 + 2,
+            SOCKS5_ATYP_IPV6 => 16 + 2,
             SOCKS5_ATYP_DOMAIN => {
-                let mut len_buf = [0u8; 1];
-                stream.read_exact(&mut len_buf).map_err(|e| {
+                // Read domain length byte first
+                stream.read_exact(&mut bound_buf[..1]).map_err(|e| {
                     AclError::OutboundError(format!("Failed to read domain length: {}", e))
                 })?;
-                let len = len_buf[0] as usize;
-                let mut domain = vec![0u8; len];
-                stream.read_exact(&mut domain).map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read domain: {}", e))
-                })?;
-                let mut port_buf = [0u8; 2];
-                stream
-                    .read_exact(&mut port_buf)
-                    .map_err(|e| AclError::OutboundError(format!("Failed to read port: {}", e)))?;
-                let port = u16::from_be_bytes(port_buf);
-                (String::from_utf8_lossy(&domain).to_string(), port)
+                1 + bound_buf[0] as usize + 2
             }
             atyp => {
                 return Err(AclError::OutboundError(format!(
@@ -328,6 +375,23 @@ impl Socks5 {
                 )));
             }
         };
+
+        if resp_header[3] == SOCKS5_ATYP_DOMAIN {
+            // Already read 1 byte (domain length), read the rest
+            stream
+                .read_exact(&mut bound_buf[1..needed])
+                .map_err(|e| {
+                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                })?;
+        } else {
+            stream
+                .read_exact(&mut bound_buf[..needed])
+                .map_err(|e| {
+                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                })?;
+        }
+
+        let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
 
         // Reset timeout
         stream.set_read_timeout(None).ok();
@@ -366,23 +430,7 @@ impl Socks5 {
 
     /// Convert address to SOCKS5 format.
     fn addr_to_socks5(&self, host: &str) -> Result<(u8, Vec<u8>)> {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => Ok((SOCKS5_ATYP_IPV4, v4.octets().to_vec())),
-                IpAddr::V6(v6) => Ok((SOCKS5_ATYP_IPV6, v6.octets().to_vec())),
-            }
-        } else {
-            let domain = host.as_bytes();
-            if domain.len() > 255 {
-                return Err(AclError::OutboundError(format!(
-                    "Domain name too long for SOCKS5: {} bytes (max 255)",
-                    domain.len()
-                )));
-            }
-            let mut addr = vec![domain.len() as u8];
-            addr.extend(domain);
-            Ok((SOCKS5_ATYP_DOMAIN, addr))
-        }
+        addr_to_socks5(host)
     }
 
     /// Async: Connect to the proxy and perform negotiation.
@@ -445,12 +493,7 @@ impl Socks5 {
                     )
                 })?;
 
-                let mut auth_req = vec![0x01];
-                auth_req.push(username.len() as u8);
-                auth_req.extend(username.as_bytes());
-                auth_req.push(password.len() as u8);
-                auth_req.extend(password.as_bytes());
-
+                let auth_req = build_auth_request(username, password);
                 tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.write_all(&auth_req))
                     .await
                     .map_err(|_| AclError::OutboundError("Auth send timeout".to_string()))?
@@ -494,11 +537,7 @@ impl Socks5 {
         cmd: u8,
         addr: &Addr,
     ) -> Result<(String, u16)> {
-        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host)?;
-        let mut req = vec![SOCKS5_VERSION, cmd, 0x00, atyp];
-        req.extend(&dst_addr);
-        req.push((addr.port >> 8) as u8);
-        req.push((addr.port & 0xFF) as u8);
+        let req = build_socks5_request(cmd, addr)?;
 
         tokio::time::timeout(SOCKS5_REQUEST_TIMEOUT, stream.write_all(&req))
             .await
@@ -513,63 +552,43 @@ impl Socks5 {
 
         validate_socks5_response(resp_header[0], resp_header[1])?;
 
-        let (bound_host, bound_port) =
-            match resp_header[3] {
-                SOCKS5_ATYP_IPV4 => {
-                    let mut addr_buf = [0u8; 4];
-                    stream.read_exact(&mut addr_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read IPv4 address: {}", e))
-                    })?;
-                    let ip = IpAddr::V4(std::net::Ipv4Addr::new(
-                        addr_buf[0],
-                        addr_buf[1],
-                        addr_buf[2],
-                        addr_buf[3],
-                    ));
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read port: {}", e))
-                    })?;
-                    (ip.to_string(), u16::from_be_bytes(port_buf))
-                }
-                SOCKS5_ATYP_IPV6 => {
-                    let mut addr_buf = [0u8; 16];
-                    stream.read_exact(&mut addr_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read IPv6 address: {}", e))
-                    })?;
-                    let ip = IpAddr::V6(std::net::Ipv6Addr::from(addr_buf));
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read port: {}", e))
-                    })?;
-                    (ip.to_string(), u16::from_be_bytes(port_buf))
-                }
-                SOCKS5_ATYP_DOMAIN => {
-                    let mut len_buf = [0u8; 1];
-                    stream.read_exact(&mut len_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read domain length: {}", e))
-                    })?;
-                    let len = len_buf[0] as usize;
-                    let mut domain = vec![0u8; len];
-                    stream.read_exact(&mut domain).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read domain: {}", e))
-                    })?;
-                    let mut port_buf = [0u8; 2];
-                    stream.read_exact(&mut port_buf).await.map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read port: {}", e))
-                    })?;
-                    (
-                        String::from_utf8_lossy(&domain).to_string(),
-                        u16::from_be_bytes(port_buf),
-                    )
-                }
-                atyp => {
-                    return Err(AclError::OutboundError(format!(
-                        "Unknown address type: {}",
-                        atyp
-                    )));
-                }
-            };
+        // Read bound address bytes and parse
+        let max_bound = 1 + 256 + 2;
+        let mut bound_buf = vec![0u8; max_bound];
+        let needed = match resp_header[3] {
+            SOCKS5_ATYP_IPV4 => 4 + 2,
+            SOCKS5_ATYP_IPV6 => 16 + 2,
+            SOCKS5_ATYP_DOMAIN => {
+                stream.read_exact(&mut bound_buf[..1]).await.map_err(|e| {
+                    AclError::OutboundError(format!("Failed to read domain length: {}", e))
+                })?;
+                1 + bound_buf[0] as usize + 2
+            }
+            atyp => {
+                return Err(AclError::OutboundError(format!(
+                    "Unknown address type: {}",
+                    atyp
+                )));
+            }
+        };
+
+        if resp_header[3] == SOCKS5_ATYP_DOMAIN {
+            stream
+                .read_exact(&mut bound_buf[1..needed])
+                .await
+                .map_err(|e| {
+                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                })?;
+        } else {
+            stream
+                .read_exact(&mut bound_buf[..needed])
+                .await
+                .map_err(|e| {
+                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                })?;
+        }
+
+        let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
 
         Ok((bound_host, bound_port))
     }
@@ -1174,6 +1193,136 @@ mod tests {
     #[test]
     fn test_socks5_rep_to_string_undefined() {
         assert_eq!(socks5_rep_to_string(0xFF), "undefined");
+    }
+
+    // ========== Extracted helper function tests ==========
+
+    #[test]
+    fn test_build_socks5_request_connect_ipv4() {
+        let addr = Addr::new("192.168.1.1", 80);
+        let req = build_socks5_request(SOCKS5_CMD_CONNECT, &addr).unwrap();
+        assert_eq!(req[0], SOCKS5_VERSION);
+        assert_eq!(req[1], SOCKS5_CMD_CONNECT);
+        assert_eq!(req[2], 0x00); // reserved
+        assert_eq!(req[3], SOCKS5_ATYP_IPV4);
+        assert_eq!(&req[4..8], &[192, 168, 1, 1]);
+        assert_eq!(u16::from_be_bytes([req[8], req[9]]), 80);
+        assert_eq!(req.len(), 10);
+    }
+
+    #[test]
+    fn test_build_socks5_request_udp_associate_domain() {
+        let addr = Addr::new("example.com", 443);
+        let req = build_socks5_request(SOCKS5_CMD_UDP_ASSOCIATE, &addr).unwrap();
+        assert_eq!(req[0], SOCKS5_VERSION);
+        assert_eq!(req[1], SOCKS5_CMD_UDP_ASSOCIATE);
+        assert_eq!(req[2], 0x00);
+        assert_eq!(req[3], SOCKS5_ATYP_DOMAIN);
+        assert_eq!(req[4], 11); // "example.com" length
+        assert_eq!(&req[5..16], b"example.com");
+        assert_eq!(u16::from_be_bytes([req[16], req[17]]), 443);
+    }
+
+    #[test]
+    fn test_build_socks5_request_ipv6() {
+        let addr = Addr::new("::1", 8080);
+        let req = build_socks5_request(SOCKS5_CMD_CONNECT, &addr).unwrap();
+        assert_eq!(req[3], SOCKS5_ATYP_IPV6);
+        // VER(1) + CMD(1) + RSV(1) + ATYP(1) + IPv6(16) + PORT(2) = 22
+        assert_eq!(req.len(), 22);
+        assert_eq!(u16::from_be_bytes([req[20], req[21]]), 8080);
+    }
+
+    #[test]
+    fn test_build_auth_request_basic() {
+        let req = build_auth_request("user", "pass");
+        assert_eq!(req[0], 0x01); // auth version
+        assert_eq!(req[1], 4); // username length
+        assert_eq!(&req[2..6], b"user");
+        assert_eq!(req[6], 4); // password length
+        assert_eq!(&req[7..11], b"pass");
+        assert_eq!(req.len(), 11);
+    }
+
+    #[test]
+    fn test_build_auth_request_empty_credentials() {
+        let req = build_auth_request("", "");
+        assert_eq!(req[0], 0x01);
+        assert_eq!(req[1], 0); // empty username
+        assert_eq!(req[2], 0); // empty password
+        assert_eq!(req.len(), 3);
+    }
+
+    #[test]
+    fn test_build_auth_request_max_length() {
+        let user = "u".repeat(255);
+        let pass = "p".repeat(255);
+        let req = build_auth_request(&user, &pass);
+        assert_eq!(req[0], 0x01);
+        assert_eq!(req[1], 255);
+        assert_eq!(req.len(), 1 + 1 + 255 + 1 + 255);
+    }
+
+    #[test]
+    fn test_parse_bound_addr_ipv4() {
+        // Simulate: ATYP=IPv4, then 4 addr bytes + 2 port bytes
+        let data = [
+            192, 168, 1, 1, // IPv4 addr
+            0x1F, 0x90,     // port 8080
+        ];
+        let (host, port, consumed) = parse_bound_addr(SOCKS5_ATYP_IPV4, &data).unwrap();
+        assert_eq!(host, "192.168.1.1");
+        assert_eq!(port, 8080);
+        assert_eq!(consumed, 6);
+    }
+
+    #[test]
+    fn test_parse_bound_addr_ipv6() {
+        let mut data = [0u8; 18];
+        // ::1 in bytes
+        data[15] = 1;
+        // port 443
+        data[16] = 0x01;
+        data[17] = 0xBB;
+        let (host, port, consumed) = parse_bound_addr(SOCKS5_ATYP_IPV6, &data).unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 443);
+        assert_eq!(consumed, 18);
+    }
+
+    #[test]
+    fn test_parse_bound_addr_domain() {
+        let mut data = Vec::new();
+        data.push(7); // domain length
+        data.extend(b"foo.com");
+        data.push(0x00); // port 80
+        data.push(0x50);
+        let (host, port, consumed) = parse_bound_addr(SOCKS5_ATYP_DOMAIN, &data).unwrap();
+        assert_eq!(host, "foo.com");
+        assert_eq!(port, 80);
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn test_parse_bound_addr_unknown_atyp() {
+        let data = [0u8; 10];
+        let result = parse_bound_addr(0xFF, &data);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Unknown address type"));
+    }
+
+    #[test]
+    fn test_parse_bound_addr_truncated_ipv4() {
+        let data = [192, 168, 1]; // only 3 bytes, need 4+2
+        let result = parse_bound_addr(SOCKS5_ATYP_IPV4, &data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bound_addr_truncated_ipv6() {
+        let data = [0u8; 10]; // need 16+2
+        let result = parse_bound_addr(SOCKS5_ATYP_IPV6, &data);
+        assert!(result.is_err());
     }
 }
 

@@ -35,18 +35,22 @@ impl<O> CacheEntry<O> {
     }
 }
 
-/// A compiled rule ready for matching
+/// A compiled rule ready for matching.
+///
+/// Internal fields (`matcher`, `protocol`, `start_port`, `end_port`) are
+/// crate-private — use [`matches()`](Self::matches) to test a rule, and
+/// access results through [`CompiledRuleSet::match_host()`].
 pub struct CompiledRule<O> {
     /// The outbound for this rule
     pub outbound: O,
     /// Host matcher
-    pub matcher: Matcher,
+    pub(crate) matcher: Matcher,
     /// Protocol to match
-    pub protocol: Protocol,
+    pub(crate) protocol: Protocol,
     /// Start port (inclusive)
-    pub start_port: u16,
+    pub(crate) start_port: u16,
     /// End port (inclusive)
-    pub end_port: u16,
+    pub(crate) end_port: u16,
     /// Hijack IP address
     pub hijack_ip: Option<IpAddr>,
 }
@@ -585,6 +589,56 @@ proxy(all)
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_compiled_rule_matches_method() {
+        // CompiledRule fields should be accessed via matches() method,
+        // not by direct field access. This test verifies the public API.
+        let text = "proxy(example.com, tcp/443, 1.2.3.4)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        // Verify matches() works correctly
+        let host = HostInfo::from_name("example.com");
+        let result = compiled.match_host(&host, Protocol::TCP, 443);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert_eq!(result.outbound, "PROXY");
+        assert_eq!(result.hijack_ip, Some("1.2.3.4".parse().unwrap()));
+
+        // Wrong protocol should not match
+        let result = compiled.match_host(&host, Protocol::UDP, 443);
+        assert!(result.is_none());
+
+        // Wrong port should not match
+        let result = compiled.match_host(&host, Protocol::TCP, 80);
+        assert!(result.is_none());
+
+        // Wrong domain should not match
+        let host = HostInfo::from_name("other.com");
+        let result = compiled.match_host(&host, Protocol::TCP, 443);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compiled_rule_needs_ip_matching() {
+        // needs_ip_matching() should be accessible without direct field access
+        let text = "proxy(192.168.0.0/16)";
+        let rules = parse_rules(text).unwrap();
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        assert!(compiled.needs_ip_matching());
+
+        let text = "proxy(example.com)";
+        let rules = parse_rules(text).unwrap();
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        assert!(!compiled.needs_ip_matching());
     }
 
     #[test]

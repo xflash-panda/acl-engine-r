@@ -113,37 +113,14 @@ impl Direct {
 
     /// Resolve the address using system DNS if ResolveInfo is not available.
     fn resolve(&self, addr: &mut Addr) {
-        if addr.resolve_info.is_some() {
+        if try_resolve_from_ip(addr) {
             return;
         }
 
-        // Check if host is already an IP address
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-                }
-                IpAddr::V6(v6) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-                }
-            }
-            return;
-        }
-
-        // Resolve using system DNS
         match (addr.host.as_str(), 0u16).to_socket_addrs() {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
-                if ipv4.is_none() && ipv6.is_none() {
-                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
-                } else {
-                    addr.resolve_info = Some(ResolveInfo {
-                        ipv4,
-                        ipv6,
-                        error: None,
-                    });
-                }
+                addr.resolve_info = Some(build_resolve_info_from_ips(ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -293,35 +270,14 @@ impl Direct {
     /// Async resolve the address using system DNS if ResolveInfo is not available.
     #[cfg(feature = "async")]
     async fn async_resolve(&self, addr: &mut Addr) {
-        if addr.resolve_info.is_some() {
-            return;
-        }
-
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-                }
-                IpAddr::V6(v6) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-                }
-            }
+        if try_resolve_from_ip(addr) {
             return;
         }
 
         match tokio::net::lookup_host(format!("{}:0", addr.host)).await {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
-                if ipv4.is_none() && ipv6.is_none() {
-                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
-                } else {
-                    addr.resolve_info = Some(ResolveInfo {
-                        ipv4,
-                        ipv6,
-                        error: None,
-                    });
-                }
+                addr.resolve_info = Some(build_resolve_info_from_ips(ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -551,6 +507,39 @@ fn set_tcp_fastopen(_socket: &socket2::Socket) -> Result<()> {
     Err(AclError::ConfigError(
         "TCP Fast Open is not supported on this platform".to_string(),
     ))
+}
+
+/// Try to resolve the address from an IP literal.
+/// Returns true if resolve_info is already set or was set from an IP literal.
+/// Returns false if the host is a domain name that needs DNS resolution.
+fn try_resolve_from_ip(addr: &mut Addr) -> bool {
+    if addr.resolve_info.is_some() {
+        return true;
+    }
+
+    if let Ok(ip) = addr.host.parse::<IpAddr>() {
+        addr.resolve_info = Some(match ip {
+            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
+            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
+        });
+        return true;
+    }
+
+    false
+}
+
+/// Build ResolveInfo from a list of resolved IP addresses.
+fn build_resolve_info_from_ips(ips: Vec<IpAddr>) -> ResolveInfo {
+    let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
+    if ipv4.is_none() && ipv6.is_none() {
+        ResolveInfo::from_error("no address found")
+    } else {
+        ResolveInfo {
+            ipv4,
+            ipv6,
+            error: None,
+        }
+    }
 }
 
 /// Select an IP address based on DirectMode preference.
@@ -831,6 +820,75 @@ mod tests {
         assert!(select_ip(DirectMode::Prefer64, &info).is_err());
         assert!(select_ip(DirectMode::Only4, &info).is_err());
         assert!(select_ip(DirectMode::Only6, &info).is_err());
+    }
+
+    // ========== Extracted helper function tests ==========
+
+    #[test]
+    fn test_try_resolve_from_ip_v4() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        let resolved = try_resolve_from_ip(&mut addr);
+        assert!(resolved);
+        let info = addr.resolve_info.unwrap();
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_v6() {
+        let mut addr = Addr::new("::1", 443);
+        let resolved = try_resolve_from_ip(&mut addr);
+        assert!(resolved);
+        let info = addr.resolve_info.unwrap();
+        assert!(info.ipv4.is_none());
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_domain() {
+        let mut addr = Addr::new("example.com", 80);
+        let resolved = try_resolve_from_ip(&mut addr);
+        assert!(!resolved);
+        assert!(addr.resolve_info.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_already_resolved() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        addr.resolve_info = Some(ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST));
+        let resolved = try_resolve_from_ip(&mut addr);
+        assert!(resolved);
+        // Should keep original resolve_info, not overwrite
+        assert_eq!(addr.resolve_info.unwrap().ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_build_resolve_info_from_ips_mixed() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let info = build_resolve_info_from_ips(ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn test_build_resolve_info_from_ips_empty() {
+        let info = build_resolve_info_from_ips(vec![]);
+        assert!(info.ipv4.is_none());
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_some());
+    }
+
+    #[test]
+    fn test_build_resolve_info_from_ips_v4_only() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))];
+        let info = build_resolve_info_from_ips(ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_none());
     }
 }
 
