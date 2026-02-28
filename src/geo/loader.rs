@@ -449,7 +449,7 @@ impl AutoGeoLoader {
     fn load_geosite_code(&self, code: &str) -> Result<Vec<DomainEntry>> {
         let code_lower = code.to_lowercase();
 
-        // Check cache first
+        // Try read lock first (fast path)
         {
             let cache = self.geosite_cache.read().unwrap();
             if let Some(domains) = cache.get(&code_lower) {
@@ -457,8 +457,15 @@ impl AutoGeoLoader {
             }
         }
 
-        // Ensure reader is initialized
+        // Cache miss — ensure reader is ready, then load under write lock
         self.ensure_geosite_reader()?;
+
+        let mut cache = self.geosite_cache.write().unwrap();
+
+        // Double-check: another thread may have populated the cache
+        if let Some(domains) = cache.get(&code_lower) {
+            return Ok(domains.clone());
+        }
 
         // Load from reader
         let domains = {
@@ -468,12 +475,7 @@ impl AutoGeoLoader {
             singsite::convert_items_to_entries(items)
         };
 
-        // Cache the result
-        {
-            let mut cache = self.geosite_cache.write().unwrap();
-            cache.insert(code_lower, domains.clone());
-        }
-
+        cache.insert(code_lower, domains.clone());
         Ok(domains)
     }
 }
@@ -628,6 +630,41 @@ mod tests {
 
         assert!(loader.load_geoip("cn").is_err());
         assert!(loader.load_geosite("google").is_err());
+    }
+
+    #[test]
+    fn test_memory_geoloader_caching() {
+        let mut loader = MemoryGeoLoader::new();
+        loader.add_geosite(
+            "google",
+            vec![
+                DomainEntry::new_root_domain("google.com"),
+                DomainEntry::new_root_domain("googleapis.com"),
+            ],
+        );
+
+        // Load twice - second call should use cached data
+        let matcher1 = loader.load_geosite("google").unwrap();
+        let matcher2 = loader.load_geosite("google").unwrap();
+
+        assert_eq!(matcher1.site_name(), "google");
+        assert_eq!(matcher2.site_name(), "google");
+    }
+
+    #[test]
+    fn test_memory_geoloader_with_attributes() {
+        let mut loader = MemoryGeoLoader::new();
+        loader.add_geosite(
+            "google",
+            vec![
+                DomainEntry::new_root_domain("google.com").with_attribute("cn", ""),
+                DomainEntry::new_root_domain("google.cn"),
+            ],
+        );
+
+        // Load with attribute filter
+        let matcher = loader.load_geosite("google@cn").unwrap();
+        assert_eq!(matcher.site_name(), "google");
     }
 
     #[test]
