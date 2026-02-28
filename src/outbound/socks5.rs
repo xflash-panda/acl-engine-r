@@ -652,6 +652,117 @@ impl AsyncOutbound for Socks5 {
 }
 
 /// SOCKS5 UDP connection wrapper.
+/// Encode an address into SOCKS5 UDP datagram header format.
+/// Returns: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT(2).
+fn socks5_udp_encode_addr(addr: &Addr) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+
+    // RSV (2 bytes) + FRAG (1 byte)
+    data.extend(&[0x00, 0x00, 0x00]);
+
+    // Address type and address
+    if let Ok(ip) = addr.host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V4(v4) => {
+                data.push(SOCKS5_ATYP_IPV4);
+                data.extend(&v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                data.push(SOCKS5_ATYP_IPV6);
+                data.extend(&v6.octets());
+            }
+        }
+    } else {
+        let domain = addr.host.as_bytes();
+        if domain.len() > 255 {
+            return Err(AclError::OutboundError(format!(
+                "Domain name too long for SOCKS5: {} bytes (max 255)",
+                domain.len()
+            )));
+        }
+        data.push(SOCKS5_ATYP_DOMAIN);
+        data.push(domain.len() as u8);
+        data.extend(domain);
+    }
+
+    // Port
+    data.push((addr.port >> 8) as u8);
+    data.push((addr.port & 0xFF) as u8);
+
+    Ok(data)
+}
+
+/// Decode a SOCKS5 UDP datagram header, returning the address and header length.
+/// Parses: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT(2) from a byte slice.
+fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
+    if data.len() < 4 {
+        return Err(AclError::OutboundError(
+            "Invalid SOCKS5 datagram".to_string(),
+        ));
+    }
+
+    // Skip RSV (2 bytes) + FRAG (1 byte)
+    let atyp = data[3];
+    let mut offset = 4;
+
+    let (host, port) = match atyp {
+        SOCKS5_ATYP_IPV4 => {
+            if data.len() < offset + 6 {
+                return Err(AclError::OutboundError("Invalid IPv4 datagram".to_string()));
+            }
+            let ip = std::net::Ipv4Addr::new(
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            );
+            offset += 4;
+            let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            (ip.to_string(), port)
+        }
+        SOCKS5_ATYP_IPV6 => {
+            if data.len() < offset + 18 {
+                return Err(AclError::OutboundError("Invalid IPv6 datagram".to_string()));
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[offset..offset + 16]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            offset += 16;
+            let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            (ip.to_string(), port)
+        }
+        SOCKS5_ATYP_DOMAIN => {
+            if data.len() < offset + 1 {
+                return Err(AclError::OutboundError(
+                    "Invalid domain datagram".to_string(),
+                ));
+            }
+            let len = data[offset] as usize;
+            offset += 1;
+            if data.len() < offset + len + 2 {
+                return Err(AclError::OutboundError(
+                    "Invalid domain datagram".to_string(),
+                ));
+            }
+            let domain = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+            offset += len;
+            let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
+            offset += 2;
+            (domain, port)
+        }
+        _ => {
+            return Err(AclError::OutboundError(format!(
+                "Unknown address type: {}",
+                atyp
+            )));
+        }
+    };
+
+    Ok((Addr::new(host, port), offset))
+}
+
 struct Socks5UdpConn {
     _tcp_conn: TcpStream, // Keep TCP connection alive
     udp_socket: UdpSocket,
@@ -664,113 +775,6 @@ impl Socks5UdpConn {
             udp_socket,
         }
     }
-
-    fn addr_to_socks5(&self, addr: &Addr) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-
-        // RSV (2 bytes) + FRAG (1 byte)
-        data.extend(&[0x00, 0x00, 0x00]);
-
-        // Address type and address
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    data.push(SOCKS5_ATYP_IPV4);
-                    data.extend(&v4.octets());
-                }
-                IpAddr::V6(v6) => {
-                    data.push(SOCKS5_ATYP_IPV6);
-                    data.extend(&v6.octets());
-                }
-            }
-        } else {
-            let domain = addr.host.as_bytes();
-            if domain.len() > 255 {
-                return Err(AclError::OutboundError(format!(
-                    "Domain name too long for SOCKS5: {} bytes (max 255)",
-                    domain.len()
-                )));
-            }
-            data.push(SOCKS5_ATYP_DOMAIN);
-            data.push(domain.len() as u8);
-            data.extend(domain);
-        }
-
-        // Port
-        data.push((addr.port >> 8) as u8);
-        data.push((addr.port & 0xFF) as u8);
-
-        Ok(data)
-    }
-
-    fn parse_socks5_addr(&self, data: &[u8]) -> Result<(Addr, usize)> {
-        if data.len() < 4 {
-            return Err(AclError::OutboundError(
-                "Invalid SOCKS5 datagram".to_string(),
-            ));
-        }
-
-        // Skip RSV (2 bytes) + FRAG (1 byte)
-        let atyp = data[3];
-        let mut offset = 4;
-
-        let (host, port) = match atyp {
-            SOCKS5_ATYP_IPV4 => {
-                if data.len() < offset + 6 {
-                    return Err(AclError::OutboundError("Invalid IPv4 datagram".to_string()));
-                }
-                let ip = std::net::Ipv4Addr::new(
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                );
-                offset += 4;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (ip.to_string(), port)
-            }
-            SOCKS5_ATYP_IPV6 => {
-                if data.len() < offset + 18 {
-                    return Err(AclError::OutboundError("Invalid IPv6 datagram".to_string()));
-                }
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[offset..offset + 16]);
-                let ip = std::net::Ipv6Addr::from(octets);
-                offset += 16;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (ip.to_string(), port)
-            }
-            SOCKS5_ATYP_DOMAIN => {
-                if data.len() < offset + 1 {
-                    return Err(AclError::OutboundError(
-                        "Invalid domain datagram".to_string(),
-                    ));
-                }
-                let len = data[offset] as usize;
-                offset += 1;
-                if data.len() < offset + len + 2 {
-                    return Err(AclError::OutboundError(
-                        "Invalid domain datagram".to_string(),
-                    ));
-                }
-                let domain = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
-                offset += len;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (domain, port)
-            }
-            _ => {
-                return Err(AclError::OutboundError(format!(
-                    "Unknown address type: {}",
-                    atyp
-                )));
-            }
-        };
-
-        Ok((Addr::new(host, port), offset))
-    }
 }
 
 impl UdpConn for Socks5UdpConn {
@@ -782,7 +786,7 @@ impl UdpConn for Socks5UdpConn {
             .recv(&mut recv_buf)
             .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
 
-        let (addr, header_len) = self.parse_socks5_addr(&recv_buf[..n])?;
+        let (addr, header_len) = socks5_udp_decode_addr(&recv_buf[..n])?;
         let data_len = n - header_len;
         let copy_len = data_len.min(buf.len());
         buf[..copy_len].copy_from_slice(&recv_buf[header_len..header_len + copy_len]);
@@ -791,7 +795,7 @@ impl UdpConn for Socks5UdpConn {
     }
 
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let mut packet = self.addr_to_socks5(addr)?;
+        let mut packet = socks5_udp_encode_addr(addr)?;
         packet.extend(buf);
 
         self.udp_socket
@@ -821,107 +825,6 @@ impl AsyncSocks5UdpConn {
             udp_socket,
         }
     }
-
-    fn addr_to_socks5(&self, addr: &Addr) -> Result<Vec<u8>> {
-        let mut data = Vec::new();
-        data.extend(&[0x00, 0x00, 0x00]);
-
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    data.push(SOCKS5_ATYP_IPV4);
-                    data.extend(&v4.octets());
-                }
-                IpAddr::V6(v6) => {
-                    data.push(SOCKS5_ATYP_IPV6);
-                    data.extend(&v6.octets());
-                }
-            }
-        } else {
-            let domain = addr.host.as_bytes();
-            if domain.len() > 255 {
-                return Err(AclError::OutboundError(format!(
-                    "Domain name too long for SOCKS5: {} bytes (max 255)",
-                    domain.len()
-                )));
-            }
-            data.push(SOCKS5_ATYP_DOMAIN);
-            data.push(domain.len() as u8);
-            data.extend(domain);
-        }
-
-        data.push((addr.port >> 8) as u8);
-        data.push((addr.port & 0xFF) as u8);
-        Ok(data)
-    }
-
-    fn parse_socks5_addr(&self, data: &[u8]) -> Result<(Addr, usize)> {
-        if data.len() < 4 {
-            return Err(AclError::OutboundError(
-                "Invalid SOCKS5 datagram".to_string(),
-            ));
-        }
-
-        let atyp = data[3];
-        let mut offset = 4;
-
-        let (host, port) = match atyp {
-            SOCKS5_ATYP_IPV4 => {
-                if data.len() < offset + 6 {
-                    return Err(AclError::OutboundError("Invalid IPv4 datagram".to_string()));
-                }
-                let ip = std::net::Ipv4Addr::new(
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                );
-                offset += 4;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (ip.to_string(), port)
-            }
-            SOCKS5_ATYP_IPV6 => {
-                if data.len() < offset + 18 {
-                    return Err(AclError::OutboundError("Invalid IPv6 datagram".to_string()));
-                }
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[offset..offset + 16]);
-                let ip = std::net::Ipv6Addr::from(octets);
-                offset += 16;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (ip.to_string(), port)
-            }
-            SOCKS5_ATYP_DOMAIN => {
-                if data.len() < offset + 1 {
-                    return Err(AclError::OutboundError(
-                        "Invalid domain datagram".to_string(),
-                    ));
-                }
-                let len = data[offset] as usize;
-                offset += 1;
-                if data.len() < offset + len + 2 {
-                    return Err(AclError::OutboundError(
-                        "Invalid domain datagram".to_string(),
-                    ));
-                }
-                let domain = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
-                offset += len;
-                let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
-                offset += 2;
-                (domain, port)
-            }
-            _ => {
-                return Err(AclError::OutboundError(format!(
-                    "Unknown address type: {}",
-                    atyp
-                )));
-            }
-        };
-
-        Ok((Addr::new(host, port), offset))
-    }
 }
 
 #[cfg(feature = "async")]
@@ -936,7 +839,7 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
             .await
             .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
 
-        let (addr, header_len) = self.parse_socks5_addr(&recv_buf[..n])?;
+        let (addr, header_len) = socks5_udp_decode_addr(&recv_buf[..n])?;
         let data_len = n - header_len;
         let copy_len = data_len.min(buf.len());
         buf[..copy_len].copy_from_slice(&recv_buf[header_len..header_len + copy_len]);
@@ -945,7 +848,7 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let mut packet = self.addr_to_socks5(addr)?;
+        let mut packet = socks5_udp_encode_addr(addr)?;
         packet.extend(buf);
 
         self.udp_socket
@@ -1053,6 +956,93 @@ mod tests {
         let socks5 = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass);
         assert_eq!(socks5.username.as_ref().unwrap().len(), 255);
         assert_eq!(socks5.password.as_ref().unwrap().len(), 255);
+    }
+
+    // ========== SOCKS5 UDP free function tests ==========
+
+    #[test]
+    fn test_socks5_udp_encode_ipv4() {
+        let addr = Addr::new("192.168.1.1", 80);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        // RSV(2) + FRAG(1) + ATYP(1) + IPv4(4) + PORT(2) = 10 bytes
+        assert_eq!(data.len(), 10);
+        assert_eq!(&data[0..3], &[0x00, 0x00, 0x00]);
+        assert_eq!(data[3], SOCKS5_ATYP_IPV4);
+        assert_eq!(&data[4..8], &[192, 168, 1, 1]);
+        assert_eq!(u16::from_be_bytes([data[8], data[9]]), 80);
+    }
+
+    #[test]
+    fn test_socks5_udp_encode_ipv6() {
+        let addr = Addr::new("::1", 443);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        // RSV(2) + FRAG(1) + ATYP(1) + IPv6(16) + PORT(2) = 22 bytes
+        assert_eq!(data.len(), 22);
+        assert_eq!(data[3], SOCKS5_ATYP_IPV6);
+        assert_eq!(u16::from_be_bytes([data[20], data[21]]), 443);
+    }
+
+    #[test]
+    fn test_socks5_udp_encode_domain() {
+        let addr = Addr::new("example.com", 53);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        // RSV(2) + FRAG(1) + ATYP(1) + LEN(1) + "example.com"(11) + PORT(2) = 18 bytes
+        assert_eq!(data.len(), 18);
+        assert_eq!(data[3], SOCKS5_ATYP_DOMAIN);
+        assert_eq!(data[4], 11);
+        assert_eq!(&data[5..16], b"example.com");
+        assert_eq!(u16::from_be_bytes([data[16], data[17]]), 53);
+    }
+
+    #[test]
+    fn test_socks5_udp_encode_domain_too_long() {
+        let long_domain = "a".repeat(256);
+        let addr = Addr::new(long_domain, 80);
+        let result = socks5_udp_encode_addr(&addr);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_socks5_udp_decode_ipv4_roundtrip() {
+        let addr = Addr::new("10.0.0.1", 8080);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        let (decoded, offset) = socks5_udp_decode_addr(&data).unwrap();
+        assert_eq!(decoded.host, "10.0.0.1");
+        assert_eq!(decoded.port, 8080);
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn test_socks5_udp_decode_ipv6_roundtrip() {
+        let addr = Addr::new("::1", 443);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        let (decoded, offset) = socks5_udp_decode_addr(&data).unwrap();
+        assert_eq!(decoded.host, "::1");
+        assert_eq!(decoded.port, 443);
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn test_socks5_udp_decode_domain_roundtrip() {
+        let addr = Addr::new("test.example.com", 53);
+        let data = socks5_udp_encode_addr(&addr).unwrap();
+        let (decoded, offset) = socks5_udp_decode_addr(&data).unwrap();
+        assert_eq!(decoded.host, "test.example.com");
+        assert_eq!(decoded.port, 53);
+        assert_eq!(offset, data.len());
+    }
+
+    #[test]
+    fn test_socks5_udp_decode_truncated() {
+        let result = socks5_udp_decode_addr(&[0x00, 0x00]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_socks5_udp_decode_unknown_atyp() {
+        let data = [0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let result = socks5_udp_decode_addr(&data);
+        assert!(result.is_err());
     }
 
     #[test]
