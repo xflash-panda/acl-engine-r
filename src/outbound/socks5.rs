@@ -39,6 +39,39 @@ const SOCKS5_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum SOCKS5 UDP header overhead: 2 RSV + 1 FRAG + 1 ATYP + 256 addr + 2 port.
 const SOCKS5_UDP_HEADER_MAX: usize = 262;
 
+/// Convert SOCKS5 reply code to human-readable string.
+fn socks5_rep_to_string(rep: u8) -> &'static str {
+    match rep {
+        0x00 => "succeeded",
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "undefined",
+    }
+}
+
+/// Validate SOCKS5 response header fields.
+fn validate_socks5_response(ver: u8, rep: u8) -> Result<()> {
+    if ver != SOCKS5_VERSION {
+        return Err(AclError::OutboundError(format!(
+            "Invalid SOCKS version in response: {}",
+            ver
+        )));
+    }
+    if rep != SOCKS5_REP_SUCCESS {
+        return Err(AclError::OutboundError(format!(
+            "SOCKS5 request failed: {}",
+            socks5_rep_to_string(rep)
+        )));
+    }
+    Ok(())
+}
+
 /// SOCKS5 proxy outbound.
 ///
 /// Since SOCKS5 supports using either IP or domain name as the target address,
@@ -241,19 +274,7 @@ impl Socks5 {
             .read_exact(&mut resp_header)
             .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
 
-        if resp_header[0] != SOCKS5_VERSION {
-            return Err(AclError::OutboundError(format!(
-                "Invalid SOCKS version in response: {}",
-                resp_header[0]
-            )));
-        }
-
-        if resp_header[1] != SOCKS5_REP_SUCCESS {
-            return Err(AclError::OutboundError(format!(
-                "SOCKS5 request failed: {}",
-                self.rep_to_string(resp_header[1])
-            )));
-        }
+        validate_socks5_response(resp_header[0], resp_header[1])?;
 
         // Read bound address
         let (bound_host, bound_port) = match resp_header[3] {
@@ -361,22 +382,6 @@ impl Socks5 {
             let mut addr = vec![domain.len() as u8];
             addr.extend(domain);
             Ok((SOCKS5_ATYP_DOMAIN, addr))
-        }
-    }
-
-    /// Convert reply code to string.
-    fn rep_to_string(&self, rep: u8) -> &'static str {
-        match rep {
-            0x00 => "succeeded",
-            0x01 => "general SOCKS server failure",
-            0x02 => "connection not allowed by ruleset",
-            0x03 => "network unreachable",
-            0x04 => "host unreachable",
-            0x05 => "connection refused",
-            0x06 => "TTL expired",
-            0x07 => "command not supported",
-            0x08 => "address type not supported",
-            _ => "undefined",
         }
     }
 
@@ -506,19 +511,7 @@ impl Socks5 {
             .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
             .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
 
-        if resp_header[0] != SOCKS5_VERSION {
-            return Err(AclError::OutboundError(format!(
-                "Invalid SOCKS version in response: {}",
-                resp_header[0]
-            )));
-        }
-
-        if resp_header[1] != SOCKS5_REP_SUCCESS {
-            return Err(AclError::OutboundError(format!(
-                "SOCKS5 request failed: {}",
-                self.rep_to_string(resp_header[1])
-            )));
-        }
+        validate_socks5_response(resp_header[0], resp_header[1])?;
 
         let (bound_host, bound_port) =
             match resp_header[3] {
@@ -1142,6 +1135,46 @@ mod tests {
             "IPv6-bound UDP socket should connect to IPv6 address"
         );
     }
+
+    #[test]
+    fn test_validate_socks5_response_success() {
+        assert!(validate_socks5_response(0x05, 0x00).is_ok());
+    }
+
+    #[test]
+    fn test_validate_socks5_response_bad_version() {
+        let err = validate_socks5_response(0x04, 0x00).unwrap_err();
+        assert!(err.to_string().contains("version"));
+    }
+
+    #[test]
+    fn test_validate_socks5_response_refused() {
+        let err = validate_socks5_response(0x05, 0x05).unwrap_err();
+        assert!(err.to_string().contains("refused"));
+    }
+
+    #[test]
+    fn test_validate_socks5_response_all_error_codes() {
+        for rep in 1..=8u8 {
+            let err = validate_socks5_response(0x05, rep).unwrap_err();
+            assert!(
+                !err.to_string().is_empty(),
+                "rep={} should produce an error message",
+                rep
+            );
+        }
+    }
+
+    #[test]
+    fn test_socks5_rep_to_string_known() {
+        assert_eq!(socks5_rep_to_string(0x00), "succeeded");
+        assert_eq!(socks5_rep_to_string(0x05), "connection refused");
+    }
+
+    #[test]
+    fn test_socks5_rep_to_string_undefined() {
+        assert_eq!(socks5_rep_to_string(0xFF), "undefined");
+    }
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -1255,4 +1288,5 @@ mod async_tests {
             Ok(_) => panic!("Expected connection error for non-listening port"),
         }
     }
+
 }

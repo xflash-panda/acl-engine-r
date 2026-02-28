@@ -76,6 +76,14 @@ impl Addr {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// Parse the network address into a SocketAddr.
+    /// Returns an error if the address cannot be parsed (e.g. unresolved domain).
+    pub fn to_socket_addr(&self) -> Result<SocketAddr> {
+        self.network_addr()
+            .parse()
+            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))
+    }
+
     /// Get the network address for dialing.
     /// If ResolveInfo contains an IPv4 address, it returns that.
     /// Otherwise, if it contains an IPv6 address, it returns that.
@@ -301,12 +309,8 @@ impl UdpConn for StdUdpConn {
     }
 
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let socket_addr: SocketAddr = addr
-            .network_addr()
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
         self.inner
-            .send_to(buf, socket_addr)
+            .send_to(buf, addr.to_socket_addr()?)
             .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
     }
 
@@ -410,12 +414,8 @@ impl AsyncUdpConn for TokioUdpConn {
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let socket_addr: SocketAddr = addr
-            .network_addr()
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
         self.inner
-            .send_to(buf, socket_addr)
+            .send_to(buf, addr.to_socket_addr()?)
             .await
             .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
     }
@@ -527,5 +527,19 @@ mod tests {
         let (v4, v6) = split_ipv4_ipv6(&ips);
         assert_eq!(v4, Some(Ipv4Addr::new(1, 1, 1, 1)));
         assert_eq!(v6, Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_with_resolve_info() {
+        let addr = Addr::new("example.com", 80)
+            .with_resolve_info(ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4)));
+        let sock = addr.to_socket_addr().unwrap();
+        assert_eq!(sock, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80));
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_domain_fails() {
+        let addr = Addr::new("example.com", 80);
+        assert!(addr.to_socket_addr().is_err());
     }
 }

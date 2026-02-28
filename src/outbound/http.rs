@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::error::{AclError, Result};
 
-use super::{Addr, Outbound, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
+use super::{Addr, Outbound, StdTcpConn, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
 #[cfg(feature = "async")]
 use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
@@ -407,7 +407,7 @@ impl Outbound for Http {
             )));
         }
 
-        Ok(Box::new(HttpTcpConn::new(stream.try_clone().map_err(
+        Ok(Box::new(StdTcpConn::new(stream.try_clone().map_err(
             |e| AclError::OutboundError(format!("Failed to clone stream: {}", e)),
         )?)))
     }
@@ -519,55 +519,6 @@ impl AsyncOutbound for Http {
         Err(AclError::OutboundError(
             "UDP not supported by HTTP proxy".to_string(),
         ))
-    }
-}
-
-/// HTTP proxy TCP connection wrapper.
-struct HttpTcpConn {
-    stream: TcpStream,
-}
-
-impl HttpTcpConn {
-    fn new(stream: TcpStream) -> Self {
-        Self { stream }
-    }
-}
-
-impl Read for HttpTcpConn {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl Write for HttpTcpConn {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-impl TcpConn for HttpTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
-    }
-
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
-    }
-
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(dur)
-    }
-
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(dur)
-    }
-
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.stream.shutdown(how)
     }
 }
 
