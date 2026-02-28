@@ -109,9 +109,7 @@ impl HostMatcher for DomainMatcher {
         match self.mode {
             DomainMatchMode::Exact => *name == self.pattern,
             DomainMatchMode::Wildcard => Self::wildcard_match(name, &self.pattern),
-            DomainMatchMode::Suffix => {
-                *name == self.pattern || name.ends_with(&self.dot_pattern)
-            }
+            DomainMatchMode::Suffix => *name == self.pattern || name.ends_with(&self.dot_pattern),
         }
     }
 }
