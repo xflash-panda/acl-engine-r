@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
@@ -38,8 +38,10 @@ pub struct FileGeoLoader {
     geoip_format: Option<GeoIpFormat>,
     geosite_format: Option<GeoSiteFormat>,
 
-    // Cached data
+    // Cached data for DAT format (pre-loaded CIDRs)
     geoip_data: RwLock<Option<HashMap<String, Vec<IpNet>>>>,
+    // Cached MMDB/MetaDB reader for on-demand IP lookups
+    mmdb_reader: RwLock<Option<Arc<maxminddb::Reader<Vec<u8>>>>>,
     geosite_data: RwLock<Option<HashMap<String, Vec<DomainEntry>>>>,
 }
 
@@ -52,6 +54,7 @@ impl FileGeoLoader {
             geoip_format: None,
             geosite_format: None,
             geoip_data: RwLock::new(None),
+            mmdb_reader: RwLock::new(None),
             geosite_data: RwLock::new(None),
         }
     }
@@ -92,9 +95,8 @@ impl FileGeoLoader {
             .or_else(|| self.geosite_path.as_ref().and_then(GeoSiteFormat::detect))
     }
 
-    /// Load and cache GeoIP data
+    /// Load and cache GeoIP CIDR data (for DAT format)
     fn ensure_geoip_loaded(&self) -> Result<()> {
-        // Check if already loaded
         if self.geoip_data.read().unwrap().is_some() {
             return Ok(());
         }
@@ -104,14 +106,33 @@ impl FileGeoLoader {
             .as_ref()
             .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
 
-        let format = self
-            .get_geoip_format()
-            .ok_or_else(|| AclError::GeoIpError("Cannot detect GeoIP format".to_string()))?;
-
-        let data = load_geoip_file(path, format)?;
+        let data = dat::load_geoip(path)?;
 
         *self.geoip_data.write().unwrap() = Some(data);
         Ok(())
+    }
+
+    /// Open and cache a shared MMDB/MetaDB reader (for MMDB and MetaDB formats)
+    fn ensure_mmdb_reader(&self) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
+        {
+            let guard = self.mmdb_reader.read().unwrap();
+            if let Some(ref reader) = *guard {
+                return Ok(reader.clone());
+            }
+        }
+
+        let path = self
+            .geoip_path
+            .as_ref()
+            .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
+
+        let reader = Arc::new(
+            maxminddb::Reader::open_readfile(path)
+                .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
+        );
+
+        *self.mmdb_reader.write().unwrap() = Some(reader.clone());
+        Ok(reader)
     }
 
     /// Load and cache GeoSite data
@@ -145,14 +166,27 @@ impl Default for FileGeoLoader {
 
 impl GeoLoader for FileGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
-        self.ensure_geoip_loaded()?;
+        let format = self
+            .get_geoip_format()
+            .ok_or_else(|| AclError::GeoIpError("Cannot detect GeoIP format".to_string()))?;
 
         let code = country_code.to_lowercase();
-        let guard = self.geoip_data.read().unwrap();
-        let data = guard.as_ref().unwrap();
 
-        let cidrs = data.get(&code).cloned().unwrap_or_default();
-        Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
+        match format {
+            GeoIpFormat::Dat => {
+                // DAT: pre-load all CIDRs, lookup by country code
+                self.ensure_geoip_loaded()?;
+                let guard = self.geoip_data.read().unwrap();
+                let data = guard.as_ref().unwrap();
+                let cidrs = data.get(&code).cloned().unwrap_or_default();
+                Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
+            }
+            GeoIpFormat::Mmdb | GeoIpFormat::MetaDb => {
+                // MMDB/MetaDB: on-demand lookup via shared reader
+                let reader = self.ensure_mmdb_reader()?;
+                Ok(GeoIpMatcher::from_mmdb_reader(reader, &code))
+            }
+        }
     }
 
     fn load_geosite(&self, site_name: &str) -> Result<GeoSiteMatcher> {
@@ -188,8 +222,10 @@ pub struct AutoGeoLoader {
     // Logger
     pub logger: Option<LoggerCallback>,
 
-    // Cached data
+    // Cached data for DAT format (pre-loaded CIDRs)
     geoip_data: RwLock<Option<HashMap<String, Vec<IpNet>>>>,
+    // Cached MMDB/MetaDB reader for on-demand IP lookups
+    mmdb_reader: RwLock<Option<Arc<maxminddb::Reader<Vec<u8>>>>>,
     // Lazy-loaded geosite data: only loads requested codes
     geosite_cache: RwLock<HashMap<String, Vec<DomainEntry>>>,
     // Persistent reader for sing-geosite format (opened once, reused for all reads)
@@ -211,6 +247,7 @@ impl AutoGeoLoader {
             update_interval: DEFAULT_UPDATE_INTERVAL,
             logger: None,
             geoip_data: RwLock::new(None),
+            mmdb_reader: RwLock::new(None),
             geosite_cache: RwLock::new(HashMap::new()),
             geosite_reader: Mutex::new(None),
             download_lock: Mutex::new(()),
@@ -370,12 +407,8 @@ impl AutoGeoLoader {
         Ok(())
     }
 
-    /// Load GeoIP data with auto-download
-    fn ensure_geoip_loaded(&self) -> Result<()> {
-        if self.geoip_data.read().unwrap().is_some() {
-            return Ok(());
-        }
-
+    /// Ensure geoip file is downloaded and available
+    fn ensure_geoip_downloaded(&self) -> Result<PathBuf> {
         let format = self
             .geoip_format
             .ok_or_else(|| AclError::GeoIpError("GeoIP format not configured".to_string()))?;
@@ -386,14 +419,12 @@ impl AutoGeoLoader {
 
         eprintln!("[geoip] Checking geoip file: {}", path.display());
 
-        // Try to download if needed
         if self.should_download(&path) {
             eprintln!("[geoip] File needs download/update");
             if let Some(ref url) = self.geoip_url {
                 eprintln!("[geoip] Downloading from: {}", url);
                 let verify = |p: &Path| verify_geoip_file(p, format);
                 if let Err(e) = self.download(&path, url, verify) {
-                    // If download fails but file exists, try to use it
                     if !path.exists() {
                         return Err(e);
                     }
@@ -402,9 +433,38 @@ impl AutoGeoLoader {
             }
         }
 
-        let data = load_geoip_file(&path, format)?;
+        Ok(path)
+    }
+
+    /// Load GeoIP CIDR data with auto-download (for DAT format)
+    fn ensure_geoip_loaded(&self) -> Result<()> {
+        if self.geoip_data.read().unwrap().is_some() {
+            return Ok(());
+        }
+
+        let path = self.ensure_geoip_downloaded()?;
+        let data = dat::load_geoip(&path)?;
         *self.geoip_data.write().unwrap() = Some(data);
         Ok(())
+    }
+
+    /// Open and cache a shared MMDB/MetaDB reader with auto-download
+    fn ensure_mmdb_reader(&self) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
+        {
+            let guard = self.mmdb_reader.read().unwrap();
+            if let Some(ref reader) = *guard {
+                return Ok(reader.clone());
+            }
+        }
+
+        let path = self.ensure_geoip_downloaded()?;
+        let reader = Arc::new(
+            maxminddb::Reader::open_readfile(&path)
+                .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
+        );
+
+        *self.mmdb_reader.write().unwrap() = Some(reader.clone());
+        Ok(reader)
     }
 
     /// Ensure geosite reader is initialized (opens file once)
@@ -490,14 +550,25 @@ impl Default for AutoGeoLoader {
 
 impl GeoLoader for AutoGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
-        self.ensure_geoip_loaded()?;
+        let format = self
+            .geoip_format
+            .ok_or_else(|| AclError::GeoIpError("GeoIP format not configured".to_string()))?;
 
         let code = country_code.to_lowercase();
-        let guard = self.geoip_data.read().unwrap();
-        let data = guard.as_ref().unwrap();
 
-        let cidrs = data.get(&code).cloned().unwrap_or_default();
-        Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
+        match format {
+            GeoIpFormat::Dat => {
+                self.ensure_geoip_loaded()?;
+                let guard = self.geoip_data.read().unwrap();
+                let data = guard.as_ref().unwrap();
+                let cidrs = data.get(&code).cloned().unwrap_or_default();
+                Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
+            }
+            GeoIpFormat::Mmdb | GeoIpFormat::MetaDb => {
+                let reader = self.ensure_mmdb_reader()?;
+                Ok(GeoIpMatcher::from_mmdb_reader(reader, &code))
+            }
+        }
     }
 
     fn load_geosite(&self, site_name: &str) -> Result<GeoSiteMatcher> {
@@ -574,14 +645,6 @@ impl GeoLoader for MemoryGeoLoader {
 // Helper functions
 
 /// Load GeoIP data from file based on format
-fn load_geoip_file(path: &Path, format: GeoIpFormat) -> Result<HashMap<String, Vec<IpNet>>> {
-    match format {
-        GeoIpFormat::Dat => dat::load_geoip(path),
-        GeoIpFormat::Mmdb => mmdb::load_geoip(path),
-        GeoIpFormat::MetaDb => metadb::load_geoip(path),
-    }
-}
-
 /// Load GeoSite data from file based on format
 fn load_geosite_file(
     path: &Path,

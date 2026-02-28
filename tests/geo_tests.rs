@@ -454,11 +454,39 @@ mod file_geo_loader_tests {
 
         let loader = FileGeoLoader::new().with_geoip_path(&geoip_path);
 
-        // MMDB format doesn't support pre-loading by country code
-        // It uses on-demand lookup via the reader
-        let result = loader.load_geoip("cn");
-        // This may return an empty matcher for MMDB since we don't pre-load
-        assert!(result.is_ok() || result.is_err());
+        let matcher = loader.load_geoip("cn").unwrap();
+
+        // Bug: MMDB load_geoip returns empty HashMap, so matcher never matches.
+        // Verify that MMDB GeoIP actually matches known Chinese IPs.
+        let ip: IpAddr = "114.114.114.114".parse().unwrap();
+        let host = HostInfo::from_ip(ip);
+        assert!(
+            matcher.matches(&host),
+            "114.114.114.114 should be in CN via MMDB FileGeoLoader"
+        );
+    }
+
+    #[test]
+    fn test_file_geo_loader_metadb() {
+        let geoip_path = testdata_path("geoip.metadb");
+
+        if !geoip_path.exists() {
+            eprintln!("Skipping test: geoip.metadb not found");
+            return;
+        }
+
+        let loader = FileGeoLoader::new().with_geoip_path(&geoip_path);
+
+        let matcher = loader.load_geoip("cn").unwrap();
+
+        // Bug: MetaDB load_geoip returns empty HashMap, so matcher never matches.
+        // Verify that MetaDB GeoIP actually matches known Chinese IPs.
+        let ip: IpAddr = "114.114.114.114".parse().unwrap();
+        let host = HostInfo::from_ip(ip);
+        assert!(
+            matcher.matches(&host),
+            "114.114.114.114 should be in CN via MetaDB FileGeoLoader"
+        );
     }
 
     #[test]

@@ -73,6 +73,22 @@ impl<O: Clone> CompiledRuleSet<O> {
         proto: Protocol,
         port: u16,
     ) -> Option<MatchResult<O>> {
+        // Ensure hostname is lowercase for matching.
+        // HostInfo constructors guarantee lowercase, but direct struct construction
+        // (e.g., in Router::match_outbound) may not. Normalize defensively, only
+        // allocating when uppercase bytes are detected.
+        let normalized;
+        let host = if host.name.as_bytes().iter().any(|b| b.is_ascii_uppercase()) {
+            normalized = HostInfo {
+                name: host.name.to_lowercase(),
+                ipv4: host.ipv4,
+                ipv6: host.ipv6,
+            };
+            &normalized
+        } else {
+            host
+        };
+
         let key = CacheKey::from_host(host, proto, port);
 
         let mut cache = self.cache.lock();
@@ -420,6 +436,55 @@ proxy(all)
 
         let r4 = compiled.match_host(&host1, Protocol::TCP, 80);
         assert_eq!(r4.unwrap().outbound, "PROXY");
+    }
+
+    #[test]
+    fn test_match_domain_mixed_case_direct_construction() {
+        // Bug: Router constructs HostInfo directly without lowercasing.
+        // Domain matching must work even when HostInfo.name is mixed-case.
+        let text = "proxy(*.google.com)\nblock(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+        outbounds.insert("block".to_string(), "BLOCK");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        // Direct construction with mixed-case (simulates Router's match_outbound)
+        let host = HostInfo {
+            name: "WWW.GOOGLE.COM".to_string(),
+            ipv4: None,
+            ipv6: None,
+        };
+        let result = compiled.match_host(&host, Protocol::TCP, 443);
+        assert_eq!(
+            result.unwrap().outbound, "PROXY",
+            "Mixed-case hostname should match domain rules"
+        );
+    }
+
+    #[test]
+    fn test_match_suffix_mixed_case_direct_construction() {
+        let text = "proxy(suffix:youtube.com)\nblock(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+        outbounds.insert("block".to_string(), "BLOCK");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        let host = HostInfo {
+            name: "WWW.YouTube.COM".to_string(),
+            ipv4: None,
+            ipv6: None,
+        };
+        let result = compiled.match_host(&host, Protocol::TCP, 443);
+        assert_eq!(
+            result.unwrap().outbound, "PROXY",
+            "Mixed-case hostname should match suffix rules"
+        );
     }
 
     #[test]

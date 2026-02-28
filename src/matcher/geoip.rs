@@ -153,7 +153,8 @@ impl GeoIpMatcher {
         self.inverse = inverse;
     }
 
-    /// Check if an IP matches using MMDB
+    /// Check if an IP matches using MMDB.
+    /// Supports multiple record formats: MaxMind, sing-geoip, and Meta-geoip0.
     fn matches_mmdb(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> bool {
         #[derive(Deserialize)]
         struct Country {
@@ -165,19 +166,43 @@ impl GeoIpMatcher {
             iso_code: Option<String>,
         }
 
-        let matches = reader
+        // Try MaxMind format: { country: { iso_code: "CN" } }
+        if let Some(code) = reader
             .lookup(ip)
             .ok()
-            .and_then(|result| result.decode::<Country>().ok()?)
-            .and_then(|record| record.country)
+            .and_then(|r| r.decode::<Country>().ok()?)
+            .and_then(|r| r.country)
             .and_then(|c| c.iso_code)
-            .map(|code| code.to_uppercase() == self.country_code)
-            .unwrap_or(false);
-        if self.inverse {
-            !matches
-        } else {
-            matches
+        {
+            let matches = code.to_uppercase() == self.country_code;
+            return if self.inverse { !matches } else { matches };
         }
+
+        // Try sing-geoip format: plain string "CN"
+        if let Some(code) = reader
+            .lookup(ip)
+            .ok()
+            .and_then(|r| r.decode::<String>().ok()?)
+        {
+            if !code.is_empty() {
+                let matches = code.to_uppercase() == self.country_code;
+                return if self.inverse { !matches } else { matches };
+            }
+        }
+
+        // Try Meta-geoip0 format: array of strings ["CN"]
+        if let Some(codes) = reader
+            .lookup(ip)
+            .ok()
+            .and_then(|r| r.decode::<Vec<String>>().ok()?)
+        {
+            let matches = codes
+                .iter()
+                .any(|c| c.to_uppercase() == self.country_code);
+            return if self.inverse { !matches } else { matches };
+        }
+
+        self.inverse
     }
 
     /// Check if an IP matches using sorted CIDR list (binary search)
