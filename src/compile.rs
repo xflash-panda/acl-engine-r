@@ -54,15 +54,19 @@ impl<O> CompiledRule<O> {
 pub struct CompiledRuleSet<O: Clone> {
     rules: Vec<CompiledRule<O>>,
     cache: Mutex<LruCache<CacheKey, CacheValue<O>>>,
+    /// True if any rule uses IP/CIDR/GeoIP matchers that require DNS resolution.
+    has_ip_rules: bool,
 }
 
 impl<O: Clone> CompiledRuleSet<O> {
     /// Create a new compiled rule set
     pub fn new(rules: Vec<CompiledRule<O>>, cache_size: usize) -> Self {
         let cache_size = NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1).unwrap());
+        let has_ip_rules = rules.iter().any(|r| r.matcher.needs_ip());
         Self {
             rules,
             cache: Mutex::new(LruCache::new(cache_size)),
+            has_ip_rules,
         }
     }
 
@@ -130,6 +134,11 @@ impl<O: Clone> CompiledRuleSet<O> {
     /// Get the number of rules
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Returns true if any rule requires IP resolution (IP/CIDR/GeoIP matchers).
+    pub fn needs_ip_matching(&self) -> bool {
+        self.has_ip_rules
     }
 
     /// Clear the cache

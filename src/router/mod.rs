@@ -181,13 +181,17 @@ impl Router {
 
 impl Outbound for Router {
     fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
-        self.resolve(addr);
+        if self.rule_set.needs_ip_matching() {
+            self.resolve(addr);
+        }
         let outbound = self.match_outbound(addr, Protocol::TCP);
         outbound.dial_tcp(addr)
     }
 
     fn dial_udp(&self, addr: &mut Addr) -> Result<Box<dyn UdpConn>> {
-        self.resolve(addr);
+        if self.rule_set.needs_ip_matching() {
+            self.resolve(addr);
+        }
         let outbound = self.match_outbound(addr, Protocol::UDP);
         outbound.dial_udp(addr)
     }
@@ -242,6 +246,49 @@ mod tests {
         assert!(map.contains_key("direct"));
         assert!(map.contains_key("reject"));
         assert!(map.contains_key("default"));
+    }
+
+    #[test]
+    fn test_router_skips_dns_for_domain_only_rules() {
+        // When rules only use domain matchers (no IP/CIDR/GeoIP),
+        // Router should NOT resolve DNS — the outbound (e.g., proxy)
+        // will handle resolution itself.
+        let rules = r#"
+            proxy(*.google.com)
+            proxy(suffix:youtube.com)
+            direct(all)
+        "#;
+
+        let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Reject::new()))];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = Router::new(rules, outbounds, &geo_loader, options).unwrap();
+
+        assert!(
+            !router.rule_set.needs_ip_matching(),
+            "Domain-only rules should not require IP matching"
+        );
+    }
+
+    #[test]
+    fn test_router_needs_dns_for_ip_rules() {
+        // When rules include IP/CIDR matchers, needs_ip_matching() should be true
+        let rules = r#"
+            direct(192.168.0.0/16)
+            proxy(all)
+        "#;
+
+        let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Reject::new()))];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = Router::new(rules, outbounds, &geo_loader, options).unwrap();
+
+        assert!(
+            router.rule_set.needs_ip_matching(),
+            "Rules with CIDR matcher should require IP matching"
+        );
     }
 
     #[test]

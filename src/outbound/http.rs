@@ -21,6 +21,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::TcpStream as TokioTcpStream;
 
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum number of response headers to read before aborting.
+/// Prevents memory exhaustion from malicious proxies sending infinite headers.
+const MAX_RESPONSE_HEADERS: usize = 100;
 
 /// HTTP/HTTPS proxy outbound.
 ///
@@ -239,6 +242,7 @@ impl Outbound for Http {
         }
 
         // Read and discard headers until empty line
+        let mut header_count = 0;
         loop {
             let mut line = String::new();
             reader
@@ -246,6 +250,12 @@ impl Outbound for Http {
                 .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
             if line.trim().is_empty() {
                 break;
+            }
+            header_count += 1;
+            if header_count > MAX_RESPONSE_HEADERS {
+                return Err(AclError::OutboundError(format!(
+                    "Too many response headers (>{MAX_RESPONSE_HEADERS})"
+                )));
             }
         }
 
@@ -336,6 +346,7 @@ impl AsyncOutbound for Http {
         }
 
         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async {
+            let mut header_count = 0;
             loop {
                 let mut line = String::new();
                 reader
@@ -346,6 +357,12 @@ impl AsyncOutbound for Http {
                     })?;
                 if line.trim().is_empty() {
                     break;
+                }
+                header_count += 1;
+                if header_count > MAX_RESPONSE_HEADERS {
+                    return Err(AclError::OutboundError(format!(
+                        "Too many response headers (>{MAX_RESPONSE_HEADERS})"
+                    )));
                 }
             }
             Ok::<_, AclError>(())
@@ -594,6 +611,66 @@ mod tests {
     }
 
     #[test]
+    fn test_http_max_response_headers_constant() {
+        // The MAX_RESPONSE_HEADERS constant must exist and be reasonable
+        assert!(
+            MAX_RESPONSE_HEADERS > 0 && MAX_RESPONSE_HEADERS <= 200,
+            "MAX_RESPONSE_HEADERS should be between 1 and 200, got {}",
+            MAX_RESPONSE_HEADERS
+        );
+    }
+
+    #[test]
+    fn test_http_sync_dial_tcp_too_many_headers() {
+        // A malicious proxy that sends valid status line + excessive headers
+        // should be rejected by the header count limit.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the CONNECT request
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .unwrap();
+            // Send way more headers than MAX_RESPONSE_HEADERS
+            for i in 0..200 {
+                let header = format!("X-Spam-{}: value{}\r\n", i, i);
+                if stream.write_all(header.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            // Never send the terminating empty line
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        // Should fail with too many headers error, not hang or succeed
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Too many") || err_msg.contains("too many"),
+                    "Error should mention too many headers, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject excessive headers"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
     fn test_http_dial_tcp_domain_name_proxy() {
         // Bug: Http::dial() uses SocketAddr::parse() which rejects domain names.
         // Using a domain name proxy address should resolve and attempt connection,
@@ -669,6 +746,55 @@ mod async_tests {
             }
             Ok(_) => panic!("Expected connection error for non-listening port"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_async_http_dial_tcp_too_many_headers() {
+        // A malicious proxy that sends valid status line + excessive headers
+        // should be rejected by the header count limit, even within timeout.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Send excessive headers quickly
+            for i in 0..200 {
+                let header = format!("X-Spam-{}: value{}\r\n", i, i);
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            // Keep alive
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        // Should fail with too many headers error
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Too many") || err_msg.contains("too many"),
+                    "Error should mention too many headers, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject excessive headers"),
+        }
+
+        server.abort();
     }
 
     #[tokio::test]

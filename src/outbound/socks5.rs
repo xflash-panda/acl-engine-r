@@ -76,6 +76,35 @@ impl Socks5 {
         }
     }
 
+    /// Create a new SOCKS5 outbound with authentication, validating credential lengths.
+    /// RFC 1929 limits username and password to 255 bytes each.
+    pub fn try_with_auth(
+        addr: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Result<Self> {
+        let username = username.into();
+        let password = password.into();
+        if username.len() > 255 {
+            return Err(AclError::OutboundError(format!(
+                "SOCKS5 username too long: {} bytes (max 255)",
+                username.len()
+            )));
+        }
+        if password.len() > 255 {
+            return Err(AclError::OutboundError(format!(
+                "SOCKS5 password too long: {} bytes (max 255)",
+                password.len()
+            )));
+        }
+        Ok(Self {
+            addr: addr.into(),
+            username: Some(username),
+            password: Some(password),
+            timeout: DEFAULT_DIALER_TIMEOUT,
+        })
+    }
+
     /// Set connection timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -915,6 +944,36 @@ mod tests {
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11); // length of "example.com"
         assert_eq!(&addr[1..], b"example.com");
+    }
+
+    #[test]
+    fn test_socks5_auth_username_too_long() {
+        let long_user = "a".repeat(256);
+        let result = Socks5::try_with_auth("127.0.0.1:1080", &long_user, "pass");
+        assert!(result.is_err(), "username >255 bytes should be rejected");
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("too long"),
+                "error should mention 'too long', got: {}",
+                e
+            ),
+            Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn test_socks5_auth_password_too_long() {
+        let long_pass = "b".repeat(256);
+        let result = Socks5::try_with_auth("127.0.0.1:1080", "user", &long_pass);
+        assert!(result.is_err(), "password >255 bytes should be rejected");
+    }
+
+    #[test]
+    fn test_socks5_auth_max_length_ok() {
+        let max_user = "a".repeat(255);
+        let max_pass = "b".repeat(255);
+        let result = Socks5::try_with_auth("127.0.0.1:1080", &max_user, &max_pass);
+        assert!(result.is_ok(), "255-byte credentials should be accepted");
     }
 
     #[test]

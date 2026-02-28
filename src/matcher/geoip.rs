@@ -153,9 +153,9 @@ impl GeoIpMatcher {
         self.inverse = inverse;
     }
 
-    /// Check if an IP matches using MMDB.
+    /// Check if an IP matches using MMDB (raw match, without inverse).
     /// Supports multiple record formats: MaxMind, sing-geoip, and Meta-geoip0.
-    fn matches_mmdb(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> bool {
+    fn matches_mmdb_raw(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> bool {
         #[derive(Deserialize)]
         struct Country {
             country: Option<CountryInfo>,
@@ -174,8 +174,7 @@ impl GeoIpMatcher {
             .and_then(|r| r.country)
             .and_then(|c| c.iso_code)
         {
-            let matches = code.to_uppercase() == self.country_code;
-            return if self.inverse { !matches } else { matches };
+            return code.to_uppercase() == self.country_code;
         }
 
         // Try sing-geoip format: plain string "CN"
@@ -185,8 +184,7 @@ impl GeoIpMatcher {
             .and_then(|r| r.decode::<String>().ok()?)
         {
             if !code.is_empty() {
-                let matches = code.to_uppercase() == self.country_code;
-                return if self.inverse { !matches } else { matches };
+                return code.to_uppercase() == self.country_code;
             }
         }
 
@@ -196,40 +194,30 @@ impl GeoIpMatcher {
             .ok()
             .and_then(|r| r.decode::<Vec<String>>().ok()?)
         {
-            let matches = codes
+            return codes
                 .iter()
                 .any(|c| c.to_uppercase() == self.country_code);
-            return if self.inverse { !matches } else { matches };
         }
 
-        self.inverse
-    }
-
-    /// Check if an IP matches using sorted CIDR list (binary search)
-    fn matches_cidrs(&self, sorted: &SortedCidrs, ip: IpAddr) -> bool {
-        let matches = sorted.contains(ip);
-        if self.inverse {
-            !matches
-        } else {
-            matches
-        }
+        false
     }
 }
 
 impl HostMatcher for GeoIpMatcher {
     fn matches(&self, host: &HostInfo) -> bool {
-        match &self.data {
+        let any_match = match &self.data {
             GeoIpData::Mmdb(reader) => {
-                let v4_match = host.ipv4.is_some_and(|ip| self.matches_mmdb(reader, ip));
-                let v6_match = host.ipv6.is_some_and(|ip| self.matches_mmdb(reader, ip));
-                v4_match || v6_match
+                let v4 = host.ipv4.is_some_and(|ip| self.matches_mmdb_raw(reader, ip));
+                let v6 = host.ipv6.is_some_and(|ip| self.matches_mmdb_raw(reader, ip));
+                v4 || v6
             }
             GeoIpData::Dat(sorted) => {
-                let v4_match = host.ipv4.is_some_and(|ip| self.matches_cidrs(sorted, ip));
-                let v6_match = host.ipv6.is_some_and(|ip| self.matches_cidrs(sorted, ip));
-                v4_match || v6_match
+                let v4 = host.ipv4.is_some_and(|ip| sorted.contains(ip));
+                let v6 = host.ipv6.is_some_and(|ip| sorted.contains(ip));
+                v4 || v6
             }
-        }
+        };
+        if self.inverse { !any_match } else { any_match }
     }
 }
 
@@ -343,6 +331,45 @@ mod tests {
         let ip: IpAddr = "1.1.1.1".parse().unwrap();
         let host = HostInfo::new("", Some(ip), None);
         assert!(!matcher.matches(&host));
+    }
+
+    #[test]
+    fn test_geoip_inverse_dual_stack() {
+        // Bug: inverse + dual-stack should mean "ALL addresses NOT in country"
+        // IPv4 in CIDR + IPv6 not in CIDR → host IS partially in country → inverse should NOT match
+        let cidrs = vec!["192.168.0.0/16".parse().unwrap()];
+        let mut matcher = GeoIpMatcher::from_cidrs("TEST", cidrs);
+        matcher.set_inverse(true);
+
+        // Host with IPv4 IN the CIDR and IPv6 NOT in the CIDR
+        let host = HostInfo::new(
+            "",
+            Some("192.168.1.1".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        // Should NOT match inverse: IPv4 is in the country
+        assert!(
+            !matcher.matches(&host),
+            "inverse should be false when any IP is in the country"
+        );
+
+        // Host with both IPs NOT in the CIDR
+        let host2 = HostInfo::new(
+            "",
+            Some("8.8.8.8".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        // Should match inverse: neither IP is in the country
+        assert!(
+            matcher.matches(&host2),
+            "inverse should be true when no IP is in the country"
+        );
+
+        // Host with both IPs IN the CIDR (only v4 CIDR here, v6 won't match)
+        // but only v4 is in CIDR
+        let host3 = HostInfo::new("", Some("192.168.1.1".parse().unwrap()), None);
+        // Should NOT match inverse: IPv4 is in the country
+        assert!(!matcher.matches(&host3));
     }
 
     #[test]
