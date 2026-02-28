@@ -40,6 +40,12 @@ fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usiz
         }
         if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
             let to_consume = newline_pos + 1;
+            if total + to_consume > max_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Line too long (>{} bytes)", max_len),
+                ));
+            }
             let chunk = &available[..to_consume];
             let s = std::str::from_utf8(chunk)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -80,6 +86,12 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
         }
         if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
             let to_consume = newline_pos + 1;
+            if total + to_consume > max_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Line too long (>{} bytes)", max_len),
+                ));
+            }
             let chunk = &available[..to_consume];
             let s = std::str::from_utf8(chunk)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -101,6 +113,17 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
         total += chunk_len;
         reader.consume(chunk_len);
     }
+}
+
+/// Validate that a hostname doesn't contain characters that could cause
+/// HTTP header injection (CRLF) in the CONNECT request.
+fn validate_connect_host(host: &str) -> Result<()> {
+    if host.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err(AclError::OutboundError(
+            "Invalid host: contains CR/LF characters".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// HTTP/HTTPS proxy outbound.
@@ -268,6 +291,9 @@ impl Http {
 
 impl Outbound for Http {
     fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
+        // Validate host before connecting to prevent HTTP header injection
+        validate_connect_host(&addr.host)?;
+
         let mut stream = self.dial()?;
 
         stream.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
@@ -371,6 +397,9 @@ impl Outbound for Http {
 #[async_trait]
 impl AsyncOutbound for Http {
     async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
+        // Validate host before connecting to prevent HTTP header injection
+        validate_connect_host(&addr.host)?;
+
         let stream = self.async_dial().await?;
 
         let target = format!("{}:{}", addr.host, addr.port);
@@ -852,6 +881,74 @@ mod tests {
     }
 
     #[test]
+    fn test_read_line_limited_enforces_limit_on_newline_chunk() {
+        // BUG #10: read_line_limited doesn't check length on the final chunk
+        // containing the newline. If the buffer fills with data then finds a
+        // newline, the total can exceed max_len.
+        //
+        // Scenario: max_len = 10, but we send 15 bytes + \n.
+        // The function should reject this, not return 16 bytes.
+        use std::io::Cursor;
+
+        let max_len = 10;
+        // Create data that's longer than max_len but has a newline at the end
+        let data = "A".repeat(15) + "\n"; // 16 bytes total, > max_len of 10
+        let mut reader = BufReader::new(Cursor::new(data.as_bytes()));
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+
+        // Should fail because total line length (16) exceeds max_len (10)
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "read_line_limited should enforce max_len={} on lines with newline, but got {} bytes: {:?}",
+            max_len, buf.len(), buf
+        );
+    }
+
+    #[test]
+    fn test_read_line_limited_small_buffer_newline_overflow() {
+        // Test with a BufReader with small internal buffer.
+        // If BufReader buffer = 4 and max_len = 6:
+        // Data: "ABCDEFGH\n"
+        // Fill 1: "ABCD" (no newline, total=4, 4 <= 6 OK, consume)
+        // Fill 2: "EFGH" (no newline, total=8, 8 > 6, should error)
+        // But without fix, if fill 2 is "EF\nGH":
+        // Fill 2 finds newline at pos 2, consumes 3 bytes, total=7 > 6 - BUG
+        use std::io::Cursor;
+
+        let max_len = 6;
+        // Use a small BufReader buffer size to force multiple fill_buf calls
+        let data = b"ABCDEF\n"; // 7 bytes, > max_len of 6
+        let cursor = Cursor::new(&data[..]);
+        let mut reader = BufReader::with_capacity(4, cursor);
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "read_line_limited should enforce max_len={} even with small BufReader buffer, got {} bytes",
+            max_len, buf.len()
+        );
+    }
+
+    #[test]
+    fn test_read_line_limited_exact_max_len_with_newline() {
+        // Line of exactly max_len bytes including newline should succeed
+        use std::io::Cursor;
+
+        let max_len = 10;
+        let data = "A".repeat(9) + "\n"; // exactly 10 bytes = max_len
+        let mut reader = BufReader::new(Cursor::new(data.as_bytes()));
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+        assert!(result.is_ok(), "Line of exactly max_len should succeed");
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
     fn test_http_new_accepts_http() {
         let result = Http::try_new("127.0.0.1:8080", false);
         assert!(
@@ -878,6 +975,58 @@ mod tests {
         assert!(
             result.is_err(),
             "HTTPS scheme with auth should be rejected at construction time"
+        );
+    }
+
+    #[test]
+    fn test_http_connect_rejects_crlf_in_host() {
+        // BUG #9: HTTP CONNECT header injection via unsanitized host.
+        // If addr.host contains \r\n, arbitrary HTTP headers can be injected
+        // in the CONNECT request. For example:
+        //   host = "evil.com\r\nX-Injected: true\r\n\r\nGET / HTTP/1.1"
+        // This constructs a malformed CONNECT that smuggles extra headers/requests.
+        //
+        // dial_tcp must validate addr.host and reject CRLF characters
+        // BEFORE establishing any connection.
+        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
+        let mut addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        // Should reject before even attempting to connect
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("invalid") || err_msg.contains("Invalid"),
+                    "Error should mention invalid host, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("dial_tcp should reject host containing CRLF characters"),
+        }
+    }
+
+    #[test]
+    fn test_http_connect_rejects_cr_only_in_host() {
+        // Lone \r is also dangerous - reject any control characters
+        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
+        let mut addr = Addr::new("evil.com\rinjected", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+        assert!(
+            result.is_err(),
+            "dial_tcp should reject host containing CR character"
+        );
+    }
+
+    #[test]
+    fn test_http_connect_rejects_lf_only_in_host() {
+        // Lone \n is also dangerous
+        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
+        let mut addr = Addr::new("evil.com\ninjected", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+        assert!(
+            result.is_err(),
+            "dial_tcp should reject host containing LF character"
         );
     }
 
@@ -1083,6 +1232,54 @@ mod async_tests {
         }
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_http_connect_rejects_crlf_in_host() {
+        // BUG #9 (async): Same CRLF injection vulnerability in async dial_tcp
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        assert!(
+            result.is_err(),
+            "async dial_tcp should reject host containing CRLF characters"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_read_line_limited_enforces_limit_on_newline_chunk() {
+        // BUG #10 (async): Same length check bypass in async_read_line_limited
+        use tokio::io::BufReader as TokioBufReader;
+
+        let max_len = 10;
+        let data = "A".repeat(15) + "\n"; // 16 bytes > max_len of 10
+        let cursor = std::io::Cursor::new(data.into_bytes());
+        let mut reader = TokioBufReader::new(cursor);
+        let mut buf = String::new();
+
+        let result = async_read_line_limited(&mut reader, &mut buf, max_len).await;
+
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "async_read_line_limited should enforce max_len={} on lines with newline, got {} bytes",
+            max_len, buf.len()
+        );
     }
 
     #[tokio::test]
