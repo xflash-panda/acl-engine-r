@@ -136,13 +136,17 @@ impl Http {
         // Simple URL parsing
         let url = url.trim();
 
-        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-            (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
+        if url.starts_with("https://") {
+            return Err(AclError::OutboundError(
+                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            ));
+        }
+
+        let rest = if let Some(rest) = url.strip_prefix("http://") {
+            rest
         } else {
             return Err(AclError::OutboundError(
-                "Unsupported scheme for HTTP proxy (use http:// or https://)".to_string(),
+                "Unsupported scheme for HTTP proxy (use http://)".to_string(),
             ));
         };
 
@@ -155,11 +159,9 @@ impl Http {
             (None, rest)
         };
 
-        // Handle default ports
+        // Handle default port
         let addr = if host_port.contains(':') {
             host_port.to_string()
-        } else if scheme {
-            format!("{}:443", host_port)
         } else {
             format!("{}:80", host_port)
         };
@@ -175,7 +177,7 @@ impl Http {
 
         Ok(Self {
             addr,
-            https: scheme,
+            https: false,
             insecure,
             basic_auth,
             timeout: DEFAULT_DIALER_TIMEOUT,
@@ -829,6 +831,27 @@ mod tests {
         }
 
         server.join().ok();
+    }
+
+    #[test]
+    fn test_http_from_url_rejects_https() {
+        // Bug: from_url("https://...") succeeds at construction time but
+        // dial() rejects at runtime with "HTTPS proxy not yet supported".
+        // Should fail early at construction time.
+        let result = Http::from_url("https://proxy.example.com:443");
+        assert!(
+            result.is_err(),
+            "HTTPS scheme should be rejected at construction time, not at dial time"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_rejects_https_with_auth() {
+        let result = Http::from_url("https://user:pass@proxy.example.com:443");
+        assert!(
+            result.is_err(),
+            "HTTPS scheme with auth should be rejected at construction time"
+        );
     }
 
     #[test]

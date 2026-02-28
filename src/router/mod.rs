@@ -148,7 +148,7 @@ impl Router {
     /// Match the address against ACL rules and return the outbound.
     fn match_outbound(&self, addr: &mut Addr, proto: Protocol) -> Arc<dyn Outbound> {
         let host_info = crate::types::HostInfo {
-            name: addr.host.clone(),
+            name: addr.host.to_lowercase(),
             ipv4: addr
                 .resolve_info
                 .as_ref()

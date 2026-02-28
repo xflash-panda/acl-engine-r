@@ -315,6 +315,31 @@ impl Socks5 {
         Ok((bound_host, bound_port))
     }
 
+    /// Resolve the SOCKS5 bound address for UDP.
+    /// When the server returns an unspecified address (0.0.0.0 or ::),
+    /// replaces it with the proxy server's host address.
+    fn resolve_bound_addr(&self, bound_host: &str, bound_port: u16) -> String {
+        let is_unspecified = matches!(
+            bound_host.parse::<IpAddr>(),
+            Ok(ip) if ip.is_unspecified()
+        );
+
+        if is_unspecified {
+            // Extract host from self.addr (formats: "host:port" or "[ipv6]:port")
+            let proxy_host = if let Some(bracket_end) = self.addr.rfind(']') {
+                // IPv6 format: [::1]:port → [::1]
+                &self.addr[..bracket_end + 1]
+            } else if let Some(colon_pos) = self.addr.rfind(':') {
+                &self.addr[..colon_pos]
+            } else {
+                &self.addr
+            };
+            format!("{}:{}", proxy_host, bound_port)
+        } else {
+            format!("{}:{}", bound_host, bound_port)
+        }
+    }
+
     /// Convert address to SOCKS5 format.
     fn addr_to_socks5(&self, host: &str) -> Result<(u8, Vec<u8>)> {
         if let Ok(ip) = host.parse::<IpAddr>() {
@@ -567,8 +592,8 @@ impl Outbound for Socks5 {
         let udp_socket = UdpSocket::bind("0.0.0.0:0")
             .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
 
-        // Connect to the bound address
-        let udp_addr = format!("{}:{}", bound_host, bound_port);
+        // Connect to the bound address (resolve unspecified 0.0.0.0 to proxy host)
+        let udp_addr = self.resolve_bound_addr(&bound_host, bound_port);
         udp_socket
             .connect(&udp_addr)
             .map_err(|e| AclError::OutboundError(format!("Failed to connect UDP: {}", e)))?;
@@ -597,7 +622,8 @@ impl AsyncOutbound for Socks5 {
             .await
             .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
 
-        let udp_addr = format!("{}:{}", bound_host, bound_port);
+        // Resolve unspecified 0.0.0.0/:: to proxy host
+        let udp_addr = self.resolve_bound_addr(&bound_host, bound_port);
         udp_socket
             .connect(&udp_addr)
             .await
@@ -1009,6 +1035,39 @@ mod tests {
         let socks5 = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass);
         assert_eq!(socks5.username.as_ref().unwrap().len(), 255);
         assert_eq!(socks5.password.as_ref().unwrap().len(), 255);
+    }
+
+    #[test]
+    fn test_socks5_resolve_bound_addr_unspecified_ipv4() {
+        // Bug: When SOCKS5 server returns 0.0.0.0 as bound address for UDP,
+        // dial_udp uses "0.0.0.0:port" as destination which is invalid.
+        // Should replace unspecified address with proxy server host.
+        let socks5 = Socks5::new("1.2.3.4:1080");
+        let addr = socks5.resolve_bound_addr("0.0.0.0", 12345);
+        assert_eq!(addr, "1.2.3.4:12345");
+    }
+
+    #[test]
+    fn test_socks5_resolve_bound_addr_unspecified_ipv6() {
+        let socks5 = Socks5::new("[::1]:1080");
+        let addr = socks5.resolve_bound_addr("::", 12345);
+        assert_eq!(addr, "[::1]:12345");
+    }
+
+    #[test]
+    fn test_socks5_resolve_bound_addr_specified() {
+        // When server returns a real address, should keep it as-is
+        let socks5 = Socks5::new("1.2.3.4:1080");
+        let addr = socks5.resolve_bound_addr("5.6.7.8", 12345);
+        assert_eq!(addr, "5.6.7.8:12345");
+    }
+
+    #[test]
+    fn test_socks5_resolve_bound_addr_domain_proxy() {
+        // When proxy address is a domain name, should extract host correctly
+        let socks5 = Socks5::new("proxy.example.com:1080");
+        let addr = socks5.resolve_bound_addr("0.0.0.0", 12345);
+        assert_eq!(addr, "proxy.example.com:12345");
     }
 
     #[test]

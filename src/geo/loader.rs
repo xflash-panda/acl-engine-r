@@ -417,12 +417,12 @@ impl AutoGeoLoader {
             .get_geoip_path()
             .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
 
-        eprintln!("[geoip] Checking geoip file: {}", path.display());
+        self.log(&format!("Checking geoip file: {}", path.display()));
 
         if self.should_download(&path) {
-            eprintln!("[geoip] File needs download/update");
+            self.log("File needs download/update");
             if let Some(ref url) = self.geoip_url {
-                eprintln!("[geoip] Downloading from: {}", url);
+                self.log(&format!("Downloading from: {}", url));
                 let verify = |p: &Path| verify_geoip_file(p, format);
                 if let Err(e) = self.download(&path, url, verify) {
                     if !path.exists() {

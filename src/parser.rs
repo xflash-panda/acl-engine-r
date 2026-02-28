@@ -11,10 +11,23 @@ use crate::types::{Protocol, TextRule};
 static RULE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\w+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$").unwrap());
 
+/// Maximum nesting depth for `file:` include directives.
+const MAX_INCLUDE_DEPTH: usize = 10;
+
 /// Parse ACL rules from text.
 ///
 /// Supports `file: /path/to/rules.acl` directive to include rules from an external file.
 pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
+    parse_rules_inner(text, 0)
+}
+
+fn parse_rules_inner(text: &str, depth: usize) -> Result<Vec<TextRule>> {
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(AclError::ParseError(format!(
+            "file include depth exceeds maximum ({MAX_INCLUDE_DEPTH}), possible circular include"
+        )));
+    }
+
     let mut rules = Vec::new();
 
     for (line_num, line) in text.lines().enumerate() {
@@ -36,7 +49,7 @@ pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
         // Handle file include directive
         if let Some(path) = line.strip_prefix("file:") {
             let path = path.trim();
-            let file_rules = parse_rules_from_file(path)?;
+            let file_rules = parse_rules_from_file_inner(path, depth + 1)?;
             rules.extend(file_rules);
             continue;
         }
@@ -51,6 +64,10 @@ pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
 
 /// Parse ACL rules from a file.
 pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
+    parse_rules_from_file_inner(path, 0)
+}
+
+fn parse_rules_from_file_inner(path: impl AsRef<Path>, depth: usize) -> Result<Vec<TextRule>> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|e| {
         AclError::ParseError(format!(
@@ -59,7 +76,7 @@ pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
             e
         ))
     })?;
-    parse_rules(&text)
+    parse_rules_inner(&text, depth)
 }
 
 /// Parse a single rule line
@@ -281,6 +298,75 @@ proxy(all)
     fn test_parse_proto_port_invalid_range() {
         let result = parse_proto_port("tcp/9000-8000");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_file_circular_include() {
+        // Bug: file A includes file B, file B includes file A → stack overflow.
+        // Should return an error instead of crashing.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("acl_engine_test_circular");
+        let _ = fs::create_dir_all(&dir);
+
+        let file_a = dir.join("a.acl");
+        let file_b = dir.join("b.acl");
+
+        // A includes B
+        let mut f = fs::File::create(&file_a).unwrap();
+        writeln!(f, "direct(10.0.0.0/8)").unwrap();
+        writeln!(f, "file: {}", file_b.display()).unwrap();
+        drop(f);
+
+        // B includes A
+        let mut f = fs::File::create(&file_b).unwrap();
+        writeln!(f, "proxy(*.google.com)").unwrap();
+        writeln!(f, "file: {}", file_a.display()).unwrap();
+        drop(f);
+
+        let result = parse_rules_from_file(&file_a);
+        assert!(result.is_err(), "Circular file include should return error");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("include") || err_msg.contains("depth") || err_msg.contains("recursive"),
+            "Error should mention include depth issue, got: {}",
+            err_msg
+        );
+
+        let _ = fs::remove_file(&file_a);
+        let _ = fs::remove_file(&file_b);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_parse_file_deep_nesting_limit() {
+        // Even without circular refs, deeply nested includes should be rejected.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("acl_engine_test_deep");
+        let _ = fs::create_dir_all(&dir);
+
+        // Create a chain: file_0 includes file_1, file_1 includes file_2, ... file_19 includes file_20
+        let depth = 21;
+        let mut paths = Vec::new();
+        for i in 0..depth {
+            paths.push(dir.join(format!("depth_{}.acl", i)));
+        }
+
+        for i in 0..depth {
+            let mut f = fs::File::create(&paths[i]).unwrap();
+            writeln!(f, "direct(10.{}.0.0/16)", i).unwrap();
+            if i + 1 < depth {
+                writeln!(f, "file: {}", paths[i + 1].display()).unwrap();
+            }
+            drop(f);
+        }
+
+        let result = parse_rules_from_file(&paths[0]);
+        assert!(result.is_err(), "Deeply nested includes should return error");
+
+        for p in &paths {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]
