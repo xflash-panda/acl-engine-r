@@ -220,6 +220,12 @@ impl Http {
 
     /// Connect to the proxy server.
     fn dial(&self) -> Result<TcpStream> {
+        if self.https {
+            return Err(AclError::OutboundError(
+                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            ));
+        }
+
         let addr: SocketAddr = self
             .addr
             .to_socket_addrs()
@@ -230,20 +236,18 @@ impl Http {
         let stream = TcpStream::connect_timeout(&addr, self.timeout)
             .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
 
-        // Note: For HTTPS proxies, we would need to wrap with TLS here.
-        // This is a simplified implementation that only supports HTTP proxies.
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
-
         Ok(stream)
     }
 
     /// Connect to the proxy server asynchronously.
     #[cfg(feature = "async")]
     async fn async_dial(&self) -> Result<TokioTcpStream> {
+        if self.https {
+            return Err(AclError::OutboundError(
+                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            ));
+        }
+
         let addr: SocketAddr = self
             .addr
             .to_socket_addrs()
@@ -255,12 +259,6 @@ impl Http {
             .await
             .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
             .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
-
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
 
         Ok(stream)
     }
@@ -688,6 +686,55 @@ mod tests {
         let mut addr = Addr::new("example.com", 53);
         let result = Outbound::dial_udp(&http, &mut addr);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_http_https_should_fail_early() {
+        // BUG #6: Http::new("addr", true) accepts https=true silently at construction,
+        // but dial() always rejects it with "HTTPS proxy not yet supported".
+        // This is a trap: the user creates an Http instance believing it works,
+        // then gets a runtime error on every connection attempt.
+        //
+        // The fix should check https=true in dial() BEFORE attempting TCP connection,
+        // not after establishing a TCP connection to the proxy.
+        //
+        // We test by using a real listening server — if the bug exists, the server
+        // will receive a TCP connection (wasteful) before the error.
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got_connection = Arc::new(AtomicBool::new(false));
+        let got_connection_clone = got_connection.clone();
+
+        // Server thread: accept connections
+        let server = std::thread::spawn(move || {
+            listener.set_nonblocking(false).ok();
+            if let Ok((_stream, _addr)) = listener.accept() {
+                got_connection_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), true);
+        let mut addr = Addr::new("example.com", 443);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        // Should fail
+        assert!(result.is_err(), "HTTPS proxy should fail");
+
+        // Give server thread a moment to process
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // BUG: The server should NOT have received a connection.
+        // With the current code, dial() connects TCP first, THEN checks https flag.
+        assert!(
+            !got_connection.load(Ordering::SeqCst),
+            "dial() should reject HTTPS before making TCP connection, but a TCP connection was made"
+        );
+
+        drop(server);
     }
 
     #[test]

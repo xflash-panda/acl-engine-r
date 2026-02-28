@@ -225,8 +225,18 @@ fn read_uvarint<R: Read>(reader: &mut R) -> Result<u64> {
     Ok(result)
 }
 
+/// Maximum allowed string length in sing-geosite format (10 MB).
+/// Prevents OOM from malicious files with absurdly large varint lengths.
+const MAX_VSTRING_LENGTH: usize = 10 * 1024 * 1024;
+
 fn read_vstring<R: Read>(reader: &mut R) -> Result<String> {
     let length = read_uvarint(reader)? as usize;
+    if length > MAX_VSTRING_LENGTH {
+        return Err(AclError::GeoSiteError(format!(
+            "String length {} exceeds limit of {} bytes",
+            length, MAX_VSTRING_LENGTH
+        )));
+    }
     let mut buf = vec![0u8; length];
     reader
         .read_exact(&mut buf)
@@ -234,4 +244,62 @@ fn read_vstring<R: Read>(reader: &mut R) -> Result<String> {
 
     String::from_utf8(buf)
         .map_err(|e| AclError::GeoSiteError(format!("Invalid UTF-8 string: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_read_vstring_rejects_huge_allocation() {
+        // BUG #3: read_vstring reads a varint length and immediately allocates
+        // vec![0u8; length] without bounds checking. A malicious file can encode
+        // a varint with a huge value (e.g. 1GB+), causing OOM.
+        //
+        // The fix should add a maximum string length constant (e.g., 10MB)
+        // and reject lengths exceeding it BEFORE allocation.
+        //
+        // Craft a varint encoding 100MB (0x6400000 = 104857600):
+        // We provide enough backing data so read_exact would succeed if allocation happens.
+        // The test verifies the function rejects based on LENGTH, not read failure.
+        let length: u64 = 100 * 1024 * 1024; // 100MB
+
+        // Encode as varint
+        let mut varint_bytes = Vec::new();
+        let mut val = length;
+        while val >= 0x80 {
+            varint_bytes.push((val as u8) | 0x80);
+            val >>= 7;
+        }
+        varint_bytes.push(val as u8);
+
+        // Add minimal trailing data (not 100MB — we want the length check to reject first)
+        varint_bytes.extend_from_slice(b"short");
+
+        let mut cursor = Cursor::new(varint_bytes);
+
+        let result = read_vstring(&mut cursor);
+        // Currently: allocates 100MB then read_exact fails because cursor is short.
+        // After fix: should reject with error mentioning length limit BEFORE allocating.
+        assert!(result.is_err(), "read_vstring should reject huge length");
+
+        // Verify the error message mentions the length limit, not just IO failure
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds") || err_msg.contains("limit") || err_msg.contains("too large"),
+            "Error should mention length limit, not just IO failure. Got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_read_vstring_normal_length_ok() {
+        // Normal-length string should still work
+        // varint 5 = 0x05, then "hello"
+        let data: &[u8] = &[0x05, b'h', b'e', b'l', b'l', b'o'];
+        let mut cursor = Cursor::new(data);
+        let result = read_vstring(&mut cursor);
+        assert_eq!(result.unwrap(), "hello");
+    }
 }

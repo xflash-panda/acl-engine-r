@@ -335,6 +335,9 @@ impl Socks5 {
                 &self.addr
             };
             format!("{}:{}", proxy_host, bound_port)
+        } else if bound_host.contains(':') {
+            // IPv6 address: wrap in brackets for valid socket address
+            format!("[{}]:{}", bound_host, bound_port)
         } else {
             format!("{}:{}", bound_host, bound_port)
         }
@@ -588,12 +591,18 @@ impl Outbound for Socks5 {
         let mut stream = self.dial_and_negotiate()?;
         let (bound_host, bound_port) = self.request(&mut stream, SOCKS5_CMD_UDP_ASSOCIATE, addr)?;
 
-        // Create UDP socket
-        let udp_socket = UdpSocket::bind("0.0.0.0:0")
-            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
-
         // Connect to the bound address (resolve unspecified 0.0.0.0 to proxy host)
         let udp_addr = self.resolve_bound_addr(&bound_host, bound_port);
+
+        // Bind UDP socket matching the address family of the bound address
+        let bind_addr = if udp_addr.contains('[') || bound_host.contains(':') {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let udp_socket = UdpSocket::bind(bind_addr)
+            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
+
         udp_socket
             .connect(&udp_addr)
             .map_err(|e| AclError::OutboundError(format!("Failed to connect UDP: {}", e)))?;
@@ -618,12 +627,19 @@ impl AsyncOutbound for Socks5 {
             .async_request(&mut stream, SOCKS5_CMD_UDP_ASSOCIATE, addr)
             .await?;
 
-        let udp_socket = TokioUdpSocket::bind("0.0.0.0:0")
+        // Resolve unspecified 0.0.0.0/:: to proxy host
+        let udp_addr = self.resolve_bound_addr(&bound_host, bound_port);
+
+        // Bind UDP socket matching the address family of the bound address
+        let bind_addr = if udp_addr.contains('[') || bound_host.contains(':') {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let udp_socket = TokioUdpSocket::bind(bind_addr)
             .await
             .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
 
-        // Resolve unspecified 0.0.0.0/:: to proxy host
-        let udp_addr = self.resolve_bound_addr(&bound_host, bound_port);
         udp_socket
             .connect(&udp_addr)
             .await
@@ -1089,6 +1105,50 @@ mod tests {
             }
             Ok(_) => panic!("Expected connection error for non-listening port"),
         }
+    }
+
+    #[test]
+    fn test_socks5_resolve_bound_addr_specified_ipv6() {
+        // BUG #1: When SOCKS5 server returns a specified (non-unspecified) IPv6
+        // bound address for UDP, resolve_bound_addr formats it as "addr:port"
+        // without brackets, producing an unparseable address string like
+        // "2001:db8::1:12345" instead of "[2001:db8::1]:12345".
+        let socks5 = Socks5::new("1.2.3.4:1080");
+        let addr = socks5.resolve_bound_addr("2001:db8::1", 12345);
+        // The result must be parseable as a socket address
+        assert!(
+            addr.parse::<std::net::SocketAddr>().is_ok()
+                || addr.to_socket_addrs().is_ok(),
+            "IPv6 bound address should be parseable, got: {}",
+            addr
+        );
+        assert_eq!(addr, "[2001:db8::1]:12345");
+    }
+
+    #[test]
+    fn test_socks5_udp_bind_should_support_ipv6() {
+        // BUG #2: dial_udp hardcodes UdpSocket::bind("0.0.0.0:0") which creates
+        // an IPv4-only socket. If the SOCKS5 proxy returns an IPv6 bound address,
+        // the UDP socket cannot connect to it.
+        //
+        // Directly demonstrate: IPv4-bound socket CANNOT connect to IPv6 address.
+        use std::net::UdpSocket;
+        let ipv4_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let connect_result = ipv4_socket.connect("[::1]:12345");
+        // This proves the bug: an IPv4 socket can't connect to IPv6.
+        // The fix should bind to "::" or match the address family.
+        assert!(
+            connect_result.is_err(),
+            "IPv4-bound UDP socket should NOT be able to connect to IPv6, proving the bug exists"
+        );
+
+        // Now verify that an IPv6 socket CAN connect to IPv6
+        let ipv6_socket = UdpSocket::bind("[::]:0").unwrap();
+        let connect_result = ipv6_socket.connect("[::1]:12345");
+        assert!(
+            connect_result.is_ok(),
+            "IPv6-bound UDP socket should connect to IPv6 address"
+        );
     }
 }
 
