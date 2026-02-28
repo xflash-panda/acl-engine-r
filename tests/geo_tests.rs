@@ -548,6 +548,7 @@ mod format_detection_tests {
 
 mod router_tests {
     use super::*;
+    use acl_engine_r::outbound::Outbound;
     use acl_engine_r::{Direct, OutboundEntry, Reject, Router, RouterOptions};
     use std::sync::Arc;
 
@@ -571,9 +572,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
@@ -607,9 +608,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
@@ -659,10 +660,10 @@ mod router_tests {
             proxy(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
-            OutboundEntry::new("reject", Arc::new(Reject::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("reject", Arc::new(Reject::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new().with_cache_size(2048);
@@ -694,9 +695,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new();
@@ -731,9 +732,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new();
