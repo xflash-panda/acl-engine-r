@@ -1,20 +1,27 @@
 /// High-performance domain matcher.
 ///
-/// Uses HashSet for exact matches and sorted suffix list for suffix matching,
-/// providing efficient O(1) exact lookup and O(log n) suffix lookup.
-use std::collections::HashSet;
+/// Uses HashSet for exact matches and a unified HashMap for suffix matching,
+/// providing efficient O(1) exact lookup and single O(1) suffix lookup per
+/// domain level.
+use std::collections::{HashMap, HashSet};
+
+/// Suffix type stored in the unified suffix map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SuffixType {
+    /// Matches domain itself + all subdomains (from "google.com" without leading dot)
+    Root,
+    /// Matches only subdomains (from ".google.com" with leading dot)
+    PrefixOnly,
+}
 
 /// High-performance domain matcher
 #[derive(Debug, Clone, Default)]
 pub struct SuccinctMatcher {
     /// Exact match domains (HashSet for O(1) lookup)
     exact: HashSet<String>,
-    /// Root domain suffixes (match domain + subdomains)
-    /// Stored as-is (e.g., "google.com")
-    root_suffixes: HashSet<String>,
-    /// Prefix suffixes (only match subdomains, not the domain itself)
-    /// Stored without leading dot (e.g., "google.com" for ".google.com")
-    prefix_suffixes: HashSet<String>,
+    /// Unified suffix map: domain -> SuffixType
+    /// Single lookup per domain level instead of two separate HashSet lookups
+    suffixes: HashMap<String, SuffixType>,
 }
 
 impl SuccinctMatcher {
@@ -31,8 +38,7 @@ impl SuccinctMatcher {
         }
 
         let mut exact = HashSet::with_capacity(domains.len());
-        let mut root_suffixes = HashSet::new();
-        let mut prefix_suffixes = HashSet::new();
+        let mut suffixes = HashMap::with_capacity(domain_suffix.len());
         let mut seen = HashSet::with_capacity(domains.len() + domain_suffix.len());
 
         // Process suffix domains
@@ -45,10 +51,10 @@ impl SuccinctMatcher {
 
             if let Some(stripped) = domain_lower.strip_prefix('.') {
                 // Domain starts with dot: only match subdomains
-                prefix_suffixes.insert(stripped.to_string());
+                suffixes.insert(stripped.to_string(), SuffixType::PrefixOnly);
             } else {
                 // Domain without dot: match both exact and subdomains
-                root_suffixes.insert(domain_lower);
+                suffixes.insert(domain_lower, SuffixType::Root);
             }
         }
 
@@ -62,11 +68,7 @@ impl SuccinctMatcher {
             exact.insert(domain_lower);
         }
 
-        Self {
-            exact,
-            root_suffixes,
-            prefix_suffixes,
-        }
+        Self { exact, suffixes }
     }
 
     /// Check if the given domain matches any rule.
@@ -78,25 +80,19 @@ impl SuccinctMatcher {
             return true;
         }
 
-        // Check root suffix match (domain + subdomains)
+        // Check root suffix match for the domain itself
         // e.g., "google.com" matches both "google.com" and "www.google.com"
-        if self.root_suffixes.contains(&domain_lower) {
+        if self.suffixes.get(&domain_lower) == Some(&SuffixType::Root) {
             return true;
         }
 
-        // Check if domain is a subdomain of any root suffix
-        // Walk up the domain hierarchy
+        // Walk up the domain hierarchy, one lookup per level
         let mut pos = 0;
         while let Some(dot_pos) = domain_lower[pos..].find('.') {
             let parent = &domain_lower[pos + dot_pos + 1..];
 
-            // Check root suffix (matches subdomains)
-            if self.root_suffixes.contains(parent) {
-                return true;
-            }
-
-            // Check prefix suffix (only matches subdomains, not the domain itself)
-            if self.prefix_suffixes.contains(parent) {
+            // Single lookup: both Root and PrefixOnly match subdomains
+            if self.suffixes.contains_key(parent) {
                 return true;
             }
 
@@ -108,7 +104,7 @@ impl SuccinctMatcher {
 
     /// Check if the set is empty
     pub fn is_empty(&self) -> bool {
-        self.exact.is_empty() && self.root_suffixes.is_empty() && self.prefix_suffixes.is_empty()
+        self.exact.is_empty() && self.suffixes.is_empty()
     }
 }
 
@@ -232,5 +228,51 @@ mod tests {
         assert!(matcher.matches("www.youtube.com"));
         assert!(matcher.matches("facebook.com"));
         assert!(!matcher.matches("twitter.com"));
+    }
+
+    #[test]
+    fn test_suffix_overlap_root_and_prefix() {
+        // root_suffix "google.com" matches google.com + *.google.com
+        // prefix_suffix ".facebook.com" matches only *.facebook.com
+        let suffix = vec![
+            "google.com".to_string(),
+            ".facebook.com".to_string(),
+        ];
+        let matcher = SuccinctMatcher::new(&[], &suffix);
+
+        assert!(matcher.matches("google.com"));         // root_suffix exact
+        assert!(matcher.matches("www.google.com"));      // root_suffix subdomain
+        assert!(!matcher.matches("facebook.com"));       // prefix_suffix should NOT match exact
+        assert!(matcher.matches("www.facebook.com"));    // prefix_suffix should match subdomain
+        assert!(matcher.matches("a.b.facebook.com"));    // prefix_suffix deep subdomain
+    }
+
+    #[test]
+    fn test_combined_exact_and_suffix() {
+        let exact = vec!["specific.com".to_string()];
+        let suffix = vec!["google.com".to_string(), ".only-sub.com".to_string()];
+        let matcher = SuccinctMatcher::new(&exact, &suffix);
+
+        // Exact
+        assert!(matcher.matches("specific.com"));
+        assert!(!matcher.matches("www.specific.com"));
+
+        // Root suffix
+        assert!(matcher.matches("google.com"));
+        assert!(matcher.matches("sub.google.com"));
+
+        // Prefix suffix
+        assert!(!matcher.matches("only-sub.com"));
+        assert!(matcher.matches("www.only-sub.com"));
+    }
+
+    #[test]
+    fn test_deep_subdomain_matching() {
+        let suffix = vec!["example.com".to_string()];
+        let matcher = SuccinctMatcher::new(&[], &suffix);
+
+        assert!(matcher.matches("a.b.c.d.e.example.com"));
+        assert!(matcher.matches("example.com"));
+        assert!(!matcher.matches("notexample.com"));
     }
 }
