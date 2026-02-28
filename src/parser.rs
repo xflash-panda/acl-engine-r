@@ -9,7 +9,10 @@ use crate::types::{Protocol, TextRule};
 /// Regex pattern for parsing ACL rules
 /// Format: outbound(address[, protoPort][, hijackAddress])
 static RULE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^([\w.\-]+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$").unwrap());
+    Lazy::new(|| {
+        Regex::new(r"^([\w.\-]+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$")
+            .expect("RULE_PATTERN: hardcoded regex is invalid")
+    });
 
 /// Maximum nesting depth for `file:` include directives.
 const MAX_INCLUDE_DEPTH: usize = 10;
@@ -161,6 +164,14 @@ pub fn parse_proto_port(spec: &str) -> Result<(Protocol, u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_rule_pattern_regex_compiles() {
+        // Verify the static RULE_PATTERN regex initializes without panic.
+        // Forces Lazy evaluation; if the pattern is invalid, this panics
+        // with the expect message rather than an opaque unwrap.
+        assert!(RULE_PATTERN.is_match("direct(all)"));
+    }
 
     #[test]
     fn test_parse_simple_rule() {

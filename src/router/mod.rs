@@ -312,7 +312,7 @@ fn entries_to_map<T: ?Sized + DefaultOutbounds>(
         if let Some(first) = first_outbound {
             map.insert("default".to_string(), first);
         } else {
-            map.insert("default".to_string(), map.get("direct").unwrap().clone());
+            map.insert("default".to_string(), T::direct());
         }
     }
 
@@ -424,6 +424,17 @@ mod tests {
         let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>)];
         let map = entries_to_map(outbounds);
         assert!(map.contains_key("proxy"));
+        assert!(map.contains_key("direct"));
+        assert!(map.contains_key("reject"));
+        assert!(map.contains_key("default"));
+    }
+
+    #[test]
+    fn test_entries_to_map_empty_outbounds_no_panic() {
+        // Empty outbounds should safely produce defaults without panicking.
+        // "default" should fall back to "direct" via T::direct(), not via map lookup.
+        let outbounds: Vec<OutboundEntry<dyn Outbound>> = vec![];
+        let map = entries_to_map(outbounds);
         assert!(map.contains_key("direct"));
         assert!(map.contains_key("reject"));
         assert!(map.contains_key("default"));
