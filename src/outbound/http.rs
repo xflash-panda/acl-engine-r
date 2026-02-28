@@ -16,7 +16,7 @@ use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
 #[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader};
 #[cfg(feature = "async")]
 use tokio::net::TcpStream as TokioTcpStream;
 

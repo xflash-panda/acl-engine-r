@@ -40,9 +40,8 @@ pub struct DomainItem {
 /// Sing-geosite reader
 pub struct SingSiteReader {
     reader: BufReader<File>,
-    domain_index: HashMap<String, usize>,
+    domain_offset: HashMap<String, u64>,
     domain_length: HashMap<String, usize>,
-    data_offset: u64,
 }
 
 impl SingSiteReader {
@@ -53,60 +52,9 @@ impl SingSiteReader {
         })?;
 
         let mut reader = BufReader::new(file);
-        let codes = Self::load_metadata(&mut reader)?;
 
-        // Record the data offset after metadata (unused, we re-parse below)
-        let _data_offset = reader
-            .stream_position()
-            .map_err(|e| AclError::GeoSiteError(format!("Failed to get stream position: {}", e)))?;
-
-        let mut domain_index = HashMap::new();
-        let mut domain_length = HashMap::new();
-
-        // The metadata already parsed index and length info
-        // We need to re-parse to get this info
-        let file = reader.into_inner();
-        let mut reader = BufReader::new(file);
-        reader
-            .seek(SeekFrom::Start(0))
-            .map_err(|e| AclError::GeoSiteError(format!("Failed to seek: {}", e)))?;
-
-        // Skip version
-        let _ = read_byte(&mut reader)?;
-
-        // Read entry count
-        let entry_count = read_uvarint(&mut reader)?;
-
-        let mut current_index = 0usize;
-        for _ in 0..entry_count {
-            let code = read_vstring(&mut reader)?;
-            let _code_index = read_uvarint(&mut reader)?;
-            let code_length = read_uvarint(&mut reader)?;
-
-            domain_index.insert(code.clone(), current_index);
-            domain_length.insert(code.clone(), code_length as usize);
-            current_index += code_length as usize;
-        }
-
-        let data_offset = reader
-            .stream_position()
-            .map_err(|e| AclError::GeoSiteError(format!("Failed to get stream position: {}", e)))?;
-
-        Ok((
-            Self {
-                reader,
-                domain_index,
-                domain_length,
-                data_offset,
-            },
-            codes,
-        ))
-    }
-
-    /// Load metadata from the file
-    fn load_metadata(reader: &mut BufReader<File>) -> Result<Vec<String>> {
         // Read version (must be 0)
-        let version = read_byte(reader)?;
+        let version = read_byte(&mut reader)?;
         if version != 0 {
             return Err(AclError::GeoSiteError(format!(
                 "Unknown sing-geosite version: {}",
@@ -115,40 +63,62 @@ impl SingSiteReader {
         }
 
         // Read entry count
-        let entry_count = read_uvarint(reader)?;
+        let entry_count = read_uvarint(&mut reader)? as usize;
 
-        let mut codes = Vec::with_capacity(entry_count as usize);
+        // Parse metadata: collect codes and their item counts in file order
+        let mut codes = Vec::with_capacity(entry_count);
+        let mut code_lengths: Vec<(String, usize)> = Vec::with_capacity(entry_count);
 
         for _ in 0..entry_count {
-            let code = read_vstring(reader)?;
-            let _code_index = read_uvarint(reader)?;
-            let _code_length = read_uvarint(reader)?;
-            codes.push(code);
+            let code = read_vstring(&mut reader)?;
+            let _code_index = read_uvarint(&mut reader)?;
+            let code_length = read_uvarint(&mut reader)? as usize;
+            codes.push(code.clone());
+            code_lengths.push((code, code_length));
         }
 
-        Ok(codes)
+        // Single sequential pass through data section to compute byte offsets
+        let mut domain_offset = HashMap::with_capacity(entry_count);
+        let mut domain_length = HashMap::with_capacity(entry_count);
+
+        for (code, length) in &code_lengths {
+            let offset = reader.stream_position().map_err(|e| {
+                AclError::GeoSiteError(format!("Failed to get stream position: {}", e))
+            })?;
+            domain_offset.insert(code.clone(), offset);
+            domain_length.insert(code.clone(), *length);
+
+            // Skip this code's items to advance to the next code
+            for _ in 0..*length {
+                let _ = read_byte(&mut reader)?;
+                let _ = read_vstring(&mut reader)?;
+            }
+        }
+
+        Ok((
+            Self {
+                reader,
+                domain_offset,
+                domain_length,
+            },
+            codes,
+        ))
     }
 
     /// Read domains for a specific code
     pub fn read(&mut self, code: &str) -> Result<Vec<DomainItem>> {
-        let index = self
-            .domain_index
+        let offset = self
+            .domain_offset
             .get(code)
             .copied()
             .ok_or_else(|| AclError::GeoSiteError(format!("Code not found: {}", code)))?;
 
         let length = self.domain_length.get(code).copied().unwrap_or(0);
 
-        // Seek to the start of data section
+        // Seek directly to this code's data
         self.reader
-            .seek(SeekFrom::Start(self.data_offset))
+            .seek(SeekFrom::Start(offset))
             .map_err(|e| AclError::GeoSiteError(format!("Failed to seek: {}", e)))?;
-
-        // Skip to the correct index by reading previous items
-        for _ in 0..index {
-            let _ = read_byte(&mut self.reader)?;
-            let _ = read_vstring(&mut self.reader)?;
-        }
 
         // Read the items for this code
         let mut items = Vec::with_capacity(length);
@@ -167,7 +137,7 @@ impl SingSiteReader {
     }
 }
 
-/// Load GeoSite data from sing-geosite format (loads ALL codes - slow!)
+/// Load GeoSite data from sing-geosite format (loads ALL codes)
 pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<DomainEntry>>> {
     let (mut reader, codes) = SingSiteReader::open(path)?;
 
