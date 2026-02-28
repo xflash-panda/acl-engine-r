@@ -28,33 +28,28 @@ const MAX_RESPONSE_HEADERS: usize = 100;
 /// Prevents OOM from malicious proxies sending data without newlines.
 const MAX_LINE_LENGTH: usize = 8 * 1024; // 8KB
 
-/// Read a line from a BufRead reader with a maximum length limit.
-/// Returns an error if the line exceeds `max_len` bytes before a newline is found.
-fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usize) -> std::io::Result<usize> {
-    let mut total = 0;
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            // EOF
-            return Ok(total);
+/// Process a chunk of buffered data for line reading.
+/// Returns (bytes_to_consume, line_complete).
+/// The caller is responsible for fill_buf() (sync or async) and consume().
+fn process_line_chunk(
+    available: &[u8],
+    buf: &mut String,
+    total: usize,
+    max_len: usize,
+) -> std::io::Result<(usize, bool)> {
+    if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+        let to_consume = newline_pos + 1;
+        if total + to_consume > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line too long (>{} bytes)", max_len),
+            ));
         }
-        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
-            let to_consume = newline_pos + 1;
-            if total + to_consume > max_len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Line too long (>{} bytes)", max_len),
-                ));
-            }
-            let chunk = &available[..to_consume];
-            let s = std::str::from_utf8(chunk)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push_str(s);
-            total += to_consume;
-            reader.consume(to_consume);
-            return Ok(total);
-        }
-        // No newline in buffer — check length limit
+        let s = std::str::from_utf8(&available[..to_consume])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        Ok((to_consume, true))
+    } else {
         let chunk_len = available.len();
         if total + chunk_len > max_len {
             return Err(std::io::Error::new(
@@ -65,8 +60,24 @@ fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usiz
         let s = std::str::from_utf8(available)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         buf.push_str(s);
-        total += chunk_len;
-        reader.consume(chunk_len);
+        Ok((chunk_len, false))
+    }
+}
+
+/// Read a line from a BufRead reader with a maximum length limit.
+fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usize) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let (consumed, done) = process_line_chunk(available, buf, total, max_len)?;
+        total += consumed;
+        reader.consume(consumed);
+        if done {
+            return Ok(total);
+        }
     }
 }
 
@@ -84,34 +95,12 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
         if available.is_empty() {
             return Ok(total);
         }
-        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
-            let to_consume = newline_pos + 1;
-            if total + to_consume > max_len {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Line too long (>{} bytes)", max_len),
-                ));
-            }
-            let chunk = &available[..to_consume];
-            let s = std::str::from_utf8(chunk)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            buf.push_str(s);
-            total += to_consume;
-            reader.consume(to_consume);
+        let (consumed, done) = process_line_chunk(available, buf, total, max_len)?;
+        total += consumed;
+        reader.consume(consumed);
+        if done {
             return Ok(total);
         }
-        let chunk_len = available.len();
-        if total + chunk_len > max_len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Line too long (>{} bytes)", max_len),
-            ));
-        }
-        let s = std::str::from_utf8(available)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        buf.push_str(s);
-        total += chunk_len;
-        reader.consume(chunk_len);
     }
 }
 
@@ -685,6 +674,52 @@ mod tests {
     fn test_parse_connect_status_invalid_status_code() {
         let result = parse_connect_status("HTTP/1.1 abc OK\r\n");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_with_newline() {
+        let mut buf = String::new();
+        let data = b"hello\r\nworld";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 0, 1024).unwrap();
+        assert_eq!(consumed, 7); // "hello\r\n"
+        assert!(done);
+        assert_eq!(buf, "hello\r\n");
+    }
+
+    #[test]
+    fn test_process_line_chunk_no_newline() {
+        let mut buf = String::new();
+        let data = b"hello";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 0, 1024).unwrap();
+        assert_eq!(consumed, 5);
+        assert!(!done);
+        assert_eq!(buf, "hello");
+    }
+
+    #[test]
+    fn test_process_line_chunk_too_long_with_newline() {
+        let mut buf = String::new();
+        let data = b"hello\n";
+        let result = process_line_chunk(data, &mut buf, 0, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_too_long_no_newline() {
+        let mut buf = String::new();
+        let data = b"hello";
+        let result = process_line_chunk(data, &mut buf, 0, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_accumulates_total() {
+        let mut buf = String::new();
+        // Simulate second call with 3 bytes already consumed
+        let data = b"end\n";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 3, 10).unwrap();
+        assert_eq!(consumed, 4);
+        assert!(done);
     }
 
     #[test]

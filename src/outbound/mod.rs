@@ -71,11 +71,6 @@ impl Addr {
         self
     }
 
-    /// Get the address string in host:port format
-    pub fn addr_string(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-
     /// Parse the network address into a SocketAddr.
     /// Returns an error if the address cannot be parsed (e.g. unresolved domain).
     pub fn to_socket_addr(&self) -> Result<SocketAddr> {
@@ -97,7 +92,7 @@ impl Addr {
                 return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
             }
         }
-        self.addr_string()
+        self.to_string()
     }
 }
 

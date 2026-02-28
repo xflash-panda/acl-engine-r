@@ -428,11 +428,6 @@ impl Socks5 {
         }
     }
 
-    /// Convert address to SOCKS5 format.
-    fn addr_to_socks5(&self, host: &str) -> Result<(u8, Vec<u8>)> {
-        addr_to_socks5(host)
-    }
-
     /// Async: Connect to the proxy and perform negotiation.
     /// Uses tokio async DNS to avoid blocking the runtime.
     #[cfg(feature = "async")]
@@ -898,16 +893,14 @@ mod tests {
 
     #[test]
     fn test_addr_to_socks5_ipv4() {
-        let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1").unwrap();
+        let (atyp, addr) = addr_to_socks5("192.168.1.1").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_IPV4);
         assert_eq!(addr, vec![192, 168, 1, 1]);
     }
 
     #[test]
     fn test_addr_to_socks5_domain() {
-        let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("example.com").unwrap();
+        let (atyp, addr) = addr_to_socks5("example.com").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11); // length of "example.com"
         assert_eq!(&addr[1..], b"example.com");
@@ -1354,16 +1347,14 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_socks5_addr_to_socks5_ipv4() {
-        let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1").unwrap();
+        let (atyp, addr) = addr_to_socks5("192.168.1.1").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_IPV4);
         assert_eq!(addr, vec![192, 168, 1, 1]);
     }
 
     #[tokio::test]
     async fn test_async_socks5_addr_to_socks5_domain() {
-        let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("example.com").unwrap();
+        let (atyp, addr) = addr_to_socks5("example.com").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11);
         assert_eq!(&addr[1..], b"example.com");
