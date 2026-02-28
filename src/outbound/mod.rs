@@ -384,6 +384,39 @@ impl AsyncUdpConn for TokioUdpConn {
     }
 }
 
+/// Try to resolve the address from an IP literal.
+/// Returns true if resolve_info is already set or was set from an IP literal.
+/// Returns false if the host is a domain name that needs DNS resolution.
+pub(crate) fn try_resolve_from_ip(addr: &mut Addr) -> bool {
+    if addr.resolve_info.is_some() {
+        return true;
+    }
+
+    if let Ok(ip) = addr.host.parse::<IpAddr>() {
+        addr.resolve_info = Some(match ip {
+            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
+            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
+        });
+        return true;
+    }
+
+    false
+}
+
+/// Build ResolveInfo from a list of resolved IP addresses.
+pub(crate) fn build_resolve_info(ips: &[IpAddr]) -> ResolveInfo {
+    let (ipv4, ipv6) = split_ipv4_ipv6(ips);
+    if ipv4.is_none() && ipv6.is_none() {
+        ResolveInfo::from_error("no address found")
+    } else {
+        ResolveInfo {
+            ipv4,
+            ipv6,
+            error: None,
+        }
+    }
+}
+
 /// Split IP addresses into IPv4 and IPv6
 pub(crate) fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut ipv4 = None;
@@ -500,5 +533,70 @@ mod tests {
     fn test_addr_to_socket_addr_domain_fails() {
         let addr = Addr::new("example.com", 80);
         assert!(addr.to_socket_addr().is_err());
+    }
+
+    // ========== Shared resolve helper tests ==========
+
+    #[test]
+    fn test_try_resolve_from_ip_v4() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        assert!(try_resolve_from_ip(&mut addr));
+        let info = addr.resolve_info.unwrap();
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_v6() {
+        let mut addr = Addr::new("::1", 443);
+        assert!(try_resolve_from_ip(&mut addr));
+        let info = addr.resolve_info.unwrap();
+        assert!(info.ipv4.is_none());
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_domain() {
+        let mut addr = Addr::new("example.com", 80);
+        assert!(!try_resolve_from_ip(&mut addr));
+        assert!(addr.resolve_info.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_already_resolved() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        addr.resolve_info = Some(ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST));
+        assert!(try_resolve_from_ip(&mut addr));
+        // Should keep original, not overwrite
+        assert_eq!(addr.resolve_info.unwrap().ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_build_resolve_info_mixed() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let info = build_resolve_info(&ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn test_build_resolve_info_empty() {
+        let info = build_resolve_info(&[]);
+        assert!(info.ipv4.is_none());
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_some());
+    }
+
+    #[test]
+    fn test_build_resolve_info_v4_only() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))];
+        let info = build_resolve_info(&ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_none());
     }
 }

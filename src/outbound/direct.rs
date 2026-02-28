@@ -10,8 +10,8 @@ use std::time::Duration;
 use crate::error::{AclError, Result};
 
 use super::{
-    split_ipv4_ipv6, Addr, Outbound, ResolveInfo, StdTcpConn, TcpConn, UdpConn,
-    DEFAULT_DIALER_TIMEOUT,
+    build_resolve_info, try_resolve_from_ip, Addr, Outbound, ResolveInfo, StdTcpConn, TcpConn,
+    UdpConn, DEFAULT_DIALER_TIMEOUT,
 };
 
 #[cfg(feature = "async")]
@@ -120,7 +120,7 @@ impl Direct {
         match (addr.host.as_str(), 0u16).to_socket_addrs() {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                addr.resolve_info = Some(build_resolve_info_from_ips(ips));
+                addr.resolve_info = Some(build_resolve_info(&ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -191,6 +191,19 @@ impl Direct {
         match target {
             IpAddr::V4(_) => self.bind_ip4.map(IpAddr::V4),
             IpAddr::V6(_) => self.bind_ip6.map(IpAddr::V6),
+        }
+    }
+
+    /// Return the UDP bind address for the given IP version.
+    fn udp_bind_addr(&self, use_ipv6: bool) -> SocketAddr {
+        if use_ipv6 {
+            self.bind_ip6
+                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+        } else {
+            self.bind_ip4
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
         }
     }
 
@@ -277,7 +290,7 @@ impl Direct {
         match tokio::net::lookup_host(format!("{}:0", addr.host)).await {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                addr.resolve_info = Some(build_resolve_info_from_ips(ips));
+                addr.resolve_info = Some(build_resolve_info(&ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -377,19 +390,8 @@ impl Outbound for Direct {
 
         let socket = if self.bind_device.is_some() {
             UdpSocket::from(self.create_udp_socket_with_device(use_ipv6)?)
-        } else if use_ipv6 {
-            let bind_addr = self
-                .bind_ip6
-                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
-            UdpSocket::bind(bind_addr)
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         } else {
-            let bind_addr = self
-                .bind_ip4
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            UdpSocket::bind(bind_addr)
+            UdpSocket::bind(self.udp_bind_addr(use_ipv6))
                 .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         };
 
@@ -446,20 +448,8 @@ impl AsyncOutbound for Direct {
             TokioUdpSocket::from_std(std_socket).map_err(|e| {
                 AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
             })?
-        } else if use_ipv6 {
-            let bind_addr = self
-                .bind_ip6
-                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
-            TokioUdpSocket::bind(bind_addr)
-                .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         } else {
-            let bind_addr = self
-                .bind_ip4
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            TokioUdpSocket::bind(bind_addr)
+            TokioUdpSocket::bind(self.udp_bind_addr(use_ipv6))
                 .await
                 .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         };
@@ -507,39 +497,6 @@ fn set_tcp_fastopen(_socket: &socket2::Socket) -> Result<()> {
     Err(AclError::ConfigError(
         "TCP Fast Open is not supported on this platform".to_string(),
     ))
-}
-
-/// Try to resolve the address from an IP literal.
-/// Returns true if resolve_info is already set or was set from an IP literal.
-/// Returns false if the host is a domain name that needs DNS resolution.
-fn try_resolve_from_ip(addr: &mut Addr) -> bool {
-    if addr.resolve_info.is_some() {
-        return true;
-    }
-
-    if let Ok(ip) = addr.host.parse::<IpAddr>() {
-        addr.resolve_info = Some(match ip {
-            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
-            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
-        });
-        return true;
-    }
-
-    false
-}
-
-/// Build ResolveInfo from a list of resolved IP addresses.
-fn build_resolve_info_from_ips(ips: Vec<IpAddr>) -> ResolveInfo {
-    let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
-    if ipv4.is_none() && ipv6.is_none() {
-        ResolveInfo::from_error("no address found")
-    } else {
-        ResolveInfo {
-            ipv4,
-            ipv6,
-            error: None,
-        }
-    }
 }
 
 /// Select an IP address based on DirectMode preference.
@@ -822,74 +779,40 @@ mod tests {
         assert!(select_ip(DirectMode::Only6, &info).is_err());
     }
 
-    // ========== Extracted helper function tests ==========
-
     #[test]
-    fn test_try_resolve_from_ip_v4() {
-        let mut addr = Addr::new("10.0.0.1", 80);
-        let resolved = try_resolve_from_ip(&mut addr);
-        assert!(resolved);
-        let info = addr.resolve_info.unwrap();
-        assert_eq!(info.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(info.ipv6.is_none());
+    fn test_udp_bind_addr_ipv4_default() {
+        let direct = Direct::new();
+        let addr = direct.udp_bind_addr(false);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
     }
 
     #[test]
-    fn test_try_resolve_from_ip_v6() {
-        let mut addr = Addr::new("::1", 443);
-        let resolved = try_resolve_from_ip(&mut addr);
-        assert!(resolved);
-        let info = addr.resolve_info.unwrap();
-        assert!(info.ipv4.is_none());
-        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    fn test_udp_bind_addr_ipv6_default() {
+        let direct = Direct::new();
+        let addr = direct.udp_bind_addr(true);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
     }
 
     #[test]
-    fn test_try_resolve_from_ip_domain() {
-        let mut addr = Addr::new("example.com", 80);
-        let resolved = try_resolve_from_ip(&mut addr);
-        assert!(!resolved);
-        assert!(addr.resolve_info.is_none());
+    fn test_udp_bind_addr_ipv4_custom() {
+        let direct = Direct::with_options(DirectOptions {
+            bind_ip4: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            ..Default::default()
+        }).unwrap();
+        let addr = direct.udp_bind_addr(false);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 0));
     }
 
     #[test]
-    fn test_try_resolve_from_ip_already_resolved() {
-        let mut addr = Addr::new("10.0.0.1", 80);
-        addr.resolve_info = Some(ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST));
-        let resolved = try_resolve_from_ip(&mut addr);
-        assert!(resolved);
-        // Should keep original resolve_info, not overwrite
-        assert_eq!(addr.resolve_info.unwrap().ipv6, Some(Ipv6Addr::LOCALHOST));
+    fn test_udp_bind_addr_ipv6_custom() {
+        let direct = Direct::with_options(DirectOptions {
+            bind_ip6: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ..Default::default()
+        }).unwrap();
+        let addr = direct.udp_bind_addr(true);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 0));
     }
 
-    #[test]
-    fn test_build_resolve_info_from_ips_mixed() {
-        let ips = vec![
-            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ];
-        let info = build_resolve_info_from_ips(ips);
-        assert_eq!(info.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
-        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
-        assert!(info.error.is_none());
-    }
-
-    #[test]
-    fn test_build_resolve_info_from_ips_empty() {
-        let info = build_resolve_info_from_ips(vec![]);
-        assert!(info.ipv4.is_none());
-        assert!(info.ipv6.is_none());
-        assert!(info.error.is_some());
-    }
-
-    #[test]
-    fn test_build_resolve_info_from_ips_v4_only() {
-        let ips = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))];
-        let info = build_resolve_info_from_ips(ips);
-        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 0, 1)));
-        assert!(info.ipv6.is_none());
-        assert!(info.error.is_none());
-    }
 }
 
 #[cfg(all(test, feature = "async"))]

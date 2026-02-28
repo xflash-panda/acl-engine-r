@@ -14,6 +14,14 @@ use crate::error::{AclError, Result};
 /// Default cache size for CachedMetaDbReader
 pub const DEFAULT_CACHE_SIZE: usize = 1024;
 
+/// Default cache size as NonZeroUsize (compile-time verified).
+const DEFAULT_CACHE_SIZE_NZ: std::num::NonZeroUsize =
+    // SAFETY: 1024 is non-zero. This is a compile-time constant.
+    match std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE) {
+        Some(v) => v,
+        None => panic!("DEFAULT_CACHE_SIZE must be non-zero"),
+    };
+
 /// MetaDB database types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatabaseType {
@@ -161,8 +169,7 @@ impl CachedMetaDbReader {
         Self {
             reader,
             cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(cache_size)
-                    .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap()),
+                std::num::NonZeroUsize::new(cache_size).unwrap_or(DEFAULT_CACHE_SIZE_NZ),
             )),
         }
     }

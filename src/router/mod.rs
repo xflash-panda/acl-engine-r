@@ -12,7 +12,8 @@ use crate::compile::{compile, CompiledRuleSet};
 use crate::error::{AclError, Result};
 use crate::geo::GeoLoader;
 use crate::outbound::{
-    split_ipv4_ipv6, Addr, Direct, DirectMode, Outbound, Reject, ResolveInfo, TcpConn, UdpConn,
+    build_resolve_info, try_resolve_from_ip, Addr, Direct, DirectMode, Outbound, Reject,
+    ResolveInfo, TcpConn, UdpConn,
 };
 use crate::parser::parse_rules;
 use crate::types::Protocol;
@@ -148,39 +149,6 @@ impl<T: ?Sized + DefaultOutbounds> RouterInner<T> {
             result.outbound
         } else {
             self.default_outbound.clone()
-        }
-    }
-}
-
-/// Try to resolve the address from an IP literal. Returns true if the host is
-/// already an IP address (and sets resolve_info), false if it's a domain name.
-fn try_resolve_from_ip(addr: &mut Addr) -> bool {
-    if let Ok(ip) = addr.host.parse::<IpAddr>() {
-        match ip {
-            IpAddr::V4(v4) => {
-                addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-            }
-            IpAddr::V6(v6) => {
-                addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-            }
-        }
-        true
-    } else {
-        false
-    }
-}
-
-/// Build a ResolveInfo from a list of resolved IPs.
-/// Sets an error if the list is empty.
-fn build_resolve_info(ips: &[IpAddr]) -> ResolveInfo {
-    let (ipv4, ipv6) = split_ipv4_ipv6(ips);
-    if ipv4.is_none() && ipv6.is_none() {
-        ResolveInfo::from_error("no address found")
-    } else {
-        ResolveInfo {
-            ipv4,
-            ipv6,
-            error: None,
         }
     }
 }
@@ -515,51 +483,4 @@ mod tests {
         assert!(router.is_ok());
     }
 
-    #[test]
-    fn test_try_resolve_from_ip_v4() {
-        let mut addr = Addr::new("1.2.3.4", 80);
-        assert!(try_resolve_from_ip(&mut addr));
-        let info = addr.resolve_info.unwrap();
-        assert_eq!(info.ipv4, Some("1.2.3.4".parse().unwrap()));
-        assert!(info.ipv6.is_none());
-        assert!(info.error.is_none());
-    }
-
-    #[test]
-    fn test_try_resolve_from_ip_v6() {
-        let mut addr = Addr::new("::1", 80);
-        assert!(try_resolve_from_ip(&mut addr));
-        let info = addr.resolve_info.unwrap();
-        assert!(info.ipv4.is_none());
-        assert_eq!(info.ipv6, Some("::1".parse().unwrap()));
-        assert!(info.error.is_none());
-    }
-
-    #[test]
-    fn test_try_resolve_from_ip_domain() {
-        let mut addr = Addr::new("example.com", 80);
-        assert!(!try_resolve_from_ip(&mut addr));
-        assert!(addr.resolve_info.is_none());
-    }
-
-    #[test]
-    fn test_build_resolve_info_both() {
-        let ips = vec![
-            "1.2.3.4".parse::<IpAddr>().unwrap(),
-            "::1".parse::<IpAddr>().unwrap(),
-        ];
-        let info = build_resolve_info(&ips);
-        assert_eq!(info.ipv4, Some("1.2.3.4".parse().unwrap()));
-        assert_eq!(info.ipv6, Some("::1".parse().unwrap()));
-        assert!(info.error.is_none());
-    }
-
-    #[test]
-    fn test_build_resolve_info_empty() {
-        let ips: Vec<IpAddr> = vec![];
-        let info = build_resolve_info(&ips);
-        assert!(info.ipv4.is_none());
-        assert!(info.ipv6.is_none());
-        assert!(info.error.is_some());
-    }
 }

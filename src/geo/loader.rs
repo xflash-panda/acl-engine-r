@@ -170,7 +170,9 @@ impl GeoLoader for FileGeoLoader {
                 // DAT: pre-load all CIDRs, lookup by country code
                 self.ensure_geoip_loaded()?;
                 let guard = self.geoip_data.read();
-                let data = guard.as_ref().unwrap();
+                let data = guard.as_ref().ok_or_else(|| {
+                    AclError::GeoIpError("GeoIP data not loaded".to_string())
+                })?;
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
             }
@@ -187,7 +189,9 @@ impl GeoLoader for FileGeoLoader {
 
         let (name, attrs) = GeoSiteMatcher::parse_pattern(site_name);
         let guard = self.geosite_data.read();
-        let data = guard.as_ref().unwrap();
+        let data = guard.as_ref().ok_or_else(|| {
+            AclError::GeoSiteError("GeoSite data not loaded".to_string())
+        })?;
 
         let domains = data.get(&name).cloned().unwrap_or_default();
         Ok(GeoSiteMatcher::new(&name, domains).with_attributes(attrs))

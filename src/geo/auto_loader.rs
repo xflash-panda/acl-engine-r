@@ -451,7 +451,9 @@ impl AutoGeoLoader {
                 // Load from reader
                 let domains = {
                     let mut reader_guard = self.geosite_reader.lock();
-                    let reader = reader_guard.as_mut().unwrap();
+                    let reader = reader_guard.as_mut().ok_or_else(|| {
+                        AclError::GeoSiteError("GeoSite reader not initialized".to_string())
+                    })?;
                     let items = reader.read(&code_lower)?;
                     singsite::convert_items_to_entries(items)
                 };
@@ -481,7 +483,9 @@ impl GeoLoader for AutoGeoLoader {
             GeoIpFormat::Dat => {
                 self.ensure_geoip_loaded()?;
                 let guard = self.geoip_data.read();
-                let data = guard.as_ref().unwrap();
+                let data = guard.as_ref().ok_or_else(|| {
+                    AclError::GeoIpError("GeoIP data not loaded".to_string())
+                })?;
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
             }
