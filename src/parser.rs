@@ -9,7 +9,7 @@ use crate::types::{Protocol, TextRule};
 /// Regex pattern for parsing ACL rules
 /// Format: outbound(address[, protoPort][, hijackAddress])
 static RULE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^(\w+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$").unwrap());
+    Lazy::new(|| Regex::new(r"^([\w.\-]+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$").unwrap());
 
 /// Maximum nesting depth for `file:` include directives.
 const MAX_INCLUDE_DEPTH: usize = 10;
@@ -414,5 +414,27 @@ proxy(all)
         assert_eq!(proto, Protocol::TCP);
         assert_eq!(start, 0);
         assert_eq!(end, 65535);
+    }
+
+    #[test]
+    fn test_parse_hyphenated_outbound_name() {
+        // BUG #4: Outbound names with hyphens (e.g. "my-proxy") are rejected
+        // because the regex uses \w+ which only matches [a-zA-Z0-9_].
+        // Hyphenated names are common in proxy configurations.
+        let text = "my-proxy(*.google.com)";
+        let rules = parse_rules(text).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].outbound, "my-proxy");
+        assert_eq!(rules[0].address, "*.google.com");
+    }
+
+    #[test]
+    fn test_parse_dotted_outbound_name() {
+        // Outbound names with dots (e.g. "us.west") should also work.
+        let text = "us.west(10.0.0.0/8)";
+        let rules = parse_rules(text).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].outbound, "us.west");
+        assert_eq!(rules[0].address, "10.0.0.0/8");
     }
 }

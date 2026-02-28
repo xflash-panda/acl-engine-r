@@ -118,9 +118,9 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
 /// Validate that a hostname doesn't contain characters that could cause
 /// HTTP header injection (CRLF) in the CONNECT request.
 fn validate_connect_host(host: &str) -> Result<()> {
-    if host.bytes().any(|b| b == b'\r' || b == b'\n') {
+    if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(AclError::OutboundError(
-            "Invalid host: contains CR/LF characters".to_string(),
+            "Invalid host: contains control characters".to_string(),
         ));
     }
     Ok(())
@@ -180,8 +180,34 @@ impl Http {
             (None, rest)
         };
 
-        // Handle default port
-        let addr = if host_port.contains(':') {
+        // Strip trailing path (e.g. "/some/path" from "host:port/some/path")
+        let host_port = if host_port.starts_with('[') {
+            // IPv6: find ']' first, then strip path after it
+            if let Some(bracket_end) = host_port.find(']') {
+                let after_bracket = &host_port[bracket_end + 1..];
+                let after_bracket = if let Some(slash_pos) = after_bracket.find('/') {
+                    &after_bracket[..slash_pos]
+                } else {
+                    after_bracket
+                };
+                &host_port[..bracket_end + 1 + after_bracket.len()]
+            } else {
+                host_port
+            }
+        } else if let Some(slash_pos) = host_port.find('/') {
+            &host_port[..slash_pos]
+        } else {
+            host_port
+        };
+
+        // Handle default port — IPv6 brackets mean ':' is not a port separator
+        let has_port = if host_port.starts_with('[') {
+            // IPv6: port is after ']:', e.g. "[::1]:8080"
+            host_port.contains("]:")
+        } else {
+            host_port.contains(':')
+        };
+        let addr = if has_port {
             host_port.to_string()
         } else {
             format!("{}:80", host_port)
@@ -1027,6 +1053,68 @@ mod tests {
         assert!(
             result.is_err(),
             "dial_tcp should reject host containing LF character"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_ipv6_default_port() {
+        // BUG #5: IPv6 address like "[::1]" contains ':', so the ':' check
+        // for default port assumes it already has a port. Result: addr = "[::1]"
+        // without port, which fails at connect time.
+        let http = Http::from_url("http://[::1]").unwrap();
+        assert_eq!(
+            http.addr, "[::1]:80",
+            "IPv6 without port should get default port 80"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_ipv6_explicit_port() {
+        // IPv6 with explicit port should work normally
+        let http = Http::from_url("http://[::1]:8080").unwrap();
+        assert_eq!(http.addr, "[::1]:8080");
+    }
+
+    #[test]
+    fn test_http_from_url_strips_trailing_path() {
+        // BUG #6: URL with trailing path like "http://proxy.example.com:8080/"
+        // keeps the "/" in host_port, producing addr = "proxy.example.com:8080/"
+        // which fails at connect time.
+        let http = Http::from_url("http://proxy.example.com:8080/").unwrap();
+        assert_eq!(
+            http.addr, "proxy.example.com:8080",
+            "Trailing slash should be stripped from proxy address"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_strips_trailing_path_with_segments() {
+        let http = Http::from_url("http://proxy.example.com:8080/some/path").unwrap();
+        assert_eq!(
+            http.addr, "proxy.example.com:8080",
+            "Trailing path should be stripped from proxy address"
+        );
+    }
+
+    #[test]
+    fn test_validate_connect_host_rejects_null_byte() {
+        // BUG #7: validate_connect_host only checks CR/LF but not NULL bytes.
+        // NULL bytes in hostnames can cause issues with C-based DNS resolvers
+        // and can be used for smuggling attacks.
+        let result = validate_connect_host("evil.com\0injected");
+        assert!(
+            result.is_err(),
+            "NULL byte in hostname should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_connect_host_rejects_control_chars() {
+        // Other control characters (< 0x20) should also be rejected
+        let result = validate_connect_host("evil.com\x01injected");
+        assert!(
+            result.is_err(),
+            "Control characters in hostname should be rejected"
         );
     }
 

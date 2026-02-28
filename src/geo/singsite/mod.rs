@@ -85,8 +85,9 @@ impl SingSiteReader {
             let offset = reader.stream_position().map_err(|e| {
                 AclError::GeoSiteError(format!("Failed to get stream position: {}", e))
             })?;
-            domain_offset.insert(code.clone(), offset);
-            domain_length.insert(code.clone(), *length);
+            let lower_code = code.to_lowercase();
+            domain_offset.insert(lower_code.clone(), offset);
+            domain_length.insert(lower_code, *length);
 
             // Skip this code's items to advance to the next code
             for _ in 0..*length {
@@ -107,13 +108,14 @@ impl SingSiteReader {
 
     /// Read domains for a specific code
     pub fn read(&mut self, code: &str) -> Result<Vec<DomainItem>> {
+        let code = code.to_lowercase();
         let offset = self
             .domain_offset
-            .get(code)
+            .get(&code)
             .copied()
             .ok_or_else(|| AclError::GeoSiteError(format!("Code not found: {}", code)))?;
 
-        let length = self.domain_length.get(code).copied().unwrap_or(0);
+        let length = self.domain_length.get(&code).copied().unwrap_or(0);
 
         // Seek directly to this code's data
         self.reader
@@ -301,5 +303,107 @@ mod tests {
         let mut cursor = Cursor::new(data);
         let result = read_vstring(&mut cursor);
         assert_eq!(result.unwrap(), "hello");
+    }
+
+    /// Helper: encode u64 as varint bytes
+    fn encode_uvarint(mut val: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        while val >= 0x80 {
+            buf.push((val as u8) | 0x80);
+            val >>= 7;
+        }
+        buf.push(val as u8);
+        buf
+    }
+
+    /// Helper: encode a string as varint-length-prefixed bytes
+    fn encode_vstring(s: &str) -> Vec<u8> {
+        let mut buf = encode_uvarint(s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+        buf
+    }
+
+    /// Helper: build a minimal sing-geosite binary file in memory
+    fn build_singsite_file(entries: &[(&str, &[(&str, u8)])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        // Version = 0
+        data.push(0u8);
+        // Entry count
+        data.extend(encode_uvarint(entries.len() as u64));
+        // Metadata: code, code_index, code_length for each entry
+        for (i, (code, items)) in entries.iter().enumerate() {
+            data.extend(encode_vstring(code));
+            data.extend(encode_uvarint(i as u64)); // code_index
+            data.extend(encode_uvarint(items.len() as u64));
+        }
+        // Data: items for each entry
+        for (_code, items) in entries {
+            for (value, item_type) in *items {
+                data.push(*item_type);
+                data.extend(encode_vstring(value));
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn test_singsite_case_insensitive_lookup() {
+        // BUG #9: SingSiteReader stores codes as-is from file (e.g. "GOOGLE"),
+        // but load_geosite_code() calls reader.read(&code.to_lowercase()),
+        // looking up "google" which doesn't exist in the map.
+        let dir = std::env::temp_dir().join("acl_engine_test_singsite_case");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_case.srs");
+
+        // Build a file with UPPERCASE code "GOOGLE"
+        let file_data = build_singsite_file(&[
+            ("GOOGLE", &[("google.com", 0)]),  // uppercase code
+        ]);
+        std::fs::write(&file_path, &file_data).unwrap();
+
+        // load_geosite_code lowercases the code, so it should find "google" → "GOOGLE"
+        let result = load_geosite_code(&file_path, "google");
+        assert!(
+            result.is_ok(),
+            "Lowercase lookup of UPPERCASE code should succeed, got: {:?}",
+            result.err()
+        );
+        let entries = result.unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_singsite_mixed_case_lookup() {
+        let dir = std::env::temp_dir().join("acl_engine_test_singsite_mixed");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_mixed.srs");
+
+        // Build with mixed-case code "Google"
+        let file_data = build_singsite_file(&[
+            ("Google", &[("google.com", 0), (".google.com", 1)]),
+        ]);
+        std::fs::write(&file_path, &file_data).unwrap();
+
+        // Should find via lowercase
+        let result = load_geosite_code(&file_path, "google");
+        assert!(
+            result.is_ok(),
+            "Lowercase lookup of mixed-case code should succeed, got: {:?}",
+            result.err()
+        );
+
+        // Should also find via uppercase
+        let result = load_geosite_code(&file_path, "GOOGLE");
+        assert!(
+            result.is_ok(),
+            "Uppercase lookup of mixed-case code should succeed, got: {:?}",
+            result.err()
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
