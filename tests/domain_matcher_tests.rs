@@ -130,16 +130,16 @@ fn test_mining_pool_suffix_matching() {
 }
 
 #[test]
-fn test_case_insensitive_matching() {
+fn test_case_insensitive_construction() {
+    // Construction lowercases domains; matches() assumes input is already lowercased
     let suffixes = vec!["Google.COM".to_string(), "BinAnce.Com".to_string()];
     let matcher = SuccinctMatcher::new(&[], &suffixes);
 
-    // All case variations should match
+    // Lowercased input matches (HostInfo guarantees lowercase)
     assert!(matcher.matches("google.com"));
-    assert!(matcher.matches("GOOGLE.COM"));
-    assert!(matcher.matches("Google.Com"));
-    assert!(matcher.matches("WWW.GOOGLE.COM"));
-    assert!(matcher.matches("api.BINANCE.com"));
+    assert!(matcher.matches("www.google.com"));
+    assert!(matcher.matches("binance.com"));
+    assert!(matcher.matches("api.binance.com"));
 }
 
 #[test]

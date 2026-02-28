@@ -90,36 +90,31 @@ fn parse_single_rule(line: &str, line_num: usize) -> Result<TextRule> {
 pub fn parse_proto_port(spec: &str) -> Result<(Protocol, u16, u16)> {
     let spec = spec.trim().to_lowercase();
 
-    // Split by '/'
-    let parts: Vec<&str> = spec.split('/').collect();
-    if parts.len() != 2 {
-        return Err(AclError::InvalidProtoPort(format!(
-            "Invalid format: {}",
-            spec
-        )));
-    }
+    // Split by '/' using split_once to avoid Vec allocation
+    let (proto_str, port_spec) = spec.split_once('/').ok_or_else(|| {
+        AclError::InvalidProtoPort(format!("Invalid format: {}", spec))
+    })?;
 
     // Parse protocol
-    let protocol = match parts[0] {
+    let protocol = match proto_str {
         "tcp" => Protocol::TCP,
         "udp" => Protocol::UDP,
         "*" => Protocol::Both,
         _ => {
             return Err(AclError::InvalidProtoPort(format!(
                 "Unknown protocol: {}",
-                parts[0]
+                proto_str
             )))
         }
     };
 
     // Parse port(s)
-    let port_spec = parts[1];
-    let (start_port, end_port) = if let Some(dash_pos) = port_spec.find('-') {
+    let (start_port, end_port) = if let Some((start_str, end_str)) = port_spec.split_once('-') {
         // Port range
-        let start: u16 = port_spec[..dash_pos]
+        let start: u16 = start_str
             .parse()
             .map_err(|_| AclError::InvalidProtoPort(format!("Invalid port: {}", port_spec)))?;
-        let end: u16 = port_spec[dash_pos + 1..]
+        let end: u16 = end_str
             .parse()
             .map_err(|_| AclError::InvalidProtoPort(format!("Invalid port: {}", port_spec)))?;
         if start > end {
@@ -266,5 +261,43 @@ proxy(all)
         let text = "file: /nonexistent/path/rules.acl";
         let result = parse_rules(text);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proto_port_no_slash() {
+        // split_once should handle missing '/' correctly
+        let result = parse_proto_port("tcp443");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proto_port_multiple_slashes() {
+        // split_once splits at first '/', rest goes to port_spec which should fail
+        let result = parse_proto_port("tcp/443/extra");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proto_port_invalid_range() {
+        let result = parse_proto_port("tcp/9000-8000");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proto_port_edge_ports() {
+        let (proto, start, end) = parse_proto_port("tcp/0").unwrap();
+        assert_eq!(proto, Protocol::TCP);
+        assert_eq!(start, 0);
+        assert_eq!(end, 0);
+
+        let (proto, start, end) = parse_proto_port("tcp/65535").unwrap();
+        assert_eq!(proto, Protocol::TCP);
+        assert_eq!(start, 65535);
+        assert_eq!(end, 65535);
+
+        let (proto, start, end) = parse_proto_port("tcp/0-65535").unwrap();
+        assert_eq!(proto, Protocol::TCP);
+        assert_eq!(start, 0);
+        assert_eq!(end, 65535);
     }
 }

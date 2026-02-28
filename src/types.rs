@@ -90,24 +90,77 @@ pub struct MatchResult<O> {
     pub hijack_ip: Option<IpAddr>,
 }
 
-/// Cache key for LRU cache
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey {
-    pub name: String,
-    pub ipv4: Option<IpAddr>,
-    pub ipv6: Option<IpAddr>,
-    pub protocol: Protocol,
-    pub port: u16,
-}
+/// Cache key for LRU cache.
+/// Uses a pre-computed u64 hash to avoid cloning the host name string on every lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey(pub u64);
 
 impl CacheKey {
+    /// Compute cache key hash from host info without allocating.
     pub fn from_host(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
-        Self {
-            name: host.name.clone(), // already lowercased in HostInfo constructors
-            ipv4: host.ipv4,
-            ipv6: host.ipv6,
-            protocol,
-            port,
-        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        host.name.hash(&mut hasher);
+        host.ipv4.hash(&mut hasher);
+        host.ipv6.hash(&mut hasher);
+        protocol.hash(&mut hasher);
+        port.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cache_key_deterministic() {
+        let host = HostInfo::from_name("example.com");
+        let key1 = CacheKey::from_host(&host, Protocol::TCP, 443);
+        let key2 = CacheKey::from_host(&host, Protocol::TCP, 443);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_different_for_different_inputs() {
+        let host = HostInfo::from_name("example.com");
+
+        // Different protocol
+        let key_tcp = CacheKey::from_host(&host, Protocol::TCP, 443);
+        let key_udp = CacheKey::from_host(&host, Protocol::UDP, 443);
+        assert_ne!(key_tcp, key_udp);
+
+        // Different port
+        let key_443 = CacheKey::from_host(&host, Protocol::TCP, 443);
+        let key_80 = CacheKey::from_host(&host, Protocol::TCP, 80);
+        assert_ne!(key_443, key_80);
+
+        // Different host
+        let host2 = HostInfo::from_name("other.com");
+        let key_other = CacheKey::from_host(&host2, Protocol::TCP, 443);
+        assert_ne!(key_tcp, key_other);
+    }
+
+    #[test]
+    fn test_cache_key_with_ip() {
+        let host_no_ip = HostInfo::from_name("example.com");
+        let host_with_ip = HostInfo::new(
+            "example.com",
+            Some("1.2.3.4".parse().unwrap()),
+            None,
+        );
+
+        let key1 = CacheKey::from_host(&host_no_ip, Protocol::TCP, 443);
+        let key2 = CacheKey::from_host(&host_with_ip, Protocol::TCP, 443);
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_is_copy() {
+        // Verify CacheKey is Copy (no heap allocation)
+        let host = HostInfo::from_name("example.com");
+        let key = CacheKey::from_host(&host, Protocol::TCP, 443);
+        let key_copy = key; // Copy, not move
+        assert_eq!(key, key_copy);
     }
 }

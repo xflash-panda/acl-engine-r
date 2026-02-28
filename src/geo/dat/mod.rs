@@ -97,22 +97,25 @@ fn domain_to_entry(domain: &geodat::Domain) -> Option<DomainEntry> {
             Ok(re) => DomainType::Regex(re),
             Err(_) => return None,
         },
-        Ok(Type::RootDomain) => DomainType::RootDomain(value),
+        Ok(Type::RootDomain) => {
+            let dot_pattern = format!(".{}", value);
+            DomainType::RootDomain(value, dot_pattern)
+        }
         Ok(Type::Full) => DomainType::Full(value),
         Err(_) => return None,
     };
 
-    let mut entry = DomainEntry {
-        domain_type,
-        attributes: HashMap::new(),
-    };
-
     // Parse attributes
-    for attr in &domain.attribute {
-        entry.attributes.insert(attr.key.clone(), String::new());
-    }
+    let attributes: Vec<(String, String)> = domain
+        .attribute
+        .iter()
+        .map(|attr| (attr.key.clone(), String::new()))
+        .collect();
 
-    Some(entry)
+    Some(DomainEntry {
+        domain_type,
+        attributes,
+    })
 }
 
 /// Verify DAT file integrity by attempting to load it

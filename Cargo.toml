@@ -15,6 +15,9 @@ ipnet = "2.9"
 # LRU cache
 lru = "0.16"
 
+# Fast mutex (no poisoning, smaller, faster for short critical sections)
+parking_lot = "0.12"
+
 # Regex for rule parsing and domain matching
 regex = "1.10"
 

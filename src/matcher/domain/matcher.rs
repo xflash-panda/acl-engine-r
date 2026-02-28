@@ -72,24 +72,23 @@ impl SuccinctMatcher {
     }
 
     /// Check if the given domain matches any rule.
+    /// Assumes `domain` is already lowercased (as guaranteed by HostInfo constructors).
     pub fn matches(&self, domain: &str) -> bool {
-        let domain_lower = domain.to_lowercase();
-
         // Check exact match first (O(1))
-        if self.exact.contains(&domain_lower) {
+        if self.exact.contains(domain) {
             return true;
         }
 
         // Check root suffix match for the domain itself
         // e.g., "google.com" matches both "google.com" and "www.google.com"
-        if self.suffixes.get(&domain_lower) == Some(&SuffixType::Root) {
+        if self.suffixes.get(domain) == Some(&SuffixType::Root) {
             return true;
         }
 
         // Walk up the domain hierarchy, one lookup per level
         let mut pos = 0;
-        while let Some(dot_pos) = domain_lower[pos..].find('.') {
-            let parent = &domain_lower[pos + dot_pos + 1..];
+        while let Some(dot_pos) = domain[pos..].find('.') {
+            let parent = &domain[pos + dot_pos + 1..];
 
             // Single lookup: both Root and PrefixOnly match subdomains
             if self.suffixes.contains_key(parent) {
@@ -125,7 +124,6 @@ mod tests {
         let matcher = SuccinctMatcher::new(&domains, &[]);
 
         assert!(matcher.matches("google.com"));
-        assert!(matcher.matches("GOOGLE.COM"));
         assert!(matcher.matches("facebook.com"));
         assert!(!matcher.matches("www.google.com"));
         assert!(!matcher.matches("twitter.com"));
@@ -171,13 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn test_case_insensitive() {
+    fn test_case_insensitive_construction() {
+        // Construction lowercases domains; matches() assumes input is already lowercased
         let domains = vec!["Google.COM".to_string()];
         let matcher = SuccinctMatcher::new(&domains, &[]);
 
         assert!(matcher.matches("google.com"));
-        assert!(matcher.matches("GOOGLE.COM"));
-        assert!(matcher.matches("Google.Com"));
     }
 
     #[test]
@@ -271,5 +268,23 @@ mod tests {
         assert!(matcher.matches("a.b.c.d.e.example.com"));
         assert!(matcher.matches("example.com"));
         assert!(!matcher.matches("notexample.com"));
+    }
+
+    #[test]
+    fn test_matches_assumes_lowercased_input() {
+        // matches() no longer calls to_lowercase() internally;
+        // it assumes the caller provides lowercased input (HostInfo guarantee)
+        let domains = vec!["google.com".to_string()];
+        let suffix = vec!["youtube.com".to_string()];
+        let matcher = SuccinctMatcher::new(&domains, &suffix);
+
+        // Lowercased input works
+        assert!(matcher.matches("google.com"));
+        assert!(matcher.matches("youtube.com"));
+        assert!(matcher.matches("www.youtube.com"));
+
+        // Non-lowercased input won't match (by design, caller must lowercase)
+        assert!(!matcher.matches("GOOGLE.COM"));
+        assert!(!matcher.matches("YouTube.com"));
     }
 }

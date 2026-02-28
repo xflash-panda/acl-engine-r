@@ -199,7 +199,8 @@ pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
             ItemType::DomainSuffix => {
                 // sing-geosite stores suffix with leading dot, remove it
                 let value = item.value.trim_start_matches('.').to_lowercase();
-                DomainType::RootDomain(value)
+                let dot_pattern = format!(".{}", value);
+                DomainType::RootDomain(value, dot_pattern)
             }
             ItemType::DomainKeyword => DomainType::Plain(item.value.to_lowercase()),
             ItemType::DomainRegex => match regex::Regex::new(&item.value) {
@@ -210,7 +211,7 @@ pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
 
         domains.push(DomainEntry {
             domain_type,
-            attributes: HashMap::new(),
+            attributes: Vec::new(),
         });
     }
 

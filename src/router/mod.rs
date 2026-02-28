@@ -193,12 +193,15 @@ impl Outbound for Router {
     }
 }
 
-/// Convert outbound entries to a map.
+/// Convert outbound entries to a map. Consumes entries to avoid Arc clones.
 fn outbounds_to_map(outbounds: Vec<OutboundEntry>) -> HashMap<String, Arc<dyn Outbound>> {
-    let mut map: HashMap<String, Arc<dyn Outbound>> = HashMap::new();
+    let mut map: HashMap<String, Arc<dyn Outbound>> = HashMap::with_capacity(outbounds.len() + 3);
 
-    for entry in &outbounds {
-        map.insert(entry.name.to_lowercase(), entry.outbound.clone());
+    // Save first outbound for potential default before consuming
+    let first_outbound = outbounds.first().map(|e| e.outbound.clone());
+
+    for entry in outbounds {
+        map.insert(entry.name.to_lowercase(), entry.outbound);
     }
 
     // Add built-in outbounds if not overridden
@@ -214,8 +217,8 @@ fn outbounds_to_map(outbounds: Vec<OutboundEntry>) -> HashMap<String, Arc<dyn Ou
 
     // Set default outbound
     if !map.contains_key("default") {
-        if !outbounds.is_empty() {
-            map.insert("default".to_string(), outbounds[0].outbound.clone());
+        if let Some(first) = first_outbound {
+            map.insert("default".to_string(), first);
         } else {
             map.insert("default".to_string(), map.get("direct").unwrap().clone());
         }

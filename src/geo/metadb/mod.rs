@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use ipnet::IpNet;
 use lru::LruCache;
@@ -181,7 +183,7 @@ impl CachedMetaDbReader {
     pub fn lookup_codes(&self, ip: IpAddr) -> Vec<String> {
         // Check cache first
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock();
             if let Some(codes) = cache.get(&ip) {
                 return codes.clone();
             }
@@ -192,7 +194,7 @@ impl CachedMetaDbReader {
 
         // Store in cache
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock();
             cache.put(ip, codes.clone());
         }
 
@@ -206,13 +208,13 @@ impl CachedMetaDbReader {
 
     /// Clear the LRU cache
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
         cache.clear();
     }
 
     /// Get the number of items in the cache
     pub fn cache_len(&self) -> usize {
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock();
         cache.len()
     }
 }

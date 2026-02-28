@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
+
+use parking_lot::Mutex;
 
 use ipnet::IpNet;
 
@@ -327,7 +329,7 @@ impl AutoGeoLoader {
         url: &str,
         verify_fn: impl Fn(&Path) -> Result<()>,
     ) -> Result<()> {
-        let _lock = self.download_lock.lock().unwrap();
+        let _lock = self.download_lock.lock();
 
         // Double-check after acquiring lock
         if !self.should_download(path) {
@@ -407,7 +409,7 @@ impl AutoGeoLoader {
 
     /// Ensure geosite reader is initialized (opens file once)
     fn ensure_geosite_reader(&self) -> Result<()> {
-        let mut reader_guard = self.geosite_reader.lock().unwrap();
+        let mut reader_guard = self.geosite_reader.lock();
         if reader_guard.is_some() {
             return Ok(());
         }
@@ -469,7 +471,7 @@ impl AutoGeoLoader {
 
         // Load from reader
         let domains = {
-            let mut reader_guard = self.geosite_reader.lock().unwrap();
+            let mut reader_guard = self.geosite_reader.lock();
             let reader = reader_guard.as_mut().unwrap();
             let items = reader.read(&code_lower)?;
             singsite::convert_items_to_entries(items)

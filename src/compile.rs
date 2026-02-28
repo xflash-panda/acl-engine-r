@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use ipnet::IpNet;
 use lru::LruCache;
@@ -74,7 +75,7 @@ impl<O: Clone> CompiledRuleSet<O> {
     ) -> Option<MatchResult<O>> {
         let key = CacheKey::from_host(host, proto, port);
 
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
 
         // Check cache first
         if let Some(cached) = cache.get(&key) {
@@ -117,7 +118,7 @@ impl<O: Clone> CompiledRuleSet<O> {
 
     /// Clear the cache
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
         cache.clear();
     }
 }
