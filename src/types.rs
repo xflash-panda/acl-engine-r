@@ -31,13 +31,22 @@ pub struct HostInfo {
 }
 
 impl HostInfo {
-    /// Create a new HostInfo with just a name
+    /// Create a new HostInfo with just a name.
+    ///
+    /// If the name is an IP address literal (e.g. "192.168.1.1" or "::1"),
+    /// the corresponding ipv4/ipv6 field is auto-populated so that IP/CIDR
+    /// rules work correctly without requiring [`from_ip`](Self::from_ip).
     pub fn from_name(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into().to_lowercase(),
-            ipv4: None,
-            ipv6: None,
-        }
+        let name = name.into().to_lowercase();
+        let (ipv4, ipv6) = if let Ok(ip) = name.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(v4) => (Some(v4), None),
+                IpAddr::V6(v6) => (None, Some(v6)),
+            }
+        } else {
+            (None, None)
+        };
+        Self { name, ipv4, ipv6 }
     }
 
     /// Create a new HostInfo with name and IPs
@@ -213,5 +222,42 @@ mod tests {
         let key = CacheKey::compute(&host, Protocol::TCP, 443);
         let key_copy = key; // Copy, not move
         assert_eq!(key, key_copy);
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_auto_detects_ipv4() {
+        // BUG B5: HostInfo::from_name("192.168.1.1") sets ipv4=None, so
+        // IP/CIDR rules silently don't match. from_name should auto-detect
+        // IP literals and populate the ipv4/ipv6 fields.
+        use std::net::Ipv4Addr;
+        let host = HostInfo::from_name("192.168.1.1");
+        assert_eq!(
+            host.ipv4,
+            Some(Ipv4Addr::new(192, 168, 1, 1)),
+            "from_name should auto-detect IPv4 literals"
+        );
+        // Name should still be preserved for domain matching fallback
+        assert_eq!(host.name, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_auto_detects_ipv6() {
+        use std::net::Ipv6Addr;
+        let host = HostInfo::from_name("::1");
+        assert_eq!(
+            host.ipv6,
+            Some(Ipv6Addr::LOCALHOST),
+            "from_name should auto-detect IPv6 literals"
+        );
+        assert_eq!(host.name, "::1");
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_domain_unchanged() {
+        // Regular domain names should NOT set ipv4/ipv6
+        let host = HostInfo::from_name("example.com");
+        assert!(host.ipv4.is_none());
+        assert!(host.ipv6.is_none());
+        assert_eq!(host.name, "example.com");
     }
 }

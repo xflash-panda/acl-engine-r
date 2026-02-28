@@ -672,6 +672,50 @@ proxy(all)
     // P1-4 verified: cache_size=0 → 1 is acceptable (NonZeroUsize fallback works fine)
 
     #[test]
+    fn test_from_name_ip_matches_cidr_rule() {
+        // BUG B5: HostInfo::from_name("192.168.1.1") has ipv4=None,
+        // so CIDR rules like direct(192.168.0.0/16) silently don't match.
+        // Third-party developers using match_host() directly (without Router)
+        // hit this trap because they naturally use from_name for any host string.
+        let text = "direct(192.168.0.0/16)\nproxy(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("direct".to_string(), "DIRECT");
+        outbounds.insert("proxy".to_string(), "PROXY");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        // from_name with an IP literal should match CIDR rules
+        let host = HostInfo::from_name("192.168.1.1");
+        let result = compiled.match_host(&host, Protocol::TCP, 80);
+        assert_eq!(
+            result.unwrap().outbound, "DIRECT",
+            "from_name('192.168.1.1') should match CIDR rule 192.168.0.0/16"
+        );
+    }
+
+    #[test]
+    fn test_from_name_ip_matches_exact_ip_rule() {
+        // from_name("1.2.3.4") should match an exact IP rule direct(1.2.3.4)
+        let text = "direct(1.2.3.4)\nproxy(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("direct".to_string(), "DIRECT");
+        outbounds.insert("proxy".to_string(), "PROXY");
+
+        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+
+        let host = HostInfo::from_name("1.2.3.4");
+        let result = compiled.match_host(&host, Protocol::TCP, 80);
+        assert_eq!(
+            result.unwrap().outbound, "DIRECT",
+            "from_name('1.2.3.4') should match exact IP rule"
+        );
+    }
+
+    #[test]
     fn test_compile_unknown_outbound_error_includes_line_number() {
         // BUG B2: When a rule references an unknown outbound, the error just says
         // "Unknown outbound: typo_proxy" with no line number. TextRule has line_num
