@@ -4,7 +4,7 @@
 //! Note: HTTP proxies don't support UDP by design.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::error::{AclError, Result};
@@ -139,8 +139,10 @@ impl Http {
     fn dial(&self) -> Result<TcpStream> {
         let addr: SocketAddr = self
             .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+            .to_socket_addrs()
+            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .next()
+            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 
         let stream = TcpStream::connect_timeout(&addr, self.timeout)
             .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
@@ -161,8 +163,10 @@ impl Http {
     async fn async_dial(&self) -> Result<TokioTcpStream> {
         let addr: SocketAddr = self
             .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+            .to_socket_addrs()
+            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .next()
+            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 
         let stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
             .await
@@ -331,16 +335,23 @@ impl AsyncOutbound for Http {
             )));
         }
 
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
-            if line.trim().is_empty() {
-                break;
+        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async {
+            loop {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read headers: {}", e))
+                    })?;
+                if line.trim().is_empty() {
+                    break;
+                }
             }
-        }
+            Ok::<_, AclError>(())
+        })
+        .await
+        .map_err(|_| AclError::OutboundError("Header read timeout".to_string()))??;
 
         let buffered = reader.buffer();
         if !buffered.is_empty() {
@@ -581,6 +592,27 @@ mod tests {
         let result = Outbound::dial_udp(&http, &mut addr);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_http_dial_tcp_domain_name_proxy() {
+        // Bug: Http::dial() uses SocketAddr::parse() which rejects domain names.
+        // Using a domain name proxy address should resolve and attempt connection,
+        // not fail with "Invalid proxy address".
+        let http = Http::new("localhost:59996", false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -618,5 +650,69 @@ mod async_tests {
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_async_http_dial_tcp_domain_name_proxy() {
+        // Bug: Http::async_dial() uses SocketAddr::parse() which rejects domain names.
+        let http = Http::new("localhost:59996", false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_http_header_read_timeout() {
+        // Bug: async dial_tcp has no timeout on header-reading loop.
+        // A proxy that sends status line but never finishes headers should timeout,
+        // not hang forever.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Mock proxy: accepts, reads request, sends status line, then hangs
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send valid status line but never send terminating empty header line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Keep connection open indefinitely
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+
+        // Outer timeout: must be larger than HTTP_REQUEST_TIMEOUT (10s)
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            AsyncOutbound::dial_tcp(&http, &mut addr),
+        )
+        .await;
+
+        // If dial_tcp hangs forever, the outer timeout fires and result is Err(Elapsed).
+        // After fix, internal timeout fires first and dial_tcp returns Err(AclError).
+        assert!(
+            result.is_ok(),
+            "dial_tcp should not hang forever - header read needs internal timeout"
+        );
+        assert!(result.unwrap().is_err());
+
+        server.abort();
     }
 }

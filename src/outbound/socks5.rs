@@ -3,7 +3,7 @@
 //! Connects to targets through a SOCKS5 proxy server.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{AclError, Result};
@@ -86,8 +86,10 @@ impl Socks5 {
     fn dial_and_negotiate(&self) -> Result<TcpStream> {
         let addr: SocketAddr = self
             .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+            .to_socket_addrs()
+            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .next()
+            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 
         let mut stream = TcpStream::connect_timeout(&addr, self.timeout)
             .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
@@ -323,8 +325,10 @@ impl Socks5 {
     async fn async_dial_and_negotiate(&self) -> Result<TokioTcpStream> {
         let addr: SocketAddr = self
             .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+            .to_socket_addrs()
+            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .next()
+            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 
         let mut stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
             .await
@@ -912,6 +916,27 @@ mod tests {
         assert_eq!(addr[0], 11); // length of "example.com"
         assert_eq!(&addr[1..], b"example.com");
     }
+
+    #[test]
+    fn test_socks5_dial_tcp_domain_name_proxy() {
+        // Bug: Socks5::dial_and_negotiate() uses SocketAddr::parse() which rejects domain names.
+        // Using a domain name proxy address should resolve and attempt connection,
+        // not fail with "Invalid proxy address".
+        let socks5 = Socks5::new("localhost:59996");
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&socks5, &mut addr);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -955,5 +980,24 @@ mod async_tests {
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11);
         assert_eq!(&addr[1..], b"example.com");
+    }
+
+    #[tokio::test]
+    async fn test_async_socks5_dial_tcp_domain_name_proxy() {
+        // Bug: Socks5::async_dial_and_negotiate() uses SocketAddr::parse() which rejects domain names.
+        let socks5 = Socks5::new("localhost:59996");
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&socks5, &mut addr).await;
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
     }
 }
