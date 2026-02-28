@@ -234,17 +234,14 @@ mod tests {
     fn test_suffix_overlap_root_and_prefix() {
         // root_suffix "google.com" matches google.com + *.google.com
         // prefix_suffix ".facebook.com" matches only *.facebook.com
-        let suffix = vec![
-            "google.com".to_string(),
-            ".facebook.com".to_string(),
-        ];
+        let suffix = vec!["google.com".to_string(), ".facebook.com".to_string()];
         let matcher = SuccinctMatcher::new(&[], &suffix);
 
-        assert!(matcher.matches("google.com"));         // root_suffix exact
-        assert!(matcher.matches("www.google.com"));      // root_suffix subdomain
-        assert!(!matcher.matches("facebook.com"));       // prefix_suffix should NOT match exact
-        assert!(matcher.matches("www.facebook.com"));    // prefix_suffix should match subdomain
-        assert!(matcher.matches("a.b.facebook.com"));    // prefix_suffix deep subdomain
+        assert!(matcher.matches("google.com")); // root_suffix exact
+        assert!(matcher.matches("www.google.com")); // root_suffix subdomain
+        assert!(!matcher.matches("facebook.com")); // prefix_suffix should NOT match exact
+        assert!(matcher.matches("www.facebook.com")); // prefix_suffix should match subdomain
+        assert!(matcher.matches("a.b.facebook.com")); // prefix_suffix deep subdomain
     }
 
     #[test]
