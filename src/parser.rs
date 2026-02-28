@@ -90,6 +90,12 @@ fn parse_single_rule(line: &str, line_num: usize) -> Result<TextRule> {
 
     let outbound = captures.get(1).unwrap().as_str().to_string();
     let address = captures.get(2).unwrap().as_str().trim().to_string();
+    if address.is_empty() {
+        return Err(AclError::ParseErrorAtLine {
+            line: line_num,
+            message: "Empty address".to_string(),
+        });
+    }
     let proto_port = captures.get(3).map(|m| m.as_str().trim().to_string());
     let hijack_address = captures.get(4).map(|m| m.as_str().trim().to_string());
 
@@ -367,6 +373,29 @@ proxy(all)
             let _ = fs::remove_file(p);
         }
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_parse_rejects_empty_address() {
+        // BUG: whitespace-only address like "direct(   )" should be rejected,
+        // not silently create a rule that never matches anything.
+        let text = "direct(   )";
+        let result = parse_rules(text);
+        assert!(
+            result.is_err(),
+            "Whitespace-only address should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_rejects_whitespace_only_fields() {
+        // "direct(  , tcp/443)" — empty address with valid proto_port
+        let text = "direct(  , tcp/443)";
+        let result = parse_rules(text);
+        assert!(
+            result.is_err(),
+            "Whitespace-only address with proto_port should be rejected"
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
 
 use parking_lot::Mutex;
@@ -18,8 +18,8 @@ use crate::types::{CacheKey, HostInfo, MatchResult, Protocol, TextRule};
 /// to detect (extremely rare) hash collisions on cache hit.
 struct CacheEntry<O> {
     name: String,
-    ipv4: Option<IpAddr>,
-    ipv6: Option<IpAddr>,
+    ipv4: Option<Ipv4Addr>,
+    ipv6: Option<Ipv6Addr>,
     protocol: Protocol,
     port: u16,
     result: Option<(O, Option<IpAddr>)>,

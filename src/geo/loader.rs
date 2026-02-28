@@ -507,6 +507,39 @@ impl AutoGeoLoader {
         Ok(())
     }
 
+    /// Pre-load all geosite data from DAT format into cache.
+    fn ensure_dat_geosite_loaded(&self) -> Result<()> {
+        // Fast path: already loaded
+        if !self.geosite_cache.read().is_empty() {
+            return Ok(());
+        }
+
+        let path = self
+            .get_geosite_path()
+            .ok_or_else(|| AclError::GeoSiteError("GeoSite path not configured".to_string()))?;
+
+        // Try to download if needed
+        if self.should_download(&path) {
+            if let Some(ref url) = self.geosite_url {
+                let verify = |p: &Path| verify_geosite_file(p, GeoSiteFormat::Dat);
+                if let Err(e) = self.download(&path, url, verify) {
+                    if !path.exists() {
+                        return Err(e);
+                    }
+                    self.log(&format!("Download failed, using existing file: {}", e));
+                }
+            }
+        }
+
+        let data = dat::load_geosite(&path)?;
+
+        let mut cache = self.geosite_cache.write();
+        for (code, domains) in data {
+            cache.insert(code, domains);
+        }
+        Ok(())
+    }
+
     /// Load a single geosite code lazily
     fn load_geosite_code(&self, code: &str) -> Result<Vec<DomainEntry>> {
         let code_lower = code.to_lowercase();
@@ -519,26 +552,40 @@ impl AutoGeoLoader {
             }
         }
 
-        // Cache miss — ensure reader is ready, then load under write lock
-        self.ensure_geosite_reader()?;
+        let format = self
+            .geosite_format
+            .ok_or_else(|| AclError::GeoSiteError("GeoSite format not configured".to_string()))?;
 
-        let mut cache = self.geosite_cache.write();
+        match format {
+            GeoSiteFormat::Dat => {
+                // DAT format: pre-load all data, then look up
+                self.ensure_dat_geosite_loaded()?;
+                let cache = self.geosite_cache.read();
+                Ok(cache.get(&code_lower).cloned().unwrap_or_default())
+            }
+            GeoSiteFormat::Sing => {
+                // Sing format: lazy load per code
+                self.ensure_geosite_reader()?;
 
-        // Double-check: another thread may have populated the cache
-        if let Some(domains) = cache.get(&code_lower) {
-            return Ok(domains.clone());
+                let mut cache = self.geosite_cache.write();
+
+                // Double-check: another thread may have populated the cache
+                if let Some(domains) = cache.get(&code_lower) {
+                    return Ok(domains.clone());
+                }
+
+                // Load from reader
+                let domains = {
+                    let mut reader_guard = self.geosite_reader.lock();
+                    let reader = reader_guard.as_mut().unwrap();
+                    let items = reader.read(&code_lower)?;
+                    singsite::convert_items_to_entries(items)
+                };
+
+                cache.insert(code_lower, domains.clone());
+                Ok(domains)
+            }
         }
-
-        // Load from reader
-        let domains = {
-            let mut reader_guard = self.geosite_reader.lock();
-            let reader = reader_guard.as_mut().unwrap();
-            let items = reader.read(&code_lower)?;
-            singsite::convert_items_to_entries(items)
-        };
-
-        cache.insert(code_lower, domains.clone());
-        Ok(domains)
     }
 }
 
@@ -730,6 +777,62 @@ mod tests {
         // Load with attribute filter
         let matcher = loader.load_geosite("google@cn").unwrap();
         assert_eq!(matcher.site_name(), "google");
+    }
+
+    #[test]
+    fn test_auto_geoloader_dat_format_geosite() {
+        // BUG: AutoGeoLoader.load_geosite() always fails for DAT format because
+        // load_geosite_code() → ensure_geosite_reader() only supports Sing format.
+        // AutoGeoLoader should support DAT format by pre-loading all data.
+        use prost::Message;
+        use std::io::Write;
+
+        // Create a minimal valid DAT geosite file using protobuf
+        let site_list = crate::geo::dat::geodat::GeoSiteList {
+            entry: vec![crate::geo::dat::geodat::GeoSite {
+                country_code: "GOOGLE".to_string(),
+                domain: vec![crate::geo::dat::geodat::Domain {
+                    r#type: 2, // RootDomain
+                    value: "google.com".to_string(),
+                    attribute: vec![],
+                }],
+                resource_hash: vec![],
+                code: String::new(),
+            }],
+        };
+
+        let dir = std::env::temp_dir().join("acl_engine_test_auto_dat");
+        let _ = fs::create_dir_all(&dir);
+        let dat_path = dir.join("geosite.dat");
+        let mut file = fs::File::create(&dat_path).unwrap();
+        file.write_all(&site_list.encode_to_vec()).unwrap();
+        drop(file);
+
+        // Configure AutoGeoLoader with DAT format
+        let loader = AutoGeoLoader::new()
+            .with_geosite(GeoSiteFormat::Dat)
+            .with_data_dir(&dir);
+
+        // This should succeed, not fail with "Lazy loading only supported for Sing format"
+        let result = loader.load_geosite("google");
+        assert!(
+            result.is_ok(),
+            "AutoGeoLoader with DAT format should load geosite data, got error: {:?}",
+            result.err()
+        );
+
+        let matcher = result.unwrap();
+        assert_eq!(matcher.site_name(), "google");
+
+        // Verify the loaded data works correctly
+        use crate::matcher::HostMatcher;
+        assert!(matcher.matches(&crate::types::HostInfo::from_name("google.com")));
+        assert!(matcher.matches(&crate::types::HostInfo::from_name("www.google.com")));
+        assert!(!matcher.matches(&crate::types::HostInfo::from_name("example.com")));
+
+        // Cleanup
+        let _ = fs::remove_file(&dat_path);
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]

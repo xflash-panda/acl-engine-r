@@ -113,9 +113,7 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
 pub struct Http {
     /// Proxy server address
     addr: String,
-    /// Use HTTPS connection to proxy
-    https: bool,
-    /// Skip TLS certificate verification
+    /// Skip TLS certificate verification (reserved for future HTTPS support)
     insecure: bool,
     /// Basic auth header value (base64 encoded)
     basic_auth: Option<String>,
@@ -177,7 +175,6 @@ impl Http {
 
         Ok(Self {
             addr,
-            https: false,
             insecure,
             basic_auth,
             timeout: DEFAULT_DIALER_TIMEOUT,
@@ -185,14 +182,29 @@ impl Http {
     }
 
     /// Create a new HTTP proxy outbound with direct address.
+    ///
+    /// # Panics
+    /// Panics if `https` is `true` (not yet supported).
+    /// Use [`try_new`](Self::try_new) for a fallible alternative.
     pub fn new(addr: impl Into<String>, https: bool) -> Self {
-        Self {
+        Self::try_new(addr, https).expect("HTTPS proxy not yet supported (use http:// instead)")
+    }
+
+    /// Create a new HTTP proxy outbound with direct address (fallible).
+    ///
+    /// Returns an error if `https` is `true` (not yet supported).
+    pub fn try_new(addr: impl Into<String>, https: bool) -> Result<Self> {
+        if https {
+            return Err(AclError::OutboundError(
+                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            ));
+        }
+        Ok(Self {
             addr: addr.into(),
-            https,
             insecure: false,
             basic_auth: None,
             timeout: DEFAULT_DIALER_TIMEOUT,
-        }
+        })
     }
 
     /// Set basic authentication.
@@ -220,12 +232,6 @@ impl Http {
 
     /// Connect to the proxy server.
     fn dial(&self) -> Result<TcpStream> {
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
-
         let addr: SocketAddr = self
             .addr
             .to_socket_addrs()
@@ -240,18 +246,14 @@ impl Http {
     }
 
     /// Connect to the proxy server asynchronously.
+    /// Uses tokio async DNS to avoid blocking the runtime.
     #[cfg(feature = "async")]
     async fn async_dial(&self) -> Result<TokioTcpStream> {
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
-
-        let addr: SocketAddr = self
-            .addr
-            .to_socket_addrs()
-            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+        let addr: SocketAddr = tokio::net::lookup_host(&self.addr)
+            .await
+            .map_err(|e| {
+                AclError::OutboundError(format!("Failed to resolve proxy address: {}", e))
+            })?
             .next()
             .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 
@@ -662,7 +664,7 @@ mod tests {
     fn test_http_from_url() {
         let http = Http::from_url("http://proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
+
         assert!(http.basic_auth.is_none());
     }
 
@@ -670,7 +672,7 @@ mod tests {
     fn test_http_from_url_with_auth() {
         let http = Http::from_url("http://user:pass@proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
+
         assert!(http.basic_auth.is_some());
     }
 
@@ -689,52 +691,10 @@ mod tests {
     }
 
     #[test]
-    fn test_http_https_should_fail_early() {
-        // BUG #6: Http::new("addr", true) accepts https=true silently at construction,
-        // but dial() always rejects it with "HTTPS proxy not yet supported".
-        // This is a trap: the user creates an Http instance believing it works,
-        // then gets a runtime error on every connection attempt.
-        //
-        // The fix should check https=true in dial() BEFORE attempting TCP connection,
-        // not after establishing a TCP connection to the proxy.
-        //
-        // We test by using a real listening server — if the bug exists, the server
-        // will receive a TCP connection (wasteful) before the error.
-        use std::net::TcpListener;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let got_connection = Arc::new(AtomicBool::new(false));
-        let got_connection_clone = got_connection.clone();
-
-        // Server thread: accept connections
-        let server = std::thread::spawn(move || {
-            listener.set_nonblocking(false).ok();
-            if let Ok((_stream, _addr)) = listener.accept() {
-                got_connection_clone.store(true, Ordering::SeqCst);
-            }
-        });
-
-        let http = Http::new(format!("127.0.0.1:{}", port), true);
-        let mut addr = Addr::new("example.com", 443);
-        let result = Outbound::dial_tcp(&http, &mut addr);
-
-        // Should fail
-        assert!(result.is_err(), "HTTPS proxy should fail");
-
-        // Give server thread a moment to process
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        // BUG: The server should NOT have received a connection.
-        // With the current code, dial() connects TCP first, THEN checks https flag.
-        assert!(
-            !got_connection.load(Ordering::SeqCst),
-            "dial() should reject HTTPS before making TCP connection, but a TCP connection was made"
-        );
-
-        drop(server);
+    #[should_panic(expected = "HTTPS proxy not yet supported")]
+    fn test_http_new_panics_on_https() {
+        // Http::new() with https=true should panic at construction time.
+        let _ = Http::new("127.0.0.1:8080", true);
     }
 
     #[test]
@@ -881,6 +841,26 @@ mod tests {
     }
 
     #[test]
+    fn test_http_new_rejects_https() {
+        // BUG: Http::new("addr", true) silently accepts https=true,
+        // but every dial() call fails at runtime. Should reject at construction.
+        let result = Http::try_new("127.0.0.1:8080", true);
+        assert!(
+            result.is_err(),
+            "Http::try_new with https=true should fail at construction time"
+        );
+    }
+
+    #[test]
+    fn test_http_new_accepts_http() {
+        let result = Http::try_new("127.0.0.1:8080", false);
+        assert!(
+            result.is_ok(),
+            "Http::try_new with https=false should succeed"
+        );
+    }
+
+    #[test]
     fn test_http_from_url_rejects_https() {
         // Bug: from_url("https://...") succeeds at construction time but
         // dial() rejects at runtime with "HTTPS proxy not yet supported".
@@ -931,7 +911,7 @@ mod async_tests {
     async fn test_async_http_from_url() {
         let http = Http::from_url("http://proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
+
     }
 
     #[tokio::test]

@@ -381,12 +381,14 @@ impl Socks5 {
     }
 
     /// Async: Connect to the proxy and perform negotiation.
+    /// Uses tokio async DNS to avoid blocking the runtime.
     #[cfg(feature = "async")]
     async fn async_dial_and_negotiate(&self) -> Result<TokioTcpStream> {
-        let addr: SocketAddr = self
-            .addr
-            .to_socket_addrs()
-            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+        let addr: SocketAddr = tokio::net::lookup_host(&self.addr)
+            .await
+            .map_err(|e| {
+                AclError::OutboundError(format!("Failed to resolve proxy address: {}", e))
+            })?
             .next()
             .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
 

@@ -204,25 +204,45 @@ impl GeoIpMatcher {
 
 impl HostMatcher for GeoIpMatcher {
     fn matches(&self, host: &HostInfo) -> bool {
+        let has_ip = host.ipv4.is_some() || host.ipv6.is_some();
+
+        // If no IPs are available, we cannot determine country membership.
+        // Return false regardless of inverse flag.
+        if !has_ip {
+            return false;
+        }
+
         let any_match = match &self.data {
             GeoIpData::Mmdb(reader) => {
-                let v4 = host.ipv4.is_some_and(|ip| self.matches_mmdb_raw(reader, ip));
-                let v6 = host.ipv6.is_some_and(|ip| self.matches_mmdb_raw(reader, ip));
+                let v4 = host
+                    .ipv4
+                    .is_some_and(|ip| self.matches_mmdb_raw(reader, IpAddr::V4(ip)));
+                let v6 = host
+                    .ipv6
+                    .is_some_and(|ip| self.matches_mmdb_raw(reader, IpAddr::V6(ip)));
                 v4 || v6
             }
             GeoIpData::Dat(sorted) => {
-                let v4 = host.ipv4.is_some_and(|ip| sorted.contains(ip));
-                let v6 = host.ipv6.is_some_and(|ip| sorted.contains(ip));
+                let v4 = host
+                    .ipv4
+                    .is_some_and(|ip| sorted.contains(IpAddr::V4(ip)));
+                let v6 = host
+                    .ipv6
+                    .is_some_and(|ip| sorted.contains(IpAddr::V6(ip)));
                 v4 || v6
             }
         };
-        if self.inverse { !any_match } else { any_match }
+        if self.inverse {
+            !any_match
+        } else {
+            any_match
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
 
@@ -234,12 +254,10 @@ mod tests {
         ];
         let matcher = GeoIpMatcher::from_cidrs("PRIVATE", cidrs);
 
-        let ip1 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let host1 = HostInfo::new("", Some(ip1), None);
+        let host1 = HostInfo::new("", Some(Ipv4Addr::new(192, 168, 1, 1)), None);
         assert!(matcher.matches(&host1));
 
-        let ip2 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        let host2 = HostInfo::new("", Some(ip2), None);
+        let host2 = HostInfo::new("", Some(Ipv4Addr::new(8, 8, 8, 8)), None);
         assert!(!matcher.matches(&host2));
     }
 
@@ -249,12 +267,10 @@ mod tests {
         let mut matcher = GeoIpMatcher::from_cidrs("PRIVATE", cidrs);
         matcher.set_inverse(true);
 
-        let ip1 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let host1 = HostInfo::new("", Some(ip1), None);
+        let host1 = HostInfo::new("", Some(Ipv4Addr::new(192, 168, 1, 1)), None);
         assert!(!matcher.matches(&host1));
 
-        let ip2 = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
-        let host2 = HostInfo::new("", Some(ip2), None);
+        let host2 = HostInfo::new("", Some(Ipv4Addr::new(8, 8, 8, 8)), None);
         assert!(matcher.matches(&host2));
     }
 
@@ -281,8 +297,7 @@ mod tests {
             "169.254.1.1",
         ];
         for ip_str in &cases_match {
-            let ip: IpAddr = ip_str.parse().unwrap();
-            let host = HostInfo::new("", Some(ip), None);
+            let host = HostInfo::from_ip(ip_str.parse::<IpAddr>().unwrap());
             assert!(matcher.matches(&host), "expected match for {}", ip_str);
         }
 
@@ -296,8 +311,7 @@ mod tests {
             "11.0.0.0",
         ];
         for ip_str in &cases_no_match {
-            let ip: IpAddr = ip_str.parse().unwrap();
-            let host = HostInfo::new("", Some(ip), None);
+            let host = HostInfo::from_ip(ip_str.parse::<IpAddr>().unwrap());
             assert!(!matcher.matches(&host), "expected no match for {}", ip_str);
         }
     }
@@ -311,31 +325,25 @@ mod tests {
         ];
         let matcher = GeoIpMatcher::from_cidrs("TEST", cidrs);
 
-        let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let host = HostInfo::new("", Some(ip), None);
+        let host = HostInfo::from_ip("10.0.0.1".parse().unwrap());
         assert!(matcher.matches(&host));
 
-        let ip: IpAddr = "10.1.0.1".parse().unwrap();
-        let host = HostInfo::new("", Some(ip), None);
+        let host = HostInfo::from_ip("10.1.0.1".parse().unwrap());
         assert!(matcher.matches(&host));
 
-        let ip: IpAddr = "11.0.0.1".parse().unwrap();
-        let host = HostInfo::new("", Some(ip), None);
+        let host = HostInfo::from_ip("11.0.0.1".parse().unwrap());
         assert!(!matcher.matches(&host));
     }
 
     #[test]
     fn test_geoip_empty_cidrs() {
         let matcher = GeoIpMatcher::from_cidrs("EMPTY", vec![]);
-        let ip: IpAddr = "1.1.1.1".parse().unwrap();
-        let host = HostInfo::new("", Some(ip), None);
+        let host = HostInfo::from_ip("1.1.1.1".parse().unwrap());
         assert!(!matcher.matches(&host));
     }
 
     #[test]
     fn test_geoip_inverse_dual_stack() {
-        // Bug: inverse + dual-stack should mean "ALL addresses NOT in country"
-        // IPv4 in CIDR + IPv6 not in CIDR → host IS partially in country → inverse should NOT match
         let cidrs = vec!["192.168.0.0/16".parse().unwrap()];
         let mut matcher = GeoIpMatcher::from_cidrs("TEST", cidrs);
         matcher.set_inverse(true);
@@ -343,10 +351,9 @@ mod tests {
         // Host with IPv4 IN the CIDR and IPv6 NOT in the CIDR
         let host = HostInfo::new(
             "",
-            Some("192.168.1.1".parse().unwrap()),
-            Some("2001:db8::1".parse().unwrap()),
+            Some("192.168.1.1".parse::<Ipv4Addr>().unwrap()),
+            Some("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
         );
-        // Should NOT match inverse: IPv4 is in the country
         assert!(
             !matcher.matches(&host),
             "inverse should be false when any IP is in the country"
@@ -355,38 +362,29 @@ mod tests {
         // Host with both IPs NOT in the CIDR
         let host2 = HostInfo::new(
             "",
-            Some("8.8.8.8".parse().unwrap()),
-            Some("2001:db8::1".parse().unwrap()),
+            Some("8.8.8.8".parse::<Ipv4Addr>().unwrap()),
+            Some("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
         );
-        // Should match inverse: neither IP is in the country
         assert!(
             matcher.matches(&host2),
             "inverse should be true when no IP is in the country"
         );
 
-        // Host with both IPs IN the CIDR (only v4 CIDR here, v6 won't match)
-        // but only v4 is in CIDR
-        let host3 = HostInfo::new("", Some("192.168.1.1".parse().unwrap()), None);
-        // Should NOT match inverse: IPv4 is in the country
+        // Only v4 is in CIDR
+        let host3 = HostInfo::new("", Some("192.168.1.1".parse::<Ipv4Addr>().unwrap()), None);
         assert!(!matcher.matches(&host3));
     }
 
     #[test]
     fn test_geoip_country_code_case_insensitive() {
-        // Country code matching should be case-insensitive WITHOUT
-        // allocating a new String via to_uppercase() on every comparison.
-        // After fix: uses eq_ignore_ascii_case instead of to_uppercase().
         let cidrs = vec!["192.168.0.0/16".parse().unwrap()];
 
-        // Constructor stores country_code as uppercase
         let matcher_upper = GeoIpMatcher::from_cidrs("PRIVATE", cidrs.clone());
         let matcher_lower = GeoIpMatcher::from_cidrs("private", cidrs.clone());
         let matcher_mixed = GeoIpMatcher::from_cidrs("Private", cidrs);
 
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let host = HostInfo::new("", Some(ip), None);
+        let host = HostInfo::new("", Some(Ipv4Addr::new(192, 168, 1, 1)), None);
 
-        // All should match regardless of case used at construction
         assert!(matcher_upper.matches(&host));
         assert!(matcher_lower.matches(&host));
         assert!(matcher_mixed.matches(&host));
@@ -400,16 +398,38 @@ mod tests {
         ];
         let matcher = GeoIpMatcher::from_cidrs("V6TEST", cidrs);
 
-        let ip: IpAddr = "2001:db8::1".parse().unwrap();
-        let host = HostInfo::new("", None, Some(ip));
+        let host = HostInfo::new("", None, Some("2001:db8::1".parse::<Ipv6Addr>().unwrap()));
         assert!(matcher.matches(&host));
 
-        let ip: IpAddr = "fd12::1".parse().unwrap();
-        let host = HostInfo::new("", None, Some(ip));
+        let host = HostInfo::new("", None, Some("fd12::1".parse::<Ipv6Addr>().unwrap()));
         assert!(matcher.matches(&host));
 
-        let ip: IpAddr = "2001:db9::1".parse().unwrap();
-        let host = HostInfo::new("", None, Some(ip));
+        let host = HostInfo::new("", None, Some("2001:db9::1".parse::<Ipv6Addr>().unwrap()));
         assert!(!matcher.matches(&host));
+    }
+
+    #[test]
+    fn test_geoip_inverse_no_ips_should_not_match() {
+        // BUG: When inverse=true and host has no resolved IPs (e.g., DNS failed),
+        // any_match=false and !false=true, causing incorrect match.
+        // A host with no IPs should NOT match an inverse GeoIP rule because
+        // we cannot determine its country membership.
+        let cidrs = vec!["192.168.0.0/16".parse().unwrap()];
+        let mut matcher = GeoIpMatcher::from_cidrs("TEST", cidrs);
+        matcher.set_inverse(true);
+
+        // Domain-only host with no IPs (DNS failed or not resolved)
+        let host_no_ips = HostInfo::from_name("example.com");
+        assert!(
+            !matcher.matches(&host_no_ips),
+            "inverse GeoIP should NOT match when no IPs are available"
+        );
+
+        // Also: empty HostInfo with no name and no IPs
+        let host_empty = HostInfo::default();
+        assert!(
+            !matcher.matches(&host_empty),
+            "inverse GeoIP should NOT match empty HostInfo"
+        );
     }
 }

@@ -106,6 +106,10 @@ pub use outbound::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn, Toki
 // Re-export router types
 pub use router::{OutboundEntry, Router, RouterOptions, DEFAULT_CACHE_SIZE};
 
+// Re-export async router types
+#[cfg(feature = "async")]
+pub use router::{AsyncOutboundEntry, AsyncRouter};
+
 #[cfg(test)]
 mod tests {
     use super::*;

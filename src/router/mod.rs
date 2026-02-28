@@ -17,6 +17,11 @@ use crate::outbound::{
 use crate::parser::parse_rules;
 use crate::types::Protocol;
 
+#[cfg(feature = "async")]
+use crate::outbound::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn};
+#[cfg(feature = "async")]
+use async_trait::async_trait;
+
 /// Default LRU cache size
 pub const DEFAULT_CACHE_SIZE: usize = 1024;
 
@@ -149,14 +154,8 @@ impl Router {
     fn match_outbound(&self, addr: &mut Addr, proto: Protocol) -> Arc<dyn Outbound> {
         let host_info = crate::types::HostInfo {
             name: addr.host.to_lowercase(),
-            ipv4: addr
-                .resolve_info
-                .as_ref()
-                .and_then(|i| i.ipv4.map(IpAddr::V4)),
-            ipv6: addr
-                .resolve_info
-                .as_ref()
-                .and_then(|i| i.ipv6.map(IpAddr::V6)),
+            ipv4: addr.resolve_info.as_ref().and_then(|i| i.ipv4),
+            ipv6: addr.resolve_info.as_ref().and_then(|i| i.ipv6),
         };
 
         if let Some(result) = self.rule_set.match_host(&host_info, proto, addr.port) {
@@ -197,6 +196,191 @@ impl Outbound for Router {
     }
 }
 
+/// Named async outbound entry.
+#[cfg(feature = "async")]
+pub struct AsyncOutboundEntry {
+    /// Name of the outbound (used in ACL rules)
+    pub name: String,
+    /// The async outbound implementation
+    pub outbound: Arc<dyn AsyncOutbound>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncOutboundEntry {
+    /// Create a new async outbound entry.
+    pub fn new(name: impl Into<String>, outbound: Arc<dyn AsyncOutbound>) -> Self {
+        Self {
+            name: name.into(),
+            outbound,
+        }
+    }
+}
+
+/// Async router routes connections to different outbounds based on ACL rules.
+///
+/// Like Router, but implements AsyncOutbound with non-blocking DNS resolution
+/// via tokio, suitable for use in async runtimes.
+#[cfg(feature = "async")]
+pub struct AsyncRouter {
+    rule_set: CompiledRuleSet<Arc<dyn AsyncOutbound>>,
+    default_outbound: Arc<dyn AsyncOutbound>,
+}
+
+#[cfg(feature = "async")]
+impl AsyncRouter {
+    /// Create a new async router from ACL rules string.
+    pub fn new(
+        rules: &str,
+        outbounds: Vec<AsyncOutboundEntry>,
+        geo_loader: &dyn GeoLoader,
+        options: RouterOptions,
+    ) -> Result<Self> {
+        let text_rules = parse_rules(rules)?;
+        let ob_map = async_outbounds_to_map(outbounds);
+        let rule_set = compile(&text_rules, &ob_map, options.cache_size, geo_loader)?;
+
+        let default_outbound = ob_map
+            .get("default")
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Direct::new()) as Arc<dyn AsyncOutbound>);
+
+        Ok(Self {
+            rule_set,
+            default_outbound,
+        })
+    }
+
+    /// Create a new async router from an ACL rules file.
+    pub fn from_file(
+        path: impl AsRef<Path>,
+        outbounds: Vec<AsyncOutboundEntry>,
+        geo_loader: &dyn GeoLoader,
+        options: RouterOptions,
+    ) -> Result<Self> {
+        let rules = fs::read_to_string(path.as_ref())
+            .map_err(|e| AclError::ParseError(format!("Failed to read rules file: {}", e)))?;
+        Self::new(&rules, outbounds, geo_loader, options)
+    }
+
+    /// Async resolve the address using tokio DNS.
+    async fn resolve(&self, addr: &mut Addr) {
+        // Check if host is already an IP address
+        if let Ok(ip) = addr.host.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(v4) => {
+                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
+                }
+                IpAddr::V6(v6) => {
+                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
+                }
+            }
+            return;
+        }
+
+        // Resolve using tokio async DNS
+        match tokio::net::lookup_host(format!("{}:0", addr.host)).await {
+            Ok(addrs) => {
+                let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
+                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
+                if ipv4.is_none() && ipv6.is_none() {
+                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
+                } else {
+                    addr.resolve_info = Some(ResolveInfo {
+                        ipv4,
+                        ipv6,
+                        error: None,
+                    });
+                }
+            }
+            Err(e) => {
+                addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
+            }
+        }
+    }
+
+    /// Match the address against ACL rules and return the outbound.
+    fn match_outbound(&self, addr: &mut Addr, proto: Protocol) -> Arc<dyn AsyncOutbound> {
+        let host_info = crate::types::HostInfo {
+            name: addr.host.to_lowercase(),
+            ipv4: addr.resolve_info.as_ref().and_then(|i| i.ipv4),
+            ipv6: addr.resolve_info.as_ref().and_then(|i| i.ipv6),
+        };
+
+        if let Some(result) = self.rule_set.match_host(&host_info, proto, addr.port) {
+            // Handle hijack IP
+            if let Some(hijack_ip) = result.hijack_ip {
+                addr.host = hijack_ip.to_string();
+                match hijack_ip {
+                    IpAddr::V4(v4) => {
+                        addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
+                    }
+                    IpAddr::V6(v6) => {
+                        addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
+                    }
+                }
+            }
+            result.outbound
+        } else {
+            self.default_outbound.clone()
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait]
+impl AsyncOutbound for AsyncRouter {
+    async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
+        if self.rule_set.needs_ip_matching() {
+            self.resolve(addr).await;
+        }
+        let outbound = self.match_outbound(addr, Protocol::TCP);
+        outbound.dial_tcp(addr).await
+    }
+
+    async fn dial_udp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>> {
+        if self.rule_set.needs_ip_matching() {
+            self.resolve(addr).await;
+        }
+        let outbound = self.match_outbound(addr, Protocol::UDP);
+        outbound.dial_udp(addr).await
+    }
+}
+
+/// Convert async outbound entries to a map.
+#[cfg(feature = "async")]
+fn async_outbounds_to_map(
+    outbounds: Vec<AsyncOutboundEntry>,
+) -> HashMap<String, Arc<dyn AsyncOutbound>> {
+    let mut map: HashMap<String, Arc<dyn AsyncOutbound>> =
+        HashMap::with_capacity(outbounds.len() + 3);
+
+    let first_outbound = outbounds.first().map(|e| e.outbound.clone());
+
+    for entry in outbounds {
+        map.insert(entry.name.to_lowercase(), entry.outbound);
+    }
+
+    if !map.contains_key("direct") {
+        map.insert(
+            "direct".to_string(),
+            Arc::new(Direct::with_mode(DirectMode::Auto)),
+        );
+    }
+    if !map.contains_key("reject") {
+        map.insert("reject".to_string(), Arc::new(Reject::new()));
+    }
+
+    if !map.contains_key("default") {
+        if let Some(first) = first_outbound {
+            map.insert("default".to_string(), first);
+        } else {
+            map.insert("default".to_string(), map.get("direct").unwrap().clone());
+        }
+    }
+
+    map
+}
+
 /// Convert outbound entries to a map. Consumes entries to avoid Arc clones.
 fn outbounds_to_map(outbounds: Vec<OutboundEntry>) -> HashMap<String, Arc<dyn Outbound>> {
     let mut map: HashMap<String, Arc<dyn Outbound>> = HashMap::with_capacity(outbounds.len() + 3);
@@ -229,6 +413,101 @@ fn outbounds_to_map(outbounds: Vec<OutboundEntry>) -> HashMap<String, Arc<dyn Ou
     }
 
     map
+}
+
+#[cfg(all(test, feature = "async"))]
+mod async_tests {
+    use super::*;
+    use crate::geo::NilGeoLoader;
+    use crate::outbound::AsyncOutbound;
+
+    #[tokio::test]
+    async fn test_async_router_new() {
+        let rules = r#"
+            direct(*.google.com)
+            reject(10.0.0.0/8)
+            direct(all)
+        "#;
+
+        let outbounds = vec![];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = AsyncRouter::new(rules, outbounds, &geo_loader, options);
+        assert!(router.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_async_router_routes_tcp() {
+        // AsyncRouter should implement AsyncOutbound and route correctly
+        let rules = r#"
+            reject(*.blocked.com)
+            direct(all)
+        "#;
+
+        let outbounds: Vec<AsyncOutboundEntry> = vec![];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = AsyncRouter::new(rules, outbounds, &geo_loader, options).unwrap();
+
+        // dial_tcp to a blocked domain should return reject error
+        let mut addr = crate::outbound::Addr::new("test.blocked.com", 443);
+        let result = AsyncOutbound::dial_tcp(&router, &mut addr).await;
+        assert!(result.is_err(), "blocked domain should be rejected");
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("rejected"),
+                "error should indicate rejection, got: {}",
+                e
+            ),
+            Ok(_) => panic!("Expected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_router_routes_udp() {
+        let rules = r#"
+            reject(*.blocked.com)
+            direct(all)
+        "#;
+
+        let outbounds: Vec<AsyncOutboundEntry> = vec![];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = AsyncRouter::new(rules, outbounds, &geo_loader, options).unwrap();
+
+        let mut addr = crate::outbound::Addr::new("test.blocked.com", 53);
+        let result = AsyncOutbound::dial_udp(&router, &mut addr).await;
+        assert!(result.is_err(), "blocked domain should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_async_router_skips_dns_for_domain_only_rules() {
+        let rules = r#"
+            reject(*.blocked.com)
+            direct(all)
+        "#;
+
+        let outbounds: Vec<AsyncOutboundEntry> = vec![];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+
+        let router = AsyncRouter::new(rules, outbounds, &geo_loader, options).unwrap();
+
+        assert!(
+            !router.rule_set.needs_ip_matching(),
+            "Domain-only rules should not require IP matching"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_router_outbound_entry() {
+        // AsyncOutboundEntry should work like OutboundEntry but with AsyncOutbound
+        let entry = AsyncOutboundEntry::new("proxy", Arc::new(Reject::new()));
+        assert_eq!(entry.name, "proxy");
+    }
 }
 
 #[cfg(test)]

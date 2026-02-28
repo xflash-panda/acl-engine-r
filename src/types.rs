@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Network protocol type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,9 +25,9 @@ pub struct HostInfo {
     /// Hostname (domain name)
     pub name: String,
     /// Resolved IPv4 address
-    pub ipv4: Option<IpAddr>,
+    pub ipv4: Option<Ipv4Addr>,
     /// Resolved IPv6 address
-    pub ipv6: Option<IpAddr>,
+    pub ipv6: Option<Ipv6Addr>,
 }
 
 impl HostInfo {
@@ -41,7 +41,11 @@ impl HostInfo {
     }
 
     /// Create a new HostInfo with name and IPs
-    pub fn new(name: impl Into<String>, ipv4: Option<IpAddr>, ipv6: Option<IpAddr>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> Self {
         Self {
             name: name.into().to_lowercase(),
             ipv4,
@@ -52,15 +56,15 @@ impl HostInfo {
     /// Create a HostInfo from an IP address
     pub fn from_ip(ip: IpAddr) -> Self {
         match ip {
-            IpAddr::V4(_) => Self {
+            IpAddr::V4(v4) => Self {
                 name: String::new(),
-                ipv4: Some(ip),
+                ipv4: Some(v4),
                 ipv6: None,
             },
-            IpAddr::V6(_) => Self {
+            IpAddr::V6(v6) => Self {
                 name: String::new(),
                 ipv4: None,
-                ipv6: Some(ip),
+                ipv6: Some(v6),
             },
         }
     }
@@ -115,6 +119,36 @@ impl CacheKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hostinfo_typed_ip_fields() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // HostInfo.ipv4 should be Option<Ipv4Addr>, not Option<IpAddr>
+        // HostInfo.ipv6 should be Option<Ipv6Addr>, not Option<IpAddr>
+        // This ensures the compiler prevents putting IPv6 into ipv4 or vice versa.
+        let v4 = Ipv4Addr::new(192, 168, 1, 1);
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let host = HostInfo::new("example.com", Some(v4), Some(v6));
+        assert_eq!(host.ipv4, Some(v4));
+        assert_eq!(host.ipv6, Some(v6));
+    }
+
+    #[test]
+    fn test_hostinfo_from_ip_typed() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        let host = HostInfo::from_ip(v4);
+        assert_eq!(host.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(host.ipv6.is_none());
+
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let host = HostInfo::from_ip(v6);
+        assert!(host.ipv4.is_none());
+        assert_eq!(
+            host.ipv6,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+    }
 
     #[test]
     fn test_cache_key_deterministic() {
