@@ -66,7 +66,7 @@ impl Http {
         };
 
         // Parse auth and host
-        let (auth, host_port) = if let Some(at_pos) = rest.find('@') {
+        let (auth, host_port) = if let Some(at_pos) = rest.rfind('@') {
             let auth_part = &rest[..at_pos];
             let host_part = &rest[at_pos + 1..];
             (Some(auth_part), host_part)

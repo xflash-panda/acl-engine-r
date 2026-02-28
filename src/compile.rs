@@ -162,9 +162,10 @@ fn compile_rule<O: Clone>(
     outbounds: &HashMap<String, O>,
     geo_loader: &dyn GeoLoader,
 ) -> Result<CompiledRule<O>> {
-    // Resolve outbound
+    // Resolve outbound (case-insensitive: Router lowercases map keys)
+    let outbound_key = rule.outbound.to_lowercase();
     let outbound = outbounds
-        .get(&rule.outbound)
+        .get(&outbound_key)
         .cloned()
         .ok_or_else(|| AclError::UnknownOutbound(rule.outbound.clone()))?;
 

@@ -191,7 +191,7 @@ impl Socks5 {
         stream.set_write_timeout(Some(SOCKS5_REQUEST_TIMEOUT)).ok();
 
         // Build request
-        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host);
+        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host)?;
         let mut req = vec![SOCKS5_VERSION, cmd, 0x00, atyp];
         req.extend(&dst_addr);
         req.push((addr.port >> 8) as u8);
@@ -282,17 +282,23 @@ impl Socks5 {
     }
 
     /// Convert address to SOCKS5 format.
-    fn addr_to_socks5(&self, host: &str) -> (u8, Vec<u8>) {
+    fn addr_to_socks5(&self, host: &str) -> Result<(u8, Vec<u8>)> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             match ip {
-                IpAddr::V4(v4) => (SOCKS5_ATYP_IPV4, v4.octets().to_vec()),
-                IpAddr::V6(v6) => (SOCKS5_ATYP_IPV6, v6.octets().to_vec()),
+                IpAddr::V4(v4) => Ok((SOCKS5_ATYP_IPV4, v4.octets().to_vec())),
+                IpAddr::V6(v6) => Ok((SOCKS5_ATYP_IPV6, v6.octets().to_vec())),
             }
         } else {
             let domain = host.as_bytes();
+            if domain.len() > 255 {
+                return Err(AclError::OutboundError(format!(
+                    "Domain name too long for SOCKS5: {} bytes (max 255)",
+                    domain.len()
+                )));
+            }
             let mut addr = vec![domain.len() as u8];
             addr.extend(domain);
-            (SOCKS5_ATYP_DOMAIN, addr)
+            Ok((SOCKS5_ATYP_DOMAIN, addr))
         }
     }
 
@@ -414,7 +420,7 @@ impl Socks5 {
         cmd: u8,
         addr: &Addr,
     ) -> Result<(String, u16)> {
-        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host);
+        let (atyp, dst_addr) = self.addr_to_socks5(&addr.host)?;
         let mut req = vec![SOCKS5_VERSION, cmd, 0x00, atyp];
         req.extend(&dst_addr);
         req.push((addr.port >> 8) as u8);
@@ -576,7 +582,7 @@ impl Socks5UdpConn {
         }
     }
 
-    fn addr_to_socks5(&self, addr: &Addr) -> Vec<u8> {
+    fn addr_to_socks5(&self, addr: &Addr) -> Result<Vec<u8>> {
         let mut data = Vec::new();
 
         // RSV (2 bytes) + FRAG (1 byte)
@@ -596,6 +602,12 @@ impl Socks5UdpConn {
             }
         } else {
             let domain = addr.host.as_bytes();
+            if domain.len() > 255 {
+                return Err(AclError::OutboundError(format!(
+                    "Domain name too long for SOCKS5: {} bytes (max 255)",
+                    domain.len()
+                )));
+            }
             data.push(SOCKS5_ATYP_DOMAIN);
             data.push(domain.len() as u8);
             data.extend(domain);
@@ -605,7 +617,7 @@ impl Socks5UdpConn {
         data.push((addr.port >> 8) as u8);
         data.push((addr.port & 0xFF) as u8);
 
-        data
+        Ok(data)
     }
 
     fn parse_socks5_addr(&self, data: &[u8]) -> Result<(Addr, usize)> {
@@ -695,7 +707,7 @@ impl UdpConn for Socks5UdpConn {
     }
 
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let mut packet = self.addr_to_socks5(addr);
+        let mut packet = self.addr_to_socks5(addr)?;
         packet.extend(buf);
 
         self.udp_socket
@@ -726,7 +738,7 @@ impl AsyncSocks5UdpConn {
         }
     }
 
-    fn addr_to_socks5(&self, addr: &Addr) -> Vec<u8> {
+    fn addr_to_socks5(&self, addr: &Addr) -> Result<Vec<u8>> {
         let mut data = Vec::new();
         data.extend(&[0x00, 0x00, 0x00]);
 
@@ -743,6 +755,12 @@ impl AsyncSocks5UdpConn {
             }
         } else {
             let domain = addr.host.as_bytes();
+            if domain.len() > 255 {
+                return Err(AclError::OutboundError(format!(
+                    "Domain name too long for SOCKS5: {} bytes (max 255)",
+                    domain.len()
+                )));
+            }
             data.push(SOCKS5_ATYP_DOMAIN);
             data.push(domain.len() as u8);
             data.extend(domain);
@@ -750,7 +768,7 @@ impl AsyncSocks5UdpConn {
 
         data.push((addr.port >> 8) as u8);
         data.push((addr.port & 0xFF) as u8);
-        data
+        Ok(data)
     }
 
     fn parse_socks5_addr(&self, data: &[u8]) -> Result<(Addr, usize)> {
@@ -842,7 +860,7 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let mut packet = self.addr_to_socks5(addr);
+        let mut packet = self.addr_to_socks5(addr)?;
         packet.extend(buf);
 
         self.udp_socket
@@ -881,7 +899,7 @@ mod tests {
     #[test]
     fn test_addr_to_socks5_ipv4() {
         let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1");
+        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_IPV4);
         assert_eq!(addr, vec![192, 168, 1, 1]);
     }
@@ -889,7 +907,7 @@ mod tests {
     #[test]
     fn test_addr_to_socks5_domain() {
         let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("example.com");
+        let (atyp, addr) = socks5.addr_to_socks5("example.com").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11); // length of "example.com"
         assert_eq!(&addr[1..], b"example.com");
@@ -925,7 +943,7 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_socks5_addr_to_socks5_ipv4() {
         let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1");
+        let (atyp, addr) = socks5.addr_to_socks5("192.168.1.1").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_IPV4);
         assert_eq!(addr, vec![192, 168, 1, 1]);
     }
@@ -933,7 +951,7 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_socks5_addr_to_socks5_domain() {
         let socks5 = Socks5::new("127.0.0.1:1080");
-        let (atyp, addr) = socks5.addr_to_socks5("example.com");
+        let (atyp, addr) = socks5.addr_to_socks5("example.com").unwrap();
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11);
         assert_eq!(&addr[1..], b"example.com");
