@@ -7,7 +7,7 @@
 //! - `Http`: HTTP/HTTPS proxy connection (CONNECT method)
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::error::{AclError, Result};
@@ -277,42 +277,6 @@ pub trait AsyncUdpConn: Send + Sync {
 
     /// Close the connection
     async fn close(&self) -> Result<()>;
-}
-
-/// Standard UdpSocket wrapper implementing UdpConn
-pub struct StdUdpConn {
-    inner: UdpSocket,
-}
-
-impl StdUdpConn {
-    pub fn new(socket: UdpSocket) -> Self {
-        Self { inner: socket }
-    }
-
-    pub fn into_inner(self) -> UdpSocket {
-        self.inner
-    }
-}
-
-impl UdpConn for StdUdpConn {
-    fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
-        let (n, addr) = self
-            .inner
-            .recv_from(buf)
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
-        Ok((n, Addr::from_socket_addr(addr)))
-    }
-
-    fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        self.inner
-            .send_to(buf, addr.to_socket_addr()?)
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
-    }
-
-    fn close(&self) -> Result<()> {
-        // UdpSocket doesn't have explicit close, it closes on drop
-        Ok(())
-    }
 }
 
 /// Tokio TcpStream wrapper implementing AsyncTcpConn

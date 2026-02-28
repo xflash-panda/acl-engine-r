@@ -306,13 +306,17 @@ impl Http {
         })
     }
 
-    /// Create a new HTTP proxy outbound with direct address.
+    /// Create a new HTTP proxy outbound.
     ///
-    /// # Panics
-    /// Panics if `https` is `true` (not yet supported).
-    /// Use [`try_new`](Self::try_new) for a fallible alternative.
-    pub fn new(addr: impl Into<String>, https: bool) -> Self {
-        Self::try_new(addr, https).expect("HTTPS proxy not yet supported (use http:// instead)")
+    /// Only HTTP proxies are supported. For HTTPS proxy support in the future,
+    /// use [`try_new`](Self::try_new) which accepts an `https` flag.
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self {
+            addr: addr.into(),
+            insecure: false,
+            basic_auth: None,
+            timeout: DEFAULT_DIALER_TIMEOUT,
+        }
     }
 
     /// Create a new HTTP proxy outbound with direct address (fallible).
@@ -745,18 +749,19 @@ mod tests {
     }
 
     #[test]
-    fn test_http_udp_not_supported() {
-        let http = Http::new("127.0.0.1:8080", false);
-        let mut addr = Addr::new("example.com", 53);
-        let result = Outbound::dial_udp(&http, &mut addr);
-        assert!(result.is_err());
+    fn test_http_new_creates_http_only() {
+        // Http::new() creates an HTTP-only proxy (no https param needed).
+        let http = Http::new("127.0.0.1:8080");
+        assert_eq!(http.addr, "127.0.0.1:8080");
+        assert!(!http.insecure);
     }
 
     #[test]
-    #[should_panic(expected = "HTTPS proxy not yet supported")]
-    fn test_http_new_panics_on_https() {
-        // Http::new() with https=true should panic at construction time.
-        let _ = Http::new("127.0.0.1:8080", true);
+    fn test_http_udp_not_supported() {
+        let http = Http::new("127.0.0.1:8080");
+        let mut addr = Addr::new("example.com", 53);
+        let result = Outbound::dial_udp(&http, &mut addr);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -799,7 +804,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(5));
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = Outbound::dial_tcp(&http, &mut addr);
 
@@ -839,7 +844,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(5));
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = Outbound::dial_tcp(&http, &mut addr);
 
@@ -883,7 +888,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(5));
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = Outbound::dial_tcp(&http, &mut addr);
 
@@ -903,9 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn test_http_new_rejects_https() {
-        // BUG: Http::new("addr", true) silently accepts https=true,
-        // but every dial() call fails at runtime. Should reject at construction.
+    fn test_http_try_new_rejects_https() {
         let result = Http::try_new("127.0.0.1:8080", true);
         assert!(
             result.is_err(),
@@ -1130,7 +1133,7 @@ mod tests {
         // Bug: Http::dial() uses SocketAddr::parse() which rejects domain names.
         // Using a domain name proxy address should resolve and attempt connection,
         // not fail with "Invalid proxy address".
-        let http = Http::new("localhost:59996", false);
+        let http = Http::new("localhost:59996");
         let mut addr = Addr::new("example.com", 80);
         let result = Outbound::dial_tcp(&http, &mut addr);
         match result {
@@ -1166,7 +1169,7 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_http_udp_not_supported() {
-        let http = Http::new("127.0.0.1:8080", false);
+        let http = Http::new("127.0.0.1:8080");
         let mut addr = Addr::new("example.com", 53);
         let result = AsyncOutbound::dial_udp(&http, &mut addr).await;
         assert!(result.is_err());
@@ -1178,7 +1181,7 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_http_dial_tcp_connection_refused() {
-        let http = Http::new("127.0.0.1:59997", false);
+        let http = Http::new("127.0.0.1:59997");
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
         assert!(result.is_err());
@@ -1187,7 +1190,7 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_http_dial_tcp_domain_name_proxy() {
         // Bug: Http::async_dial() uses SocketAddr::parse() which rejects domain names.
-        let http = Http::new("localhost:59996", false);
+        let http = Http::new("localhost:59996");
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
         match result {
@@ -1220,7 +1223,7 @@ mod async_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
 
@@ -1261,7 +1264,7 @@ mod async_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
 
@@ -1309,7 +1312,7 @@ mod async_tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
 
@@ -1345,7 +1348,7 @@ mod async_tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("evil.com\r\nX-Injected: true", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
 
@@ -1401,7 +1404,7 @@ mod async_tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
 
-        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let http = Http::new(format!("127.0.0.1:{}", port));
         let mut addr = Addr::new("example.com", 80);
 
         // Outer timeout: must be larger than HTTP_REQUEST_TIMEOUT (10s)

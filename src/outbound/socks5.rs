@@ -141,6 +141,22 @@ fn parse_bound_addr(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
     }
 }
 
+/// Compute the fixed byte count needed to read a SOCKS5 bound address for the given atyp.
+/// Returns `None` for domain type (needs a length byte read first).
+/// Returns `Some(Ok(n))` for fixed-size types (IPv4=6, IPv6=18).
+/// Returns `Some(Err(...))` for unknown address types.
+fn bound_addr_fixed_size(atyp: u8) -> Option<Result<usize>> {
+    match atyp {
+        SOCKS5_ATYP_IPV4 => Some(Ok(4 + 2)),
+        SOCKS5_ATYP_IPV6 => Some(Ok(16 + 2)),
+        SOCKS5_ATYP_DOMAIN => None,
+        _ => Some(Err(AclError::OutboundError(format!(
+            "Unknown address type: {}",
+            atyp
+        )))),
+    }
+}
+
 /// Convert address to SOCKS5 format (free function).
 fn addr_to_socks5(host: &str) -> Result<(u8, Vec<u8>)> {
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -193,13 +209,14 @@ impl Socks5 {
     /// # Panics
     /// Panics if username or password exceeds 255 bytes (RFC 1929 limit).
     /// Use [`try_with_auth`](Self::try_with_auth) for a fallible alternative.
+    #[track_caller]
     pub fn with_auth(
         addr: impl Into<String>,
         username: impl Into<String>,
         password: impl Into<String>,
     ) -> Self {
         Self::try_with_auth(addr, username, password)
-            .expect("SOCKS5 credential validation failed")
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Create a new SOCKS5 outbound with authentication, validating credential lengths.
@@ -356,40 +373,24 @@ impl Socks5 {
         validate_socks5_response(resp_header[0], resp_header[1])?;
 
         // Read bound address bytes and parse
-        let max_bound = 1 + 256 + 2; // max: domain len(1) + domain(255) + port(2)
+        let max_bound = 1 + 256 + 2;
         let mut bound_buf = vec![0u8; max_bound];
-        let needed = match resp_header[3] {
-            SOCKS5_ATYP_IPV4 => 4 + 2,
-            SOCKS5_ATYP_IPV6 => 16 + 2,
-            SOCKS5_ATYP_DOMAIN => {
-                // Read domain length byte first
+        let needed = match bound_addr_fixed_size(resp_header[3]) {
+            Some(r) => r?,
+            None => {
                 stream.read_exact(&mut bound_buf[..1]).map_err(|e| {
                     AclError::OutboundError(format!("Failed to read domain length: {}", e))
                 })?;
                 1 + bound_buf[0] as usize + 2
             }
-            atyp => {
-                return Err(AclError::OutboundError(format!(
-                    "Unknown address type: {}",
-                    atyp
-                )));
-            }
         };
 
-        if resp_header[3] == SOCKS5_ATYP_DOMAIN {
-            // Already read 1 byte (domain length), read the rest
-            stream
-                .read_exact(&mut bound_buf[1..needed])
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
-                })?;
-        } else {
-            stream
-                .read_exact(&mut bound_buf[..needed])
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
-                })?;
-        }
+        let start = if bound_addr_fixed_size(resp_header[3]).is_none() { 1 } else { 0 };
+        stream
+            .read_exact(&mut bound_buf[start..needed])
+            .map_err(|e| {
+                AclError::OutboundError(format!("Failed to read bound address: {}", e))
+            })?;
 
         let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
 
@@ -550,38 +551,23 @@ impl Socks5 {
         // Read bound address bytes and parse
         let max_bound = 1 + 256 + 2;
         let mut bound_buf = vec![0u8; max_bound];
-        let needed = match resp_header[3] {
-            SOCKS5_ATYP_IPV4 => 4 + 2,
-            SOCKS5_ATYP_IPV6 => 16 + 2,
-            SOCKS5_ATYP_DOMAIN => {
+        let needed = match bound_addr_fixed_size(resp_header[3]) {
+            Some(r) => r?,
+            None => {
                 stream.read_exact(&mut bound_buf[..1]).await.map_err(|e| {
                     AclError::OutboundError(format!("Failed to read domain length: {}", e))
                 })?;
                 1 + bound_buf[0] as usize + 2
             }
-            atyp => {
-                return Err(AclError::OutboundError(format!(
-                    "Unknown address type: {}",
-                    atyp
-                )));
-            }
         };
 
-        if resp_header[3] == SOCKS5_ATYP_DOMAIN {
-            stream
-                .read_exact(&mut bound_buf[1..needed])
-                .await
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
-                })?;
-        } else {
-            stream
-                .read_exact(&mut bound_buf[..needed])
-                .await
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read bound address: {}", e))
-                })?;
-        }
+        let start = if bound_addr_fixed_size(resp_header[3]).is_none() { 1 } else { 0 };
+        stream
+            .read_exact(&mut bound_buf[start..needed])
+            .await
+            .map_err(|e| {
+                AclError::OutboundError(format!("Failed to read bound address: {}", e))
+            })?;
 
         let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
 
@@ -1316,6 +1302,33 @@ mod tests {
         let data = [0u8; 10]; // need 16+2
         let result = parse_bound_addr(SOCKS5_ATYP_IPV6, &data);
         assert!(result.is_err());
+    }
+
+    // ========== bound_addr_fixed_size tests ==========
+
+    #[test]
+    fn test_bound_addr_fixed_size_ipv4() {
+        // IPv4: 4 addr bytes + 2 port bytes = 6
+        assert_eq!(bound_addr_fixed_size(SOCKS5_ATYP_IPV4).unwrap().unwrap(), 6);
+    }
+
+    #[test]
+    fn test_bound_addr_fixed_size_ipv6() {
+        // IPv6: 16 addr bytes + 2 port bytes = 18
+        assert_eq!(bound_addr_fixed_size(SOCKS5_ATYP_IPV6).unwrap().unwrap(), 18);
+    }
+
+    #[test]
+    fn test_bound_addr_fixed_size_domain() {
+        // Domain: needs length byte first, so returns None
+        assert!(bound_addr_fixed_size(SOCKS5_ATYP_DOMAIN).is_none());
+    }
+
+    #[test]
+    fn test_bound_addr_fixed_size_unknown() {
+        let result = bound_addr_fixed_size(0xFF);
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
     }
 }
 
