@@ -16,6 +16,8 @@ pub enum DomainMatchMode {
 #[derive(Debug, Clone)]
 pub struct DomainMatcher {
     pattern: String,
+    /// Pre-computed ".{pattern}" for suffix matching (avoids format! per call)
+    dot_pattern: String,
     mode: DomainMatchMode,
 }
 
@@ -25,17 +27,21 @@ impl DomainMatcher {
         let pattern = pattern.to_lowercase();
 
         if let Some(suffix) = pattern.strip_prefix("suffix:") {
+            let dot_pattern = format!(".{}", suffix);
             Self {
                 pattern: suffix.to_string(),
+                dot_pattern,
                 mode: DomainMatchMode::Suffix,
             }
         } else if pattern.contains('*') {
             Self {
+                dot_pattern: format!(".{}", pattern),
                 pattern,
                 mode: DomainMatchMode::Wildcard,
             }
         } else {
             Self {
+                dot_pattern: format!(".{}", pattern),
                 pattern,
                 mode: DomainMatchMode::Exact,
             }
@@ -44,8 +50,11 @@ impl DomainMatcher {
 
     /// Create a domain matcher with explicit mode
     pub fn with_mode(pattern: &str, mode: DomainMatchMode) -> Self {
+        let pattern = pattern.to_lowercase();
+        let dot_pattern = format!(".{}", pattern);
         Self {
-            pattern: pattern.to_lowercase(),
+            pattern,
+            dot_pattern,
             mode,
         }
     }
@@ -94,16 +103,14 @@ impl HostMatcher for DomainMatcher {
             return false;
         }
 
-        let name = host.name.to_lowercase();
+        // host.name is already lowercased by HostInfo constructors
+        let name = &host.name;
 
         match self.mode {
-            DomainMatchMode::Exact => name == self.pattern,
-            DomainMatchMode::Wildcard => Self::wildcard_match(&name, &self.pattern),
+            DomainMatchMode::Exact => *name == self.pattern,
+            DomainMatchMode::Wildcard => Self::wildcard_match(name, &self.pattern),
             DomainMatchMode::Suffix => {
-                // Matches if:
-                // 1. name == pattern
-                // 2. name ends with ".pattern"
-                name == self.pattern || name.ends_with(&format!(".{}", self.pattern))
+                *name == self.pattern || name.ends_with(&self.dot_pattern)
             }
         }
     }
@@ -197,5 +204,30 @@ mod tests {
         let m3 = DomainMatcher::new("exact.com");
         assert!(m3.matches(&HostInfo::from_name("exact.com")));
         assert!(!m3.matches(&HostInfo::from_name("www.exact.com")));
+    }
+
+    #[test]
+    fn test_suffix_no_allocation_per_call() {
+        // Suffix matching should work correctly without per-call format! allocation
+        let matcher = DomainMatcher::new("suffix:example.com");
+
+        // Multiple calls should all work (verifies pre-computed suffix)
+        for _ in 0..100 {
+            assert!(matcher.matches(&HostInfo::from_name("example.com")));
+            assert!(matcher.matches(&HostInfo::from_name("www.example.com")));
+            assert!(matcher.matches(&HostInfo::from_name("deep.sub.example.com")));
+            assert!(!matcher.matches(&HostInfo::from_name("notexample.com")));
+        }
+    }
+
+    #[test]
+    fn test_matches_already_lowercase() {
+        // HostInfo already lowercases, verify matcher works without re-lowering
+        let matcher = DomainMatcher::new("EXAMPLE.COM"); // pattern is lowercased in new()
+
+        // HostInfo::from_name lowercases the input
+        assert!(matcher.matches(&HostInfo::from_name("EXAMPLE.COM")));
+        assert!(matcher.matches(&HostInfo::from_name("example.com")));
+        assert!(matcher.matches(&HostInfo::from_name("Example.Com")));
     }
 }
