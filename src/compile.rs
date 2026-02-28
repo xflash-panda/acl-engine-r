@@ -13,8 +13,27 @@ use crate::matcher::{AllMatcher, CidrMatcher, DomainMatcher, HostMatcher, IpMatc
 use crate::parser::parse_proto_port;
 use crate::types::{CacheKey, HostInfo, MatchResult, Protocol, TextRule};
 
-/// Cache value type: outbound and optional hijacked IP
-type CacheValue<O> = Option<(O, Option<IpAddr>)>;
+/// Cache entry storing verification data and the cached result.
+/// CacheKey is a u64 hash, so we store the original query fields here
+/// to detect (extremely rare) hash collisions on cache hit.
+struct CacheEntry<O> {
+    name: String,
+    ipv4: Option<IpAddr>,
+    ipv6: Option<IpAddr>,
+    protocol: Protocol,
+    port: u16,
+    result: Option<(O, Option<IpAddr>)>,
+}
+
+impl<O> CacheEntry<O> {
+    fn matches_query(&self, host: &HostInfo, protocol: Protocol, port: u16) -> bool {
+        self.port == port
+            && self.protocol == protocol
+            && self.ipv4 == host.ipv4
+            && self.ipv6 == host.ipv6
+            && self.name == host.name
+    }
+}
 
 /// A compiled rule ready for matching
 pub struct CompiledRule<O> {
@@ -53,7 +72,7 @@ impl<O> CompiledRule<O> {
 /// Compiled rule set with LRU caching
 pub struct CompiledRuleSet<O: Clone> {
     rules: Vec<CompiledRule<O>>,
-    cache: Mutex<LruCache<CacheKey, CacheValue<O>>>,
+    cache: Mutex<LruCache<CacheKey, CacheEntry<O>>>,
     /// True if any rule uses IP/CIDR/GeoIP matchers that require DNS resolution.
     has_ip_rules: bool,
 }
@@ -93,27 +112,41 @@ impl<O: Clone> CompiledRuleSet<O> {
             host
         };
 
-        let key = CacheKey::from_host(host, proto, port);
+        let key = CacheKey::compute(host, proto, port);
 
-        let mut cache = self.cache.lock();
-
-        // Check cache first
-        if let Some(cached) = cache.get(&key) {
-            return cached.clone().map(|(outbound, hijack_ip)| MatchResult {
-                outbound,
-                hijack_ip,
-            });
+        // Check cache (brief lock). CacheKey is a u64 hash — no String clone.
+        {
+            let mut cache = self.cache.lock();
+            if let Some(entry) = cache.get(&key) {
+                if entry.matches_query(host, proto, port) {
+                    return entry.result.clone().map(|(outbound, hijack_ip)| MatchResult {
+                        outbound,
+                        hijack_ip,
+                    });
+                }
+                // Hash collision (extremely rare) — treat as cache miss
+            }
         }
 
-        // Cache miss — compute result while holding the lock.
-        // This prevents cache stampede (multiple threads computing the same key).
-        // The matching itself is CPU-only (no I/O), so holding the lock is acceptable.
+        // Cache miss — compute without holding the lock so concurrent
+        // queries on different keys are not serialized.
         let result = self.find_match(host, proto, port);
 
-        cache.put(
-            key,
-            result.as_ref().map(|r| (r.outbound.clone(), r.hijack_ip)),
-        );
+        // Store result (brief lock). String is only cloned here on cache miss.
+        {
+            let mut cache = self.cache.lock();
+            cache.put(
+                key,
+                CacheEntry {
+                    name: host.name.clone(),
+                    ipv4: host.ipv4,
+                    ipv6: host.ipv6,
+                    protocol: proto,
+                    port,
+                    result: result.as_ref().map(|r| (r.outbound.clone(), r.hijack_ip)),
+                },
+            );
+        }
 
         result
     }
@@ -495,6 +528,63 @@ proxy(all)
             result.unwrap().outbound, "PROXY",
             "Mixed-case hostname should match suffix rules"
         );
+    }
+
+    #[test]
+    fn test_concurrent_match_host_correctness() {
+        // Verify that concurrent match_host calls on the same rule set
+        // produce correct results. After the lock refactor (release lock
+        // during find_match), this ensures no data races or lost updates.
+        use std::sync::Arc;
+        use std::thread;
+
+        let text = "proxy(*.google.com)\ndirect(10.0.0.0/8)\nblock(all)";
+        let rules = parse_rules(text).unwrap();
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert("proxy".to_string(), "PROXY");
+        outbounds.insert("direct".to_string(), "DIRECT");
+        outbounds.insert("block".to_string(), "BLOCK");
+
+        let compiled = Arc::new(compile(&rules, &outbounds, 64, &NilGeoLoader).unwrap());
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let compiled = compiled.clone();
+                thread::spawn(move || {
+                    for j in 0..100 {
+                        // Alternate between different query types to exercise
+                        // concurrent cache miss paths for different keys
+                        let host = if (i + j) % 3 == 0 {
+                            HostInfo::from_name("www.google.com")
+                        } else if (i + j) % 3 == 1 {
+                            HostInfo::new(
+                                "",
+                                Some("10.1.2.3".parse().unwrap()),
+                                None,
+                            )
+                        } else {
+                            HostInfo::from_name("unknown.example.org")
+                        };
+
+                        let result = compiled.match_host(&host, Protocol::TCP, 443);
+                        let outbound = result.unwrap().outbound;
+
+                        if (i + j) % 3 == 0 {
+                            assert_eq!(outbound, "PROXY");
+                        } else if (i + j) % 3 == 1 {
+                            assert_eq!(outbound, "DIRECT");
+                        } else {
+                            assert_eq!(outbound, "BLOCK");
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

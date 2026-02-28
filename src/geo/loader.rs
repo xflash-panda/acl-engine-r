@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use ipnet::IpNet;
 
@@ -97,7 +97,7 @@ impl FileGeoLoader {
 
     /// Load and cache GeoIP CIDR data (for DAT format)
     fn ensure_geoip_loaded(&self) -> Result<()> {
-        if self.geoip_data.read().unwrap().is_some() {
+        if self.geoip_data.read().is_some() {
             return Ok(());
         }
 
@@ -108,14 +108,14 @@ impl FileGeoLoader {
 
         let data = dat::load_geoip(path)?;
 
-        *self.geoip_data.write().unwrap() = Some(data);
+        *self.geoip_data.write() = Some(data);
         Ok(())
     }
 
     /// Open and cache a shared MMDB/MetaDB reader (for MMDB and MetaDB formats)
     fn ensure_mmdb_reader(&self) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
         {
-            let guard = self.mmdb_reader.read().unwrap();
+            let guard = self.mmdb_reader.read();
             if let Some(ref reader) = *guard {
                 return Ok(reader.clone());
             }
@@ -131,14 +131,14 @@ impl FileGeoLoader {
                 .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
         );
 
-        *self.mmdb_reader.write().unwrap() = Some(reader.clone());
+        *self.mmdb_reader.write() = Some(reader.clone());
         Ok(reader)
     }
 
     /// Load and cache GeoSite data
     fn ensure_geosite_loaded(&self) -> Result<()> {
         // Check if already loaded
-        if self.geosite_data.read().unwrap().is_some() {
+        if self.geosite_data.read().is_some() {
             return Ok(());
         }
 
@@ -153,7 +153,7 @@ impl FileGeoLoader {
 
         let data = load_geosite_file(path, format)?;
 
-        *self.geosite_data.write().unwrap() = Some(data);
+        *self.geosite_data.write() = Some(data);
         Ok(())
     }
 }
@@ -176,7 +176,7 @@ impl GeoLoader for FileGeoLoader {
             GeoIpFormat::Dat => {
                 // DAT: pre-load all CIDRs, lookup by country code
                 self.ensure_geoip_loaded()?;
-                let guard = self.geoip_data.read().unwrap();
+                let guard = self.geoip_data.read();
                 let data = guard.as_ref().unwrap();
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
@@ -193,7 +193,7 @@ impl GeoLoader for FileGeoLoader {
         self.ensure_geosite_loaded()?;
 
         let (name, attrs) = GeoSiteMatcher::parse_pattern(site_name);
-        let guard = self.geosite_data.read().unwrap();
+        let guard = self.geosite_data.read();
         let data = guard.as_ref().unwrap();
 
         let domains = data.get(&name).cloned().unwrap_or_default();
@@ -438,20 +438,20 @@ impl AutoGeoLoader {
 
     /// Load GeoIP CIDR data with auto-download (for DAT format)
     fn ensure_geoip_loaded(&self) -> Result<()> {
-        if self.geoip_data.read().unwrap().is_some() {
+        if self.geoip_data.read().is_some() {
             return Ok(());
         }
 
         let path = self.ensure_geoip_downloaded()?;
         let data = dat::load_geoip(&path)?;
-        *self.geoip_data.write().unwrap() = Some(data);
+        *self.geoip_data.write() = Some(data);
         Ok(())
     }
 
     /// Open and cache a shared MMDB/MetaDB reader with auto-download
     fn ensure_mmdb_reader(&self) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
         {
-            let guard = self.mmdb_reader.read().unwrap();
+            let guard = self.mmdb_reader.read();
             if let Some(ref reader) = *guard {
                 return Ok(reader.clone());
             }
@@ -463,7 +463,7 @@ impl AutoGeoLoader {
                 .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
         );
 
-        *self.mmdb_reader.write().unwrap() = Some(reader.clone());
+        *self.mmdb_reader.write() = Some(reader.clone());
         Ok(reader)
     }
 
@@ -513,7 +513,7 @@ impl AutoGeoLoader {
 
         // Try read lock first (fast path)
         {
-            let cache = self.geosite_cache.read().unwrap();
+            let cache = self.geosite_cache.read();
             if let Some(domains) = cache.get(&code_lower) {
                 return Ok(domains.clone());
             }
@@ -522,7 +522,7 @@ impl AutoGeoLoader {
         // Cache miss — ensure reader is ready, then load under write lock
         self.ensure_geosite_reader()?;
 
-        let mut cache = self.geosite_cache.write().unwrap();
+        let mut cache = self.geosite_cache.write();
 
         // Double-check: another thread may have populated the cache
         if let Some(domains) = cache.get(&code_lower) {
@@ -559,7 +559,7 @@ impl GeoLoader for AutoGeoLoader {
         match format {
             GeoIpFormat::Dat => {
                 self.ensure_geoip_loaded()?;
-                let guard = self.geoip_data.read().unwrap();
+                let guard = self.geoip_data.read();
                 let data = guard.as_ref().unwrap();
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))

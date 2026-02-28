@@ -36,6 +36,9 @@ const SOCKS5_REP_SUCCESS: u8 = 0x00;
 const SOCKS5_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKS5_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum SOCKS5 UDP header overhead: 2 RSV + 1 FRAG + 1 ATYP + 256 addr + 2 port.
+const SOCKS5_UDP_HEADER_MAX: usize = 262;
+
 /// SOCKS5 proxy outbound.
 ///
 /// Since SOCKS5 supports using either IP or domain name as the target address,
@@ -413,15 +416,18 @@ impl Socks5 {
                 auth_req.push(password.len() as u8);
                 auth_req.extend(password.as_bytes());
 
-                stream
-                    .write_all(&auth_req)
+                tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.write_all(&auth_req))
                     .await
+                    .map_err(|_| AclError::OutboundError("Auth send timeout".to_string()))?
                     .map_err(|e| AclError::OutboundError(format!("Failed to send auth: {}", e)))?;
 
                 let mut auth_resp = [0u8; 2];
-                stream.read_exact(&mut auth_resp).await.map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read auth response: {}", e))
-                })?;
+                tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.read_exact(&mut auth_resp))
+                    .await
+                    .map_err(|_| AclError::OutboundError("Auth response timeout".to_string()))?
+                    .map_err(|e| {
+                        AclError::OutboundError(format!("Failed to read auth response: {}", e))
+                    })?;
 
                 if auth_resp[1] != 0x00 {
                     return Err(AclError::OutboundError(
@@ -725,7 +731,8 @@ impl Socks5UdpConn {
 
 impl UdpConn for Socks5UdpConn {
     fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
-        let mut recv_buf = vec![0u8; 65536];
+        let recv_buf_size = buf.len().saturating_add(SOCKS5_UDP_HEADER_MAX).min(65536);
+        let mut recv_buf = vec![0u8; recv_buf_size];
         let n = self
             .udp_socket
             .recv(&mut recv_buf)
@@ -877,7 +884,8 @@ impl AsyncSocks5UdpConn {
 #[async_trait]
 impl AsyncUdpConn for AsyncSocks5UdpConn {
     async fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
-        let mut recv_buf = vec![0u8; 65536];
+        let recv_buf_size = buf.len().saturating_add(SOCKS5_UDP_HEADER_MAX).min(65536);
+        let mut recv_buf = vec![0u8; recv_buf_size];
         let n = self
             .udp_socket
             .recv(&mut recv_buf)
@@ -1066,6 +1074,56 @@ mod async_tests {
         assert_eq!(atyp, SOCKS5_ATYP_DOMAIN);
         assert_eq!(addr[0], 11);
         assert_eq!(&addr[1..], b"example.com");
+    }
+
+    #[tokio::test]
+    async fn test_async_socks5_auth_exchange_timeout() {
+        // Bug: async_dial_and_negotiate wraps initial negotiation with timeout
+        // but the auth exchange (write_all + read_exact for credentials) has
+        // no timeout. A malicious server can hang after receiving credentials.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // Read negotiation request
+            let mut buf = [0u8; 16];
+            let _ = stream.read(&mut buf).await;
+            // Reply: require username/password auth
+            stream.write_all(&[0x05, 0x02]).await.unwrap();
+            // Read auth request from client
+            let mut auth_buf = [0u8; 512];
+            let _ = stream.read(&mut auth_buf).await;
+            // Hang: never send auth response
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let socks5 = Socks5::with_auth(format!("127.0.0.1:{}", port), "user", "pass")
+            .with_timeout(Duration::from_secs(5));
+
+        // The auth exchange should timeout, not hang forever.
+        // We use an outer timeout larger than SOCKS5_NEGOTIATION_TIMEOUT to detect
+        // if the internal timeout is working.
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            socks5.async_dial_and_negotiate(),
+        )
+        .await;
+
+        // After fix: internal timeout fires first, result is Ok(Err(AclError))
+        // Before fix: outer timeout fires, result is Err(Elapsed)
+        assert!(
+            result.is_ok(),
+            "async_dial_and_negotiate should not hang forever - auth exchange needs timeout"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "auth exchange should fail with timeout error"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

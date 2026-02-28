@@ -91,40 +91,16 @@ pub struct MatchResult<O> {
 }
 
 /// Cache key for LRU cache.
-/// Stores full key data to avoid hash collision bugs, while using a precomputed
-/// hash for the `Hash` trait to keep HashMap/LRU lookups fast.
-#[derive(Debug, Clone)]
-pub(crate) struct CacheKey {
-    hash: u64,
-    name: String,
-    ipv4: Option<IpAddr>,
-    ipv6: Option<IpAddr>,
-    protocol: Protocol,
-    port: u16,
-}
-
-impl PartialEq for CacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.hash == other.hash
-            && self.port == other.port
-            && self.protocol == other.protocol
-            && self.ipv4 == other.ipv4
-            && self.ipv6 == other.ipv6
-            && self.name == other.name
-    }
-}
-
-impl Eq for CacheKey {}
-
-impl std::hash::Hash for CacheKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.hash.hash(state);
-    }
-}
+/// Lightweight u64 hash — does NOT clone the hostname string on construction.
+/// Hash collision safety is handled by storing verification data in the cache
+/// entry (see `CacheEntry` in compile.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey(u64);
 
 impl CacheKey {
-    /// Create cache key from host info. Clones the hostname string.
-    pub fn from_host(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
+    /// Compute a cache key hash from host info, protocol, and port.
+    /// Zero-allocation: does not clone the hostname string.
+    pub fn compute(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         host.name.hash(&mut hasher);
@@ -132,14 +108,7 @@ impl CacheKey {
         host.ipv6.hash(&mut hasher);
         protocol.hash(&mut hasher);
         port.hash(&mut hasher);
-        Self {
-            hash: hasher.finish(),
-            name: host.name.clone(),
-            ipv4: host.ipv4,
-            ipv6: host.ipv6,
-            protocol,
-            port,
-        }
+        Self(hasher.finish())
     }
 }
 
@@ -150,8 +119,8 @@ mod tests {
     #[test]
     fn test_cache_key_deterministic() {
         let host = HostInfo::from_name("example.com");
-        let key1 = CacheKey::from_host(&host, Protocol::TCP, 443);
-        let key2 = CacheKey::from_host(&host, Protocol::TCP, 443);
+        let key1 = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key2 = CacheKey::compute(&host, Protocol::TCP, 443);
         assert_eq!(key1, key2);
     }
 
@@ -160,18 +129,18 @@ mod tests {
         let host = HostInfo::from_name("example.com");
 
         // Different protocol
-        let key_tcp = CacheKey::from_host(&host, Protocol::TCP, 443);
-        let key_udp = CacheKey::from_host(&host, Protocol::UDP, 443);
+        let key_tcp = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_udp = CacheKey::compute(&host, Protocol::UDP, 443);
         assert_ne!(key_tcp, key_udp);
 
         // Different port
-        let key_443 = CacheKey::from_host(&host, Protocol::TCP, 443);
-        let key_80 = CacheKey::from_host(&host, Protocol::TCP, 80);
+        let key_443 = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_80 = CacheKey::compute(&host, Protocol::TCP, 80);
         assert_ne!(key_443, key_80);
 
         // Different host
         let host2 = HostInfo::from_name("other.com");
-        let key_other = CacheKey::from_host(&host2, Protocol::TCP, 443);
+        let key_other = CacheKey::compute(&host2, Protocol::TCP, 443);
         assert_ne!(key_tcp, key_other);
     }
 
@@ -184,35 +153,31 @@ mod tests {
             None,
         );
 
-        let key1 = CacheKey::from_host(&host_no_ip, Protocol::TCP, 443);
-        let key2 = CacheKey::from_host(&host_with_ip, Protocol::TCP, 443);
+        let key1 = CacheKey::compute(&host_no_ip, Protocol::TCP, 443);
+        let key2 = CacheKey::compute(&host_with_ip, Protocol::TCP, 443);
         assert_ne!(key1, key2);
     }
 
     #[test]
-    fn test_cache_key_equality_uses_full_data() {
-        // CacheKey equality must compare full key data, not just hash.
-        // Two different hosts must produce non-equal keys even if their
-        // hashes happened to collide.
-        //
-        // We can't easily force a hash collision, but we can verify the
-        // structural requirement: CacheKey must store enough information
-        // so that Eq compares the original inputs, not just a hash digest.
-        // This means CacheKey should NOT be a simple u64 wrapper.
+    fn test_cache_key_is_lightweight_hash() {
+        // CacheKey should be a lightweight u64 hash, NOT a full copy of
+        // HostInfo fields. This avoids cloning the hostname String on
+        // every cache lookup. Hash collision safety is handled by storing
+        // verification data in the cache entry (see compile.rs CacheEntry).
         let key_size = std::mem::size_of::<CacheKey>();
-        assert!(
-            key_size > std::mem::size_of::<u64>(),
-            "CacheKey must store more than just a u64 hash to prevent collision bugs (size={})",
+        assert_eq!(
+            key_size,
+            std::mem::size_of::<u64>(),
+            "CacheKey should be a u64 hash to avoid String clone on lookup (actual size={})",
             key_size
         );
     }
 
     #[test]
-    fn test_cache_key_is_clone() {
-        // Verify CacheKey is Clone
+    fn test_cache_key_is_copy() {
         let host = HostInfo::from_name("example.com");
-        let key = CacheKey::from_host(&host, Protocol::TCP, 443);
-        let key_clone = key.clone();
-        assert_eq!(key, key_clone);
+        let key = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_copy = key; // Copy, not move
+        assert_eq!(key, key_copy);
     }
 }

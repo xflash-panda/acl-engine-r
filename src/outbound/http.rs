@@ -24,6 +24,84 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum number of response headers to read before aborting.
 /// Prevents memory exhaustion from malicious proxies sending infinite headers.
 const MAX_RESPONSE_HEADERS: usize = 100;
+/// Maximum length of a single HTTP response line (status line or header).
+/// Prevents OOM from malicious proxies sending data without newlines.
+const MAX_LINE_LENGTH: usize = 8 * 1024; // 8KB
+
+/// Read a line from a BufRead reader with a maximum length limit.
+/// Returns an error if the line exceeds `max_len` bytes before a newline is found.
+fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usize) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            // EOF
+            return Ok(total);
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            let to_consume = newline_pos + 1;
+            let chunk = &available[..to_consume];
+            let s = std::str::from_utf8(chunk)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            buf.push_str(s);
+            total += to_consume;
+            reader.consume(to_consume);
+            return Ok(total);
+        }
+        // No newline in buffer — check length limit
+        let chunk_len = available.len();
+        if total + chunk_len > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line too long (>{} bytes)", max_len),
+            ));
+        }
+        let s = std::str::from_utf8(available)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        total += chunk_len;
+        reader.consume(chunk_len);
+    }
+}
+
+/// Async version of read_line_limited.
+#[cfg(feature = "async")]
+async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            let to_consume = newline_pos + 1;
+            let chunk = &available[..to_consume];
+            let s = std::str::from_utf8(chunk)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            buf.push_str(s);
+            total += to_consume;
+            reader.consume(to_consume);
+            return Ok(total);
+        }
+        let chunk_len = available.len();
+        if total + chunk_len > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line too long (>{} bytes)", max_len),
+            ));
+        }
+        let s = std::str::from_utf8(available)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        total += chunk_len;
+        reader.consume(chunk_len);
+    }
+}
 
 /// HTTP/HTTPS proxy outbound.
 ///
@@ -216,8 +294,7 @@ impl Outbound for Http {
         // Read response
         let mut reader = BufReader::new(&stream);
         let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
+        read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH)
             .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
 
         // Parse status code
@@ -245,8 +322,7 @@ impl Outbound for Http {
         let mut header_count = 0;
         loop {
             let mut line = String::new();
-            reader
-                .read_line(&mut line)
+            read_line_limited(&mut reader, &mut line, MAX_LINE_LENGTH)
                 .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
             if line.trim().is_empty() {
                 break;
@@ -320,10 +396,13 @@ impl AsyncOutbound for Http {
         .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
 
         let mut status_line = String::new();
-        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.read_line(&mut status_line))
-            .await
-            .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+        tokio::time::timeout(
+            HTTP_REQUEST_TIMEOUT,
+            async_read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH),
+        )
+        .await
+        .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
+        .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
 
         let parts: Vec<&str> = status_line.split_whitespace().collect();
         if parts.len() < 2 {
@@ -349,8 +428,7 @@ impl AsyncOutbound for Http {
             let mut header_count = 0;
             loop {
                 let mut line = String::new();
-                reader
-                    .read_line(&mut line)
+                async_read_line_limited(&mut reader, &mut line, MAX_LINE_LENGTH)
                     .await
                     .map_err(|e| {
                         AclError::OutboundError(format!("Failed to read headers: {}", e))
@@ -671,6 +749,89 @@ mod tests {
     }
 
     #[test]
+    fn test_http_sync_oversized_status_line() {
+        // A malicious proxy sends a status line without \n, causing
+        // read_line to buffer indefinitely. Should reject lines > MAX_LINE_LENGTH.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send 16KB of data without newline (exceeds 8KB limit)
+            let data = vec![b'A'; 16 * 1024];
+            let _ = stream.write_all(&data);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized status line"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
+    fn test_http_sync_oversized_header_line() {
+        // A malicious proxy sends a valid status line, then a header line > MAX_LINE_LENGTH.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .unwrap();
+            // Send header line > 8KB without newline
+            let header_start = b"X-Evil: ";
+            stream.write_all(header_start).unwrap();
+            let data = vec![b'B'; 16 * 1024];
+            let _ = stream.write_all(&data);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized header line"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
     fn test_http_dial_tcp_domain_name_proxy() {
         // Bug: Http::dial() uses SocketAddr::parse() which rejects domain names.
         // Using a domain name proxy address should resolve and attempt connection,
@@ -746,6 +907,83 @@ mod async_tests {
             }
             Ok(_) => panic!("Expected connection error for non-listening port"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_async_http_oversized_status_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send 16KB of data without newline
+            let data = vec![b'A'; 16 * 1024];
+            let _ = stream.write_all(&data).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized status line"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_http_oversized_header_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Send header line > 8KB without newline
+            let mut header = b"X-Evil: ".to_vec();
+            header.extend(vec![b'B'; 16 * 1024]);
+            let _ = stream.write_all(&header).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port), false);
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized header line"),
+        }
+
+        server.abort();
     }
 
     #[tokio::test]

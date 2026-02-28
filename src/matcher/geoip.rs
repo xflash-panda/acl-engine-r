@@ -155,6 +155,8 @@ impl GeoIpMatcher {
 
     /// Check if an IP matches using MMDB (raw match, without inverse).
     /// Supports multiple record formats: MaxMind, sing-geoip, and Meta-geoip0.
+    /// Performs a single B-tree lookup and tries different decode formats on
+    /// the same result to avoid redundant traversals.
     fn matches_mmdb_raw(&self, reader: &maxminddb::Reader<Vec<u8>>, ip: IpAddr) -> bool {
         #[derive(Deserialize)]
         struct Country {
@@ -166,37 +168,34 @@ impl GeoIpMatcher {
             iso_code: Option<String>,
         }
 
+        let lookup = match reader.lookup(ip) {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+
         // Try MaxMind format: { country: { iso_code: "CN" } }
-        if let Some(code) = reader
-            .lookup(ip)
+        if let Some(code) = lookup
+            .decode::<Country>()
             .ok()
-            .and_then(|r| r.decode::<Country>().ok()?)
+            .flatten()
             .and_then(|r| r.country)
             .and_then(|c| c.iso_code)
         {
-            return code.to_uppercase() == self.country_code;
+            return code.eq_ignore_ascii_case(&self.country_code);
         }
 
         // Try sing-geoip format: plain string "CN"
-        if let Some(code) = reader
-            .lookup(ip)
-            .ok()
-            .and_then(|r| r.decode::<String>().ok()?)
-        {
+        if let Some(code) = lookup.decode::<String>().ok().flatten() {
             if !code.is_empty() {
-                return code.to_uppercase() == self.country_code;
+                return code.eq_ignore_ascii_case(&self.country_code);
             }
         }
 
         // Try Meta-geoip0 format: array of strings ["CN"]
-        if let Some(codes) = reader
-            .lookup(ip)
-            .ok()
-            .and_then(|r| r.decode::<Vec<String>>().ok()?)
-        {
+        if let Some(codes) = lookup.decode::<Vec<String>>().ok().flatten() {
             return codes
                 .iter()
-                .any(|c| c.to_uppercase() == self.country_code);
+                .any(|c| c.eq_ignore_ascii_case(&self.country_code));
         }
 
         false
@@ -370,6 +369,27 @@ mod tests {
         let host3 = HostInfo::new("", Some("192.168.1.1".parse().unwrap()), None);
         // Should NOT match inverse: IPv4 is in the country
         assert!(!matcher.matches(&host3));
+    }
+
+    #[test]
+    fn test_geoip_country_code_case_insensitive() {
+        // Country code matching should be case-insensitive WITHOUT
+        // allocating a new String via to_uppercase() on every comparison.
+        // After fix: uses eq_ignore_ascii_case instead of to_uppercase().
+        let cidrs = vec!["192.168.0.0/16".parse().unwrap()];
+
+        // Constructor stores country_code as uppercase
+        let matcher_upper = GeoIpMatcher::from_cidrs("PRIVATE", cidrs.clone());
+        let matcher_lower = GeoIpMatcher::from_cidrs("private", cidrs.clone());
+        let matcher_mixed = GeoIpMatcher::from_cidrs("Private", cidrs);
+
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let host = HostInfo::new("", Some(ip), None);
+
+        // All should match regardless of case used at construction
+        assert!(matcher_upper.matches(&host));
+        assert!(matcher_lower.matches(&host));
+        assert!(matcher_mixed.matches(&host));
     }
 
     #[test]
