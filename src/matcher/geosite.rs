@@ -165,11 +165,38 @@ impl GeoSiteMatcher {
     pub fn with_attributes(mut self, attrs: HashMap<String, Option<String>>) -> Self {
         self.required_attributes = attrs;
 
-        // When attributes are required, we need to fall back to linear scanning
-        // because the Succinct Trie doesn't track attributes
         if !self.required_attributes.is_empty() {
-            self.succinct = None;
-            self.fallback_domains = self.all_domains.clone();
+            // Pre-filter: only keep domains that have the required attributes
+            let mut exact_domains: Vec<String> = Vec::new();
+            let mut suffix_domains: Vec<String> = Vec::new();
+            let mut fallback: Vec<DomainEntry> = Vec::new();
+
+            for entry in &self.all_domains {
+                if !entry.has_attributes(&self.required_attributes) {
+                    continue;
+                }
+
+                match &entry.domain_type {
+                    DomainType::Full(domain) => {
+                        exact_domains.push(domain.clone());
+                    }
+                    DomainType::RootDomain(domain) => {
+                        suffix_domains.push(domain.clone());
+                    }
+                    DomainType::Plain(_) | DomainType::Regex(_) => {
+                        fallback.push(entry.clone());
+                    }
+                }
+            }
+
+            // Rebuild succinct matcher with filtered domains
+            self.succinct = if exact_domains.is_empty() && suffix_domains.is_empty() {
+                None
+            } else {
+                Some(SuccinctMatcher::new(&exact_domains, &suffix_domains))
+            };
+
+            self.fallback_domains = fallback;
         }
 
         self
@@ -196,15 +223,8 @@ impl HostMatcher for GeoSiteMatcher {
             }
         }
 
-        // Slow path: linear scan for Plain/Regex types (or when attributes are required)
+        // Slow path: linear scan for Plain/Regex types
         for entry in &self.fallback_domains {
-            // Check attributes first (if required)
-            if !self.required_attributes.is_empty()
-                && !entry.has_attributes(&self.required_attributes)
-            {
-                continue;
-            }
-
             if entry.matches(name) {
                 return true;
             }
@@ -323,5 +343,56 @@ mod tests {
     fn test_geosite_empty() {
         let matcher = GeoSiteMatcher::new("empty", vec![]);
         assert!(!matcher.matches(&HostInfo::from_name("google.com")));
+    }
+
+    #[test]
+    fn test_geosite_attribute_filtering_only_matching() {
+        // Create domains where only some have the "cn" attribute
+        let domains = vec![
+            DomainEntry::new_root_domain("google.com").with_attribute("cn", ""),
+            DomainEntry::new_root_domain("google.co.jp"), // no cn attribute
+            DomainEntry::new_full("special.google.com").with_attribute("cn", ""),
+            DomainEntry::new_plain("facebook").with_attribute("cn", ""),
+            DomainEntry::new_root_domain("youtube.com"), // no cn attribute
+        ];
+
+        let mut attrs = HashMap::new();
+        attrs.insert("cn".to_string(), None);
+
+        let matcher = GeoSiteMatcher::new("test", domains).with_attributes(attrs);
+
+        // Should match: has @cn attribute
+        assert!(matcher.matches(&HostInfo::from_name("google.com")));
+        assert!(matcher.matches(&HostInfo::from_name("www.google.com")));
+        assert!(matcher.matches(&HostInfo::from_name("special.google.com")));
+        assert!(matcher.matches(&HostInfo::from_name("facebook.com")));
+
+        // Should NOT match: no @cn attribute
+        assert!(!matcher.matches(&HostInfo::from_name("google.co.jp")));
+        assert!(!matcher.matches(&HostInfo::from_name("youtube.com")));
+        assert!(!matcher.matches(&HostInfo::from_name("www.youtube.com")));
+    }
+
+    #[test]
+    fn test_geosite_no_attributes_uses_succinct() {
+        // Without attributes, Full/RootDomain should use the fast succinct path
+        let domains = vec![
+            DomainEntry::new_root_domain("google.com"),
+            DomainEntry::new_full("exact.example.com"),
+            DomainEntry::new_plain("facebook"),
+        ];
+
+        let matcher = GeoSiteMatcher::new("test", domains);
+
+        // Succinct path (RootDomain)
+        assert!(matcher.matches(&HostInfo::from_name("google.com")));
+        assert!(matcher.matches(&HostInfo::from_name("www.google.com")));
+
+        // Succinct path (Full)
+        assert!(matcher.matches(&HostInfo::from_name("exact.example.com")));
+        assert!(!matcher.matches(&HostInfo::from_name("other.example.com")));
+
+        // Fallback path (Plain)
+        assert!(matcher.matches(&HostInfo::from_name("facebook.com")));
     }
 }
