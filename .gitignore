@@ -30,11 +30,11 @@ Cargo.lock
 coverage.txt
 coverage.html
 
-# Geo data files
-*.dat
-*.mmdb
-*.metadb
-geosite.db
+# Geo data files (root only, preserve testdata/)
+/*.dat
+/*.mmdb
+/*.metadb
+/geosite.db
 
 # Dependencies
 vendor/
