@@ -809,9 +809,6 @@ impl UdpConn for Socks5UdpConn {
         Ok(buf.len())
     }
 
-    fn close(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Async SOCKS5 UDP connection wrapper.
@@ -863,9 +860,6 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
         Ok(buf.len())
     }
 
-    async fn close(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

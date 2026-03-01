@@ -323,9 +323,6 @@ pub trait UdpConn: Send + Sync {
 
     /// Write to the UDP connection
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
-
-    /// Close the connection
-    fn close(&self) -> Result<()>;
 }
 
 /// Async UDP connection interface.
@@ -337,9 +334,6 @@ pub trait AsyncUdpConn: Send + Sync {
 
     /// Write to the UDP connection
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
-
-    /// Close the connection
-    async fn close(&self) -> Result<()>;
 }
 
 /// Tokio TcpStream wrapper implementing AsyncTcpConn
@@ -448,9 +442,6 @@ impl AsyncUdpConn for TokioUdpConn {
             })
     }
 
-    async fn close(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Try to resolve the address from an IP literal.

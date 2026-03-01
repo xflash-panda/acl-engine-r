@@ -714,9 +714,6 @@ impl UdpConn for DirectUdpConn {
             })
     }
 
-    fn close(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Async direct UDP connection with mode-aware address selection.
@@ -759,9 +756,6 @@ impl AsyncUdpConn for AsyncDirectUdpConn {
             })
     }
 
-    async fn close(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
