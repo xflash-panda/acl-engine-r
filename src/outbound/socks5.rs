@@ -238,16 +238,6 @@ impl Socks5 {
         })
     }
 
-    /// Deprecated: Use [`with_auth`](Self::with_auth) instead (same signature now).
-    #[deprecated(since = "0.3.3", note = "Use with_auth() instead, which now returns Result")]
-    pub fn try_with_auth(
-        addr: impl Into<String>,
-        username: impl Into<String>,
-        password: impl Into<String>,
-    ) -> Result<Self> {
-        Self::with_auth(addr, username, password)
-    }
-
     /// Set connection timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -900,7 +890,7 @@ mod tests {
     #[test]
     fn test_socks5_auth_username_too_long() {
         let long_user = "a".repeat(256);
-        let result = Socks5::try_with_auth("127.0.0.1:1080", &long_user, "pass");
+        let result = Socks5::with_auth("127.0.0.1:1080", &long_user, "pass");
         assert!(result.is_err(), "username >255 bytes should be rejected");
         match result {
             Err(e) => assert!(
@@ -915,7 +905,7 @@ mod tests {
     #[test]
     fn test_socks5_auth_password_too_long() {
         let long_pass = "b".repeat(256);
-        let result = Socks5::try_with_auth("127.0.0.1:1080", "user", &long_pass);
+        let result = Socks5::with_auth("127.0.0.1:1080", "user", &long_pass);
         assert!(result.is_err(), "password >255 bytes should be rejected");
     }
 
@@ -923,7 +913,7 @@ mod tests {
     fn test_socks5_auth_max_length_ok() {
         let max_user = "a".repeat(255);
         let max_pass = "b".repeat(255);
-        let result = Socks5::try_with_auth("127.0.0.1:1080", &max_user, &max_pass);
+        let result = Socks5::with_auth("127.0.0.1:1080", &max_user, &max_pass);
         assert!(result.is_ok(), "255-byte credentials should be accepted");
     }
 

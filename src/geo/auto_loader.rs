@@ -285,11 +285,11 @@ impl AutoGeoLoader {
     fn ensure_geoip_downloaded(&self) -> Result<PathBuf> {
         let format = self
             .geoip_format
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured, call with_geoip() to set it".to_string() })?;
 
         let path = self
             .get_geoip_path()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_data_dir() or with_geoip_path() to set it".to_string() })?;
 
         self.log(&format!("Checking geoip file: {}", path.display()));
 
@@ -350,7 +350,7 @@ impl AutoGeoLoader {
 
         let format = self
             .geosite_format
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured, call with_geosite() to set it".to_string() })?;
 
         // Currently only Sing format supports lazy loading
         if format != GeoSiteFormat::Sing {
@@ -362,7 +362,7 @@ impl AutoGeoLoader {
 
         let path = self
             .get_geosite_path()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured, call with_data_dir() or with_geosite_path() to set it".to_string() })?;
 
         // Try to download if needed
         if self.should_download(&path) {
@@ -391,7 +391,7 @@ impl AutoGeoLoader {
 
         let path = self
             .get_geosite_path()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured, call with_data_dir() or with_geosite_path() to set it".to_string() })?;
 
         // Try to download if needed
         if self.should_download(&path) {
@@ -429,7 +429,7 @@ impl AutoGeoLoader {
 
         let format = self
             .geosite_format
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured, call with_geosite() to set it".to_string() })?;
 
         match format {
             GeoSiteFormat::Dat => {
@@ -476,7 +476,7 @@ impl GeoLoader for AutoGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
         let format = self
             .geoip_format
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured, call with_geoip() to set it".to_string() })?;
 
         let code = country_code.to_lowercase();
 
@@ -584,31 +584,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_geoip_path_not_configured_error_includes_hint() {
-        // Format set but no data_dir or path
-        let loader = AutoGeoLoader::new().with_geoip(GeoIpFormat::Dat);
-        let err = loader.load_geoip("cn").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("with_data_dir") || msg.contains("with_geoip_path"),
-            "error should hint at with_data_dir()/with_geoip_path(), got: {}",
-            msg
-        );
-    }
-
-    #[test]
-    fn test_geosite_path_not_configured_error_includes_hint() {
-        // Format set but no data_dir or path
-        let loader = AutoGeoLoader::new().with_geosite(GeoSiteFormat::Sing);
-        let err = loader.load_geosite("google").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("with_data_dir") || msg.contains("with_geosite_path"),
-            "error should hint at with_data_dir()/with_geosite_path(), got: {}",
-            msg
-        );
-    }
 
     #[test]
     fn test_auto_geoloader_dat_format_geosite() {

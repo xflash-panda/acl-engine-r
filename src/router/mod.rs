@@ -26,7 +26,7 @@ use crate::outbound::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn};
 use async_trait::async_trait;
 
 /// Default LRU cache size
-pub const DEFAULT_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1024) };
+pub const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// Generic router that routes connections to outbounds based on ACL rules.
 ///
