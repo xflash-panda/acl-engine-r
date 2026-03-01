@@ -4,23 +4,226 @@
 //! Note: HTTP proxies don't support UDP by design.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
-use super::{Addr, Outbound, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
+use super::{Addr, Outbound, StdTcpConn, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
 #[cfg(feature = "async")]
 use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn, TokioTcpConn};
 #[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncWriteExt, BufReader as TokioBufReader};
 #[cfg(feature = "async")]
 use tokio::net::TcpStream as TokioTcpStream;
 
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum number of response headers to read before aborting.
+/// Prevents memory exhaustion from malicious proxies sending infinite headers.
+const MAX_RESPONSE_HEADERS: usize = 100;
+/// Maximum length of a single HTTP response line (status line or header).
+/// Prevents OOM from malicious proxies sending data without newlines.
+const MAX_LINE_LENGTH: usize = 8 * 1024; // 8KB
+
+/// Process a chunk of buffered data for line reading.
+/// Returns (bytes_to_consume, line_complete).
+/// The caller is responsible for fill_buf() (sync or async) and consume().
+fn process_line_chunk(
+    available: &[u8],
+    buf: &mut String,
+    total: usize,
+    max_len: usize,
+) -> std::io::Result<(usize, bool)> {
+    if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+        let to_consume = newline_pos + 1;
+        if total + to_consume > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line too long (>{} bytes)", max_len),
+            ));
+        }
+        let s = std::str::from_utf8(&available[..to_consume])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        Ok((to_consume, true))
+    } else {
+        let chunk_len = available.len();
+        if total + chunk_len > max_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line too long (>{} bytes)", max_len),
+            ));
+        }
+        let s = std::str::from_utf8(available)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        Ok((chunk_len, false))
+    }
+}
+
+/// Read a line from a BufRead reader with a maximum length limit.
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let (consumed, done) = process_line_chunk(available, buf, total, max_len)?;
+        total += consumed;
+        reader.consume(consumed);
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// Async version of read_line_limited.
+#[cfg(feature = "async")]
+async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<usize> {
+    use tokio::io::AsyncBufReadExt;
+    let mut total = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let (consumed, done) = process_line_chunk(available, buf, total, max_len)?;
+        total += consumed;
+        reader.consume(consumed);
+        if done {
+            return Ok(total);
+        }
+    }
+}
+
+/// Validate that a hostname doesn't contain characters that could cause
+/// HTTP header injection (CRLF) in the CONNECT request.
+fn validate_connect_host(host: &str) -> Result<()> {
+    if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::InvalidInput,
+            message: "Invalid host: contains control characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Build an HTTP CONNECT request string.
+fn build_connect_request(host: &str, port: u16, basic_auth: Option<&str>) -> String {
+    // IPv6 literals must be wrapped in brackets per RFC 7230 authority-form
+    let target = if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    };
+    let mut request = format!(
+        "CONNECT {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Proxy-Connection: Keep-Alive\r\n",
+        target, target
+    );
+
+    if let Some(auth) = basic_auth {
+        request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
+    }
+
+    request.push_str("\r\n");
+    request
+}
+
+/// Parse an HTTP CONNECT response status line.
+/// Returns Ok(()) on 200, Err on any other status or malformed input.
+fn parse_connect_status(status_line: &str) -> Result<()> {
+    let parts: Vec<&str> = status_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Invalid HTTP response: {}", status_line.trim()),
+        });
+    }
+
+    let status_code: u16 = parts[1].parse().map_err(|_| AclError::OutboundError {
+        kind: OutboundErrorKind::Protocol,
+        message: format!("Invalid status code: {}", parts[1]),
+    })?;
+
+    if status_code != 200 {
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!(
+                "HTTP CONNECT failed: {} {}",
+                status_code,
+                parts.get(2..).unwrap_or(&[]).join(" ")
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Read and discard HTTP response headers until empty line.
+/// Returns error if too many headers or line too long.
+fn drain_headers<R: BufRead>(reader: &mut R) -> Result<()> {
+    let mut header_count = 0;
+    loop {
+        let mut line = String::new();
+        read_line_limited(reader, &mut line, MAX_LINE_LENGTH).map_err(|e| {
+            AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read headers: {}", e),
+            }
+        })?;
+        if line.trim().is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_RESPONSE_HEADERS {
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Too many response headers (>{MAX_RESPONSE_HEADERS})"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Async: read and discard HTTP response headers until empty line.
+#[cfg(feature = "async")]
+async fn async_drain_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<()> {
+    let mut header_count = 0;
+    loop {
+        let mut line = String::new();
+        async_read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
+            .await
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read headers: {}", e),
+            })?;
+        if line.trim().is_empty() {
+            break;
+        }
+        header_count += 1;
+        if header_count > MAX_RESPONSE_HEADERS {
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Too many response headers (>{MAX_RESPONSE_HEADERS})"),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// HTTP/HTTPS proxy outbound.
 ///
@@ -32,10 +235,6 @@ const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct Http {
     /// Proxy server address
     addr: String,
-    /// Use HTTPS connection to proxy
-    https: bool,
-    /// Skip TLS certificate verification
-    insecure: bool,
     /// Basic auth header value (base64 encoded)
     basic_auth: Option<String>,
     /// Connection timeout
@@ -45,28 +244,29 @@ pub struct Http {
 impl Http {
     /// Create a new HTTP proxy outbound from URL.
     ///
-    /// URL format: `http://[user:pass@]host:port` or `https://[user:pass@]host:port`
+    /// URL format: `http://[user:pass@]host:port`
     pub fn from_url(url: &str) -> Result<Self> {
-        Self::from_url_with_options(url, false)
-    }
-
-    /// Create a new HTTP proxy outbound from URL with options.
-    pub fn from_url_with_options(url: &str, insecure: bool) -> Result<Self> {
         // Simple URL parsing
         let url = url.trim();
 
-        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-            (true, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (false, rest)
+        if url.starts_with("https://") {
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            });
+        }
+
+        let rest = if let Some(rest) = url.strip_prefix("http://") {
+            rest
         } else {
-            return Err(AclError::OutboundError(
-                "Unsupported scheme for HTTP proxy (use http:// or https://)".to_string(),
-            ));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "Unsupported scheme for HTTP proxy (use http://)".to_string(),
+            });
         };
 
         // Parse auth and host
-        let (auth, host_port) = if let Some(at_pos) = rest.find('@') {
+        let (auth, host_port) = if let Some(at_pos) = rest.rfind('@') {
             let auth_part = &rest[..at_pos];
             let host_part = &rest[at_pos + 1..];
             (Some(auth_part), host_part)
@@ -74,11 +274,35 @@ impl Http {
             (None, rest)
         };
 
-        // Handle default ports
-        let addr = if host_port.contains(':') {
+        // Strip trailing path (e.g. "/some/path" from "host:port/some/path")
+        let host_port = if host_port.starts_with('[') {
+            // IPv6: find ']' first, then strip path after it
+            if let Some(bracket_end) = host_port.find(']') {
+                let after_bracket = &host_port[bracket_end + 1..];
+                let after_bracket = if let Some(slash_pos) = after_bracket.find('/') {
+                    &after_bracket[..slash_pos]
+                } else {
+                    after_bracket
+                };
+                &host_port[..bracket_end + 1 + after_bracket.len()]
+            } else {
+                host_port
+            }
+        } else if let Some(slash_pos) = host_port.find('/') {
+            &host_port[..slash_pos]
+        } else {
+            host_port
+        };
+
+        // Handle default port — IPv6 brackets mean ':' is not a port separator
+        let has_port = if host_port.starts_with('[') {
+            // IPv6: port is after ']:', e.g. "[::1]:8080"
+            host_port.contains("]:")
+        } else {
+            host_port.contains(':')
+        };
+        let addr = if has_port {
             host_port.to_string()
-        } else if scheme {
-            format!("{}:443", host_port)
         } else {
             format!("{}:80", host_port)
         };
@@ -94,22 +318,38 @@ impl Http {
 
         Ok(Self {
             addr,
-            https: scheme,
-            insecure,
             basic_auth,
             timeout: DEFAULT_DIALER_TIMEOUT,
         })
     }
 
-    /// Create a new HTTP proxy outbound with direct address.
-    pub fn new(addr: impl Into<String>, https: bool) -> Self {
+    /// Create a new HTTP proxy outbound.
+    ///
+    /// Only HTTP proxies are supported. For HTTPS proxy support in the future,
+    /// use [`try_new`](Self::try_new) which accepts an `https` flag.
+    pub fn new(addr: impl Into<String>) -> Self {
         Self {
             addr: addr.into(),
-            https,
-            insecure: false,
             basic_auth: None,
             timeout: DEFAULT_DIALER_TIMEOUT,
         }
+    }
+
+    /// Create a new HTTP proxy outbound with direct address (fallible).
+    ///
+    /// Returns an error if `https` is `true` (not yet supported).
+    pub fn try_new(addr: impl Into<String>, https: bool) -> Result<Self> {
+        if https {
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            });
+        }
+        Ok(Self {
+            addr: addr.into(),
+            basic_auth: None,
+            timeout: DEFAULT_DIALER_TIMEOUT,
+        })
     }
 
     /// Set basic authentication.
@@ -129,51 +369,57 @@ impl Http {
         self
     }
 
-    /// Set insecure mode (skip TLS verification).
-    pub fn with_insecure(mut self, insecure: bool) -> Self {
-        self.insecure = insecure;
-        self
-    }
-
     /// Connect to the proxy server.
     fn dial(&self) -> Result<TcpStream> {
         let addr: SocketAddr = self
             .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+            .to_socket_addrs()
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: format!("Failed to resolve proxy address: {}", e),
+            })?
+            .next()
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address resolved for proxy".to_string(),
+            })?;
 
-        let stream = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
-
-        // Note: For HTTPS proxies, we would need to wrap with TLS here.
-        // This is a simplified implementation that only supports HTTP proxies.
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
+        let stream = TcpStream::connect_timeout(&addr, self.timeout).map_err(|e| {
+            AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to connect to proxy: {}", e),
+            }
+        })?;
 
         Ok(stream)
     }
 
     /// Connect to the proxy server asynchronously.
+    /// Uses tokio async DNS to avoid blocking the runtime.
     #[cfg(feature = "async")]
     async fn async_dial(&self) -> Result<TokioTcpStream> {
-        let addr: SocketAddr = self
-            .addr
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid proxy address: {}", e)))?;
+        let addr: SocketAddr = tokio::net::lookup_host(&self.addr)
+            .await
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: format!("Failed to resolve proxy address: {}", e),
+            })?
+            .next()
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address resolved for proxy".to_string(),
+            })?;
 
         let stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
             .await
-            .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
-
-        if self.https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
-        }
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::Timeout,
+                message: "Connection timeout".to_string(),
+            })?
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to connect to proxy: {}", e),
+            })?;
 
         Ok(stream)
     }
@@ -181,97 +427,60 @@ impl Http {
 
 impl Outbound for Http {
     fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
-        let mut stream = self.dial()?;
+        validate_connect_host(&addr.host)?;
 
+        let mut stream = self.dial()?;
         stream.set_read_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
         stream.set_write_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
 
-        // Build CONNECT request
-        let target = format!("{}:{}", addr.host, addr.port);
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Proxy-Connection: Keep-Alive\r\n",
-            target, target
-        );
+        let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to send CONNECT request: {}", e),
+            })?;
 
-        if let Some(ref auth) = self.basic_auth {
-            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
-        }
-
-        request.push_str("\r\n");
-
-        // Send request
-        stream.write_all(request.as_bytes()).map_err(|e| {
-            AclError::OutboundError(format!("Failed to send CONNECT request: {}", e))
-        })?;
-
-        // Read response
         let mut reader = BufReader::new(&stream);
         let mut status_line = String::new();
-        reader
-            .read_line(&mut status_line)
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
-
-        // Parse status code
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(AclError::OutboundError(format!(
-                "Invalid HTTP response: {}",
-                status_line.trim()
-            )));
-        }
-
-        let status_code: u16 = parts[1]
-            .parse()
-            .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
-
-        if status_code != 200 {
-            return Err(AclError::OutboundError(format!(
-                "HTTP CONNECT failed: {} {}",
-                status_code,
-                parts.get(2..).unwrap_or(&[]).join(" ")
-            )));
-        }
-
-        // Read and discard headers until empty line
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
-            if line.trim().is_empty() {
-                break;
+        read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH).map_err(|e| {
+            AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read response: {}", e),
             }
-        }
+        })?;
+        parse_connect_status(&status_line)?;
+        drain_headers(&mut reader)?;
 
-        // Reset timeout
         stream.set_read_timeout(None).ok();
         stream.set_write_timeout(None).ok();
 
-        // Check if there's buffered data
         let buffered = reader.buffer();
         if !buffered.is_empty() {
-            // Wrap connection with buffered data
             let buffered_data = buffered.to_vec();
             let stream = reader.into_inner();
             return Ok(Box::new(BufferedTcpConn::new(
-                stream.try_clone().map_err(|e| {
-                    AclError::OutboundError(format!("Failed to clone stream: {}", e))
+                stream.try_clone().map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to clone stream: {}", e),
                 })?,
                 buffered_data,
             )));
         }
 
-        Ok(Box::new(HttpTcpConn::new(stream.try_clone().map_err(
-            |e| AclError::OutboundError(format!("Failed to clone stream: {}", e)),
+        Ok(Box::new(StdTcpConn::new(stream.try_clone().map_err(
+            |e| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to clone stream: {}", e),
+            },
         )?)))
     }
 
     fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn UdpConn>> {
-        Err(AclError::OutboundError(
-            "UDP not supported by HTTP proxy".to_string(),
-        ))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "UDP not supported by HTTP proxy".to_string(),
+        })
     }
 }
 
@@ -279,22 +488,10 @@ impl Outbound for Http {
 #[async_trait]
 impl AsyncOutbound for Http {
     async fn dial_tcp(&self, addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
+        validate_connect_host(&addr.host)?;
+
         let stream = self.async_dial().await?;
-
-        let target = format!("{}:{}", addr.host, addr.port);
-        let mut request = format!(
-            "CONNECT {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Proxy-Connection: Keep-Alive\r\n",
-            target, target
-        );
-
-        if let Some(ref auth) = self.basic_auth {
-            request.push_str(&format!("Proxy-Authorization: {}\r\n", auth));
-        }
-
-        request.push_str("\r\n");
-
+        let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
         let mut reader = TokioBufReader::new(stream);
 
         tokio::time::timeout(
@@ -302,45 +499,38 @@ impl AsyncOutbound for Http {
             reader.get_mut().write_all(request.as_bytes()),
         )
         .await
-        .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
-        .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
+        .map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::Timeout,
+            message: "Request timeout".to_string(),
+        })?
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Failed to send CONNECT request: {}", e),
+        })?;
 
         let mut status_line = String::new();
-        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, reader.read_line(&mut status_line))
+        tokio::time::timeout(
+            HTTP_REQUEST_TIMEOUT,
+            async_read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH),
+        )
+        .await
+        .map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::Timeout,
+            message: "Response timeout".to_string(),
+        })?
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Failed to read response: {}", e),
+        })?;
+
+        parse_connect_status(&status_line)?;
+
+        tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async_drain_headers(&mut reader))
             .await
-            .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
-
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(AclError::OutboundError(format!(
-                "Invalid HTTP response: {}",
-                status_line.trim()
-            )));
-        }
-
-        let status_code: u16 = parts[1]
-            .parse()
-            .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
-
-        if status_code != 200 {
-            return Err(AclError::OutboundError(format!(
-                "HTTP CONNECT failed: {} {}",
-                status_code,
-                parts.get(2..).unwrap_or(&[]).join(" ")
-            )));
-        }
-
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
-            if line.trim().is_empty() {
-                break;
-            }
-        }
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::Timeout,
+                message: "Header read timeout".to_string(),
+            })??;
 
         let buffered = reader.buffer();
         if !buffered.is_empty() {
@@ -353,58 +543,10 @@ impl AsyncOutbound for Http {
     }
 
     async fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>> {
-        Err(AclError::OutboundError(
-            "UDP not supported by HTTP proxy".to_string(),
-        ))
-    }
-}
-
-/// HTTP proxy TCP connection wrapper.
-struct HttpTcpConn {
-    stream: TcpStream,
-}
-
-impl HttpTcpConn {
-    fn new(stream: TcpStream) -> Self {
-        Self { stream }
-    }
-}
-
-impl Read for HttpTcpConn {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.read(buf)
-    }
-}
-
-impl Write for HttpTcpConn {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.stream.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
-
-impl TcpConn for HttpTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
-    }
-
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
-    }
-
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(dur)
-    }
-
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(dur)
-    }
-
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.stream.shutdown(how)
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "UDP not supported by HTTP proxy".to_string(),
+        })
     }
 }
 
@@ -451,24 +593,24 @@ impl Write for BufferedTcpConn {
 }
 
 impl TcpConn for BufferedTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.local_addr()?)
     }
 
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.peer_addr()?)
     }
 
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(dur)
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.stream.set_read_timeout(dur)?)
     }
 
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(dur)
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.stream.set_write_timeout(dur)?)
     }
 
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.stream.shutdown(how)
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        Ok(self.stream.shutdown(how)?)
     }
 }
 
@@ -539,12 +681,12 @@ impl Unpin for AsyncBufferedTcpConn {}
 
 #[cfg(feature = "async")]
 impl AsyncTcpConn for AsyncBufferedTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.local_addr()?)
     }
 
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.peer_addr()?)
     }
 }
 
@@ -553,10 +695,128 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_connect_request_no_auth() {
+        let req = build_connect_request("example.com", 443, None);
+        assert!(req.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+        assert!(req.contains("Host: example.com:443\r\n"));
+        assert!(req.contains("Proxy-Connection: Keep-Alive\r\n"));
+        assert!(!req.contains("Proxy-Authorization:"));
+        assert!(req.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_build_connect_request_with_auth() {
+        let auth = "Basic dXNlcjpwYXNz".to_string();
+        let req = build_connect_request("example.com", 443, Some(&auth));
+        assert!(req.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[test]
+    fn test_build_connect_request_ipv6_target() {
+        // BUG B4: build_connect_request formats IPv6 as "::1:80" (invalid).
+        // RFC 7230 requires authority-form with brackets: "[::1]:80".
+        let req = build_connect_request("::1", 80, None);
+        // The CONNECT target must use brackets for IPv6
+        assert!(
+            req.starts_with("CONNECT [::1]:80 HTTP/1.1\r\n"),
+            "IPv6 CONNECT target must use brackets, got: {}",
+            req.lines().next().unwrap_or("")
+        );
+        assert!(
+            req.contains("Host: [::1]:80\r\n"),
+            "Host header must use brackets for IPv6, got: {}",
+            req
+        );
+    }
+
+    #[test]
+    fn test_build_connect_request_ipv6_full_address() {
+        let req = build_connect_request("2001:db8::1", 443, None);
+        assert!(
+            req.starts_with("CONNECT [2001:db8::1]:443 HTTP/1.1\r\n"),
+            "Full IPv6 CONNECT target must use brackets, got: {}",
+            req.lines().next().unwrap_or("")
+        );
+    }
+
+    #[test]
+    fn test_parse_connect_status_success() {
+        let line = "HTTP/1.1 200 Connection established\r\n";
+        let result = parse_connect_status(line);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_connect_status_proxy_auth_required() {
+        let line = "HTTP/1.1 407 Proxy Authentication Required\r\n";
+        let result = parse_connect_status(line);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("407"));
+    }
+
+    #[test]
+    fn test_parse_connect_status_invalid_format() {
+        let result = parse_connect_status("garbage");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_connect_status_invalid_status_code() {
+        let result = parse_connect_status("HTTP/1.1 abc OK\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_with_newline() {
+        let mut buf = String::new();
+        let data = b"hello\r\nworld";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 0, 1024).unwrap();
+        assert_eq!(consumed, 7); // "hello\r\n"
+        assert!(done);
+        assert_eq!(buf, "hello\r\n");
+    }
+
+    #[test]
+    fn test_process_line_chunk_no_newline() {
+        let mut buf = String::new();
+        let data = b"hello";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 0, 1024).unwrap();
+        assert_eq!(consumed, 5);
+        assert!(!done);
+        assert_eq!(buf, "hello");
+    }
+
+    #[test]
+    fn test_process_line_chunk_too_long_with_newline() {
+        let mut buf = String::new();
+        let data = b"hello\n";
+        let result = process_line_chunk(data, &mut buf, 0, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_too_long_no_newline() {
+        let mut buf = String::new();
+        let data = b"hello";
+        let result = process_line_chunk(data, &mut buf, 0, 3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_line_chunk_accumulates_total() {
+        let mut buf = String::new();
+        // Simulate second call with 3 bytes already consumed
+        let data = b"end\n";
+        let (consumed, done) = process_line_chunk(data, &mut buf, 3, 10).unwrap();
+        assert_eq!(consumed, 4);
+        assert!(done);
+    }
+
+    #[test]
     fn test_http_from_url() {
         let http = Http::from_url("http://proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
+
         assert!(http.basic_auth.is_none());
     }
 
@@ -564,7 +824,7 @@ mod tests {
     fn test_http_from_url_with_auth() {
         let http = Http::from_url("http://user:pass@proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
+
         assert!(http.basic_auth.is_some());
     }
 
@@ -575,12 +835,380 @@ mod tests {
     }
 
     #[test]
+    fn test_http_new_creates_http_only() {
+        // Http::new() creates an HTTP-only proxy (no https param needed).
+        let http = Http::new("127.0.0.1:8080");
+        assert_eq!(http.addr, "127.0.0.1:8080");
+    }
+
+    #[test]
     fn test_http_udp_not_supported() {
-        let http = Http::new("127.0.0.1:8080", false);
+        let http = Http::new("127.0.0.1:8080");
         let mut addr = Addr::new("example.com", 53);
         let result = Outbound::dial_udp(&http, &mut addr);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_http_max_response_headers_constant() {
+        // The MAX_RESPONSE_HEADERS constant must exist and be reasonable
+        assert!(
+            MAX_RESPONSE_HEADERS > 0 && MAX_RESPONSE_HEADERS <= 200,
+            "MAX_RESPONSE_HEADERS should be between 1 and 200, got {}",
+            MAX_RESPONSE_HEADERS
+        );
+    }
+
+    #[test]
+    fn test_http_sync_dial_tcp_too_many_headers() {
+        // A malicious proxy that sends valid status line + excessive headers
+        // should be rejected by the header count limit.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the CONNECT request
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .unwrap();
+            // Send way more headers than MAX_RESPONSE_HEADERS
+            for i in 0..200 {
+                let header = format!("X-Spam-{}: value{}\r\n", i, i);
+                if stream.write_all(header.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            // Never send the terminating empty line
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        // Should fail with too many headers error, not hang or succeed
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Too many") || err_msg.contains("too many"),
+                    "Error should mention too many headers, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject excessive headers"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
+    fn test_http_sync_oversized_status_line() {
+        // A malicious proxy sends a status line without \n, causing
+        // read_line to buffer indefinitely. Should reject lines > MAX_LINE_LENGTH.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send 16KB of data without newline (exceeds 8KB limit)
+            let data = vec![b'A'; 16 * 1024];
+            let _ = stream.write_all(&data);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized status line"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
+    fn test_http_sync_oversized_header_line() {
+        // A malicious proxy sends a valid status line, then a header line > MAX_LINE_LENGTH.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .unwrap();
+            // Send header line > 8KB without newline
+            let header_start = b"X-Evil: ";
+            stream.write_all(header_start).unwrap();
+            let data = vec![b'B'; 16 * 1024];
+            let _ = stream.write_all(&data);
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized header line"),
+        }
+
+        server.join().ok();
+    }
+
+    #[test]
+    fn test_http_try_new_rejects_https() {
+        let result = Http::try_new("127.0.0.1:8080", true);
+        assert!(
+            result.is_err(),
+            "Http::try_new with https=true should fail at construction time"
+        );
+    }
+
+    #[test]
+    fn test_read_line_limited_enforces_limit_on_newline_chunk() {
+        // BUG #10: read_line_limited doesn't check length on the final chunk
+        // containing the newline. If the buffer fills with data then finds a
+        // newline, the total can exceed max_len.
+        //
+        // Scenario: max_len = 10, but we send 15 bytes + \n.
+        // The function should reject this, not return 16 bytes.
+        use std::io::Cursor;
+
+        let max_len = 10;
+        // Create data that's longer than max_len but has a newline at the end
+        let data = "A".repeat(15) + "\n"; // 16 bytes total, > max_len of 10
+        let mut reader = BufReader::new(Cursor::new(data.as_bytes()));
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+
+        // Should fail because total line length (16) exceeds max_len (10)
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "read_line_limited should enforce max_len={} on lines with newline, but got {} bytes: {:?}",
+            max_len, buf.len(), buf
+        );
+    }
+
+    #[test]
+    fn test_read_line_limited_small_buffer_newline_overflow() {
+        // Test with a BufReader with small internal buffer.
+        // If BufReader buffer = 4 and max_len = 6:
+        // Data: "ABCDEFGH\n"
+        // Fill 1: "ABCD" (no newline, total=4, 4 <= 6 OK, consume)
+        // Fill 2: "EFGH" (no newline, total=8, 8 > 6, should error)
+        // But without fix, if fill 2 is "EF\nGH":
+        // Fill 2 finds newline at pos 2, consumes 3 bytes, total=7 > 6 - BUG
+        use std::io::Cursor;
+
+        let max_len = 6;
+        // Use a small BufReader buffer size to force multiple fill_buf calls
+        let data = b"ABCDEF\n"; // 7 bytes, > max_len of 6
+        let cursor = Cursor::new(&data[..]);
+        let mut reader = BufReader::with_capacity(4, cursor);
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "read_line_limited should enforce max_len={} even with small BufReader buffer, got {} bytes",
+            max_len, buf.len()
+        );
+    }
+
+    #[test]
+    fn test_read_line_limited_exact_max_len_with_newline() {
+        // Line of exactly max_len bytes including newline should succeed
+        use std::io::Cursor;
+
+        let max_len = 10;
+        let data = "A".repeat(9) + "\n"; // exactly 10 bytes = max_len
+        let mut reader = BufReader::new(Cursor::new(data.as_bytes()));
+        let mut buf = String::new();
+
+        let result = read_line_limited(&mut reader, &mut buf, max_len);
+        assert!(result.is_ok(), "Line of exactly max_len should succeed");
+        assert_eq!(buf.len(), 10);
+    }
+
+    #[test]
+    fn test_http_new_accepts_http() {
+        let result = Http::try_new("127.0.0.1:8080", false);
+        assert!(
+            result.is_ok(),
+            "Http::try_new with https=false should succeed"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_rejects_https() {
+        // Bug: from_url("https://...") succeeds at construction time but
+        // dial() rejects at runtime with "HTTPS proxy not yet supported".
+        // Should fail early at construction time.
+        let result = Http::from_url("https://proxy.example.com:443");
+        assert!(
+            result.is_err(),
+            "HTTPS scheme should be rejected at construction time, not at dial time"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_rejects_https_with_auth() {
+        let result = Http::from_url("https://user:pass@proxy.example.com:443");
+        assert!(
+            result.is_err(),
+            "HTTPS scheme with auth should be rejected at construction time"
+        );
+    }
+
+    #[test]
+    fn test_addr_new_strips_crlf_preventing_http_injection() {
+        // CRLF injection is now prevented at the Addr layer:
+        // Addr::new() strips control characters, so CRLF never reaches HTTP.
+        let addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        assert_eq!(addr.host, "evil.comX-Injected: true");
+        assert!(!addr.host.contains('\r'));
+        assert!(!addr.host.contains('\n'));
+    }
+
+    #[test]
+    fn test_addr_new_strips_cr_only() {
+        let addr = Addr::new("evil.com\rinjected", 80);
+        assert_eq!(addr.host, "evil.cominjected");
+        assert!(!addr.host.contains('\r'));
+    }
+
+    #[test]
+    fn test_http_connect_rejects_lf_only_in_host() {
+        // Lone \n is also dangerous
+        let http = Http::try_new("127.0.0.1:59999", false).unwrap();
+        let mut addr = Addr::new("evil.com\ninjected", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+        assert!(
+            result.is_err(),
+            "dial_tcp should reject host containing LF character"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_ipv6_default_port() {
+        // BUG #5: IPv6 address like "[::1]" contains ':', so the ':' check
+        // for default port assumes it already has a port. Result: addr = "[::1]"
+        // without port, which fails at connect time.
+        let http = Http::from_url("http://[::1]").unwrap();
+        assert_eq!(
+            http.addr, "[::1]:80",
+            "IPv6 without port should get default port 80"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_ipv6_explicit_port() {
+        // IPv6 with explicit port should work normally
+        let http = Http::from_url("http://[::1]:8080").unwrap();
+        assert_eq!(http.addr, "[::1]:8080");
+    }
+
+    #[test]
+    fn test_http_from_url_strips_trailing_path() {
+        // BUG #6: URL with trailing path like "http://proxy.example.com:8080/"
+        // keeps the "/" in host_port, producing addr = "proxy.example.com:8080/"
+        // which fails at connect time.
+        let http = Http::from_url("http://proxy.example.com:8080/").unwrap();
+        assert_eq!(
+            http.addr, "proxy.example.com:8080",
+            "Trailing slash should be stripped from proxy address"
+        );
+    }
+
+    #[test]
+    fn test_http_from_url_strips_trailing_path_with_segments() {
+        let http = Http::from_url("http://proxy.example.com:8080/some/path").unwrap();
+        assert_eq!(
+            http.addr, "proxy.example.com:8080",
+            "Trailing path should be stripped from proxy address"
+        );
+    }
+
+    #[test]
+    fn test_validate_connect_host_rejects_null_byte() {
+        // BUG #7: validate_connect_host only checks CR/LF but not NULL bytes.
+        // NULL bytes in hostnames can cause issues with C-based DNS resolvers
+        // and can be used for smuggling attacks.
+        let result = validate_connect_host("evil.com\0injected");
+        assert!(result.is_err(), "NULL byte in hostname should be rejected");
+    }
+
+    #[test]
+    fn test_validate_connect_host_rejects_control_chars() {
+        // Other control characters (< 0x20) should also be rejected
+        let result = validate_connect_host("evil.com\x01injected");
+        assert!(
+            result.is_err(),
+            "Control characters in hostname should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_http_dial_tcp_domain_name_proxy() {
+        // Bug: Http::dial() uses SocketAddr::parse() which rejects domain names.
+        // Using a domain name proxy address should resolve and attempt connection,
+        // not fail with "Invalid proxy address".
+        let http = Http::new("localhost:59996");
+        let mut addr = Addr::new("example.com", 80);
+        let result = Outbound::dial_tcp(&http, &mut addr);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
+    }
+
+    // P1-5 verified: Http::new() without port already gives clear error at connect time
 }
 
 #[cfg(all(test, feature = "async"))]
@@ -591,7 +1219,6 @@ mod async_tests {
     async fn test_async_http_from_url() {
         let http = Http::from_url("http://proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-        assert!(!http.https);
     }
 
     #[tokio::test]
@@ -602,7 +1229,7 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_http_udp_not_supported() {
-        let http = Http::new("127.0.0.1:8080", false);
+        let http = Http::new("127.0.0.1:8080");
         let mut addr = Addr::new("example.com", 53);
         let result = AsyncOutbound::dial_udp(&http, &mut addr).await;
         assert!(result.is_err());
@@ -614,9 +1241,235 @@ mod async_tests {
 
     #[tokio::test]
     async fn test_async_http_dial_tcp_connection_refused() {
-        let http = Http::new("127.0.0.1:59997", false);
+        let http = Http::new("127.0.0.1:59997");
         let mut addr = Addr::new("example.com", 80);
         let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_async_http_dial_tcp_domain_name_proxy() {
+        // Bug: Http::async_dial() uses SocketAddr::parse() which rejects domain names.
+        let http = Http::new("localhost:59996");
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    !err_msg.contains("Invalid proxy address"),
+                    "Domain name proxy should be resolved, got address parse error: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error for non-listening port"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_async_http_oversized_status_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send 16KB of data without newline
+            let data = vec![b'A'; 16 * 1024];
+            let _ = stream.write_all(&data).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized status line"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_http_oversized_header_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Send header line > 8KB without newline
+            let mut header = b"X-Evil: ".to_vec();
+            header.extend(vec![b'B'; 16 * 1024]);
+            let _ = stream.write_all(&header).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("too long") || err_msg.contains("too large"),
+                    "Error should mention line too long, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject oversized header line"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_http_dial_tcp_too_many_headers() {
+        // A malicious proxy that sends valid status line + excessive headers
+        // should be rejected by the header count limit, even within timeout.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send valid status line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Send excessive headers quickly
+            for i in 0..200 {
+                let header = format!("X-Spam-{}: value{}\r\n", i, i);
+                if stream.write_all(header.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            // Keep alive
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+        let result = AsyncOutbound::dial_tcp(&http, &mut addr).await;
+
+        // Should fail with too many headers error
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Too many") || err_msg.contains("too many"),
+                    "Error should mention too many headers, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Should reject excessive headers"),
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_async_addr_strips_crlf_preventing_http_injection() {
+        // CRLF injection is now prevented at the Addr layer:
+        // Addr::new() strips control characters before reaching HTTP.
+        let addr = Addr::new("evil.com\r\nX-Injected: true", 80);
+        assert!(
+            !addr.host.contains('\r'),
+            "CRLF should be stripped by Addr::new"
+        );
+        assert!(
+            !addr.host.contains('\n'),
+            "CRLF should be stripped by Addr::new"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_read_line_limited_enforces_limit_on_newline_chunk() {
+        // BUG #10 (async): Same length check bypass in async_read_line_limited
+        use tokio::io::BufReader as TokioBufReader;
+
+        let max_len = 10;
+        let data = "A".repeat(15) + "\n"; // 16 bytes > max_len of 10
+        let cursor = std::io::Cursor::new(data.into_bytes());
+        let mut reader = TokioBufReader::new(cursor);
+        let mut buf = String::new();
+
+        let result = async_read_line_limited(&mut reader, &mut buf, max_len).await;
+
+        assert!(
+            result.is_err() || buf.len() <= max_len,
+            "async_read_line_limited should enforce max_len={} on lines with newline, got {} bytes",
+            max_len,
+            buf.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_http_header_read_timeout() {
+        // Bug: async dial_tcp has no timeout on header-reading loop.
+        // A proxy that sends status line but never finishes headers should timeout,
+        // not hang forever.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Mock proxy: accepts, reads request, sends status line, then hangs
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            // Send valid status line but never send terminating empty header line
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n")
+                .await
+                .unwrap();
+            // Keep connection open indefinitely
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let http = Http::new(format!("127.0.0.1:{}", port));
+        let mut addr = Addr::new("example.com", 80);
+
+        // Outer timeout: must be larger than HTTP_REQUEST_TIMEOUT (10s)
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            AsyncOutbound::dial_tcp(&http, &mut addr),
+        )
+        .await;
+
+        // If dial_tcp hangs forever, the outer timeout fires and result is Err(Elapsed).
+        // After fix, internal timeout fires first and dial_tcp returns Err(AclError).
+        assert!(
+            result.is_ok(),
+            "dial_tcp should not hang forever - header read needs internal timeout"
+        );
+        assert!(result.unwrap().is_err());
+
+        server.abort();
     }
 }

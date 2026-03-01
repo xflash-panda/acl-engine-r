@@ -3,15 +3,16 @@
 //! Connects directly to the target using the local network.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 use super::{
-    split_ipv4_ipv6, Addr, Outbound, ResolveInfo, StdTcpConn, TcpConn, UdpConn,
-    DEFAULT_DIALER_TIMEOUT,
+    build_resolve_info, try_resolve_from_ip, Addr, Outbound, ResolveInfo, StdTcpConn, TcpConn,
+    UdpConn, DEFAULT_DIALER_TIMEOUT,
 };
 
 #[cfg(feature = "async")]
@@ -113,37 +114,14 @@ impl Direct {
 
     /// Resolve the address using system DNS if ResolveInfo is not available.
     fn resolve(&self, addr: &mut Addr) {
-        if addr.resolve_info.is_some() {
+        if try_resolve_from_ip(addr) {
             return;
         }
 
-        // Check if host is already an IP address
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-                }
-                IpAddr::V6(v6) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-                }
-            }
-            return;
-        }
-
-        // Resolve using system DNS
         match (addr.host.as_str(), 0u16).to_socket_addrs() {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
-                if ipv4.is_none() && ipv6.is_none() {
-                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
-                } else {
-                    addr.resolve_info = Some(ResolveInfo {
-                        ipv4,
-                        ipv6,
-                        error: None,
-                    });
-                }
+                addr.resolve_info = Some(build_resolve_info(&ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -164,14 +142,20 @@ impl Direct {
         };
         let socket =
             socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(|e| AclError::OutboundError(format!("Failed to create socket: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to create socket: {}", e),
+                })?;
 
         // Bind to IP address
         if let Some(bind_ip) = self.get_bind_ip(ip) {
             let bind_addr = SocketAddr::new(bind_ip, 0);
             socket
                 .bind(&bind_addr.into())
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind: {}", e),
+                })?;
         }
 
         // Bind to network device (Linux only)
@@ -179,7 +163,10 @@ impl Direct {
         if let Some(ref device) = self.bind_device {
             socket
                 .bind_device(Some(device.as_bytes()))
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind device: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind device: {}", e),
+                })?;
         }
 
         // Enable TCP Fast Open (client-side)
@@ -188,6 +175,20 @@ impl Direct {
         }
 
         Ok(socket)
+    }
+
+    /// Dial TCP to a specific IP address, checking a cancellation flag first.
+    /// Returns `None` if cancelled (the caller should not attempt the connection).
+    fn dial_tcp_ip_cancellable(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        cancelled: &AtomicBool,
+    ) -> Option<Result<TcpStream>> {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.dial_tcp_ip(ip, port))
     }
 
     /// Dial TCP to a specific IP address.
@@ -199,11 +200,18 @@ impl Direct {
             socket.set_nonblocking(false).ok();
             socket
                 .connect_timeout(&socket_addr.into(), self.timeout)
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?;
             TcpStream::from(socket)
         } else {
-            TcpStream::connect_timeout(&socket_addr, self.timeout)
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+            TcpStream::connect_timeout(&socket_addr, self.timeout).map_err(|e| {
+                AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                }
+            })?
         };
 
         Ok(stream)
@@ -217,6 +225,19 @@ impl Direct {
         }
     }
 
+    /// Return the UDP bind address for the given IP version.
+    fn udp_bind_addr(&self, use_ipv6: bool) -> SocketAddr {
+        if use_ipv6 {
+            self.bind_ip6
+                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
+        } else {
+            self.bind_ip4
+                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        }
+    }
+
     /// Create a UDP socket with bind_device support via socket2.
     fn create_udp_socket_with_device(&self, use_ipv6: bool) -> Result<socket2::Socket> {
         let domain = if use_ipv6 {
@@ -226,8 +247,9 @@ impl Direct {
         };
         let socket =
             socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to create UDP socket: {}", e),
                 })?;
 
         let bind_addr = if use_ipv6 {
@@ -237,13 +259,19 @@ impl Direct {
         };
         socket
             .bind(&bind_addr.into())
-            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to bind UDP: {}", e),
+            })?;
 
         #[cfg(target_os = "linux")]
         if let Some(ref device) = self.bind_device {
             socket
                 .bind_device(Some(device.as_bytes()))
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind device: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind device: {}", e),
+                })?;
         }
 
         Ok(socket)
@@ -262,66 +290,83 @@ impl Direct {
     }
 
     /// Dual-stack dial TCP, racing IPv4 and IPv6 connections.
+    ///
+    /// Spawns two threads to race IPv4 and IPv6 connections. When the first
+    /// succeeds, a shared cancellation flag is set so the other thread can
+    /// skip its connection attempt if it hasn't started yet.
+    ///
+    /// Note: if the losing thread has already entered `connect_timeout`,
+    /// the flag cannot interrupt the in-progress syscall — the thread will
+    /// run until the OS connect times out. This is a limitation of
+    /// std::thread (no cooperative cancellation). For full cancellation,
+    /// use the async API which leverages `tokio::select!`.
     fn dual_stack_dial_tcp(&self, ipv4: Ipv4Addr, ipv6: Ipv6Addr, port: u16) -> Result<TcpStream> {
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         let clone_v4 = self.clone();
         let tx_v4 = tx.clone();
+        let ip_v4 = IpAddr::V4(ipv4);
+        let cancelled_v4 = cancelled.clone();
         thread::spawn(move || {
-            let _ = tx_v4.send(clone_v4.dial_tcp_ip(IpAddr::V4(ipv4), port));
+            if let Some(result) = clone_v4.dial_tcp_ip_cancellable(ip_v4, port, &cancelled_v4) {
+                let _ = tx_v4.send((ip_v4, result));
+            }
         });
 
         let clone_v6 = self.clone();
+        let ip_v6 = IpAddr::V6(ipv6);
+        let cancelled_v6 = cancelled.clone();
         thread::spawn(move || {
-            let _ = tx.send(clone_v6.dial_tcp_ip(IpAddr::V6(ipv6), port));
+            if let Some(result) = clone_v6.dial_tcp_ip_cancellable(ip_v6, port, &cancelled_v6) {
+                let _ = tx.send((ip_v6, result));
+            }
         });
 
         // Get first result
-        let first = rx
-            .recv()
-            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
+        let (first_ip, first) = rx.recv().map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::ConnectionFailed,
+            message: "Channel error".to_string(),
+        })?;
 
         if first.is_ok() {
+            cancelled.store(true, Ordering::Relaxed);
             return first;
         }
+        let first_err = first.unwrap_err();
 
         // First failed, try second
-        rx.recv()
-            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?
+        let (second_ip, second) = rx.recv().map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::ConnectionFailed,
+            message: "Channel error".to_string(),
+        })?;
+
+        if second.is_ok() {
+            return second;
+        }
+        let second_err = second.unwrap_err();
+
+        // Both failed — combine errors so the caller sees both attempts
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::ConnectionFailed,
+            message: format!(
+                "dual-stack connection failed: {} ({}), {} ({})",
+                first_ip, first_err, second_ip, second_err
+            ),
+        })
     }
 
     /// Async resolve the address using system DNS if ResolveInfo is not available.
     #[cfg(feature = "async")]
     async fn async_resolve(&self, addr: &mut Addr) {
-        if addr.resolve_info.is_some() {
-            return;
-        }
-
-        if let Ok(ip) = addr.host.parse::<IpAddr>() {
-            match ip {
-                IpAddr::V4(v4) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv4(v4));
-                }
-                IpAddr::V6(v6) => {
-                    addr.resolve_info = Some(ResolveInfo::from_ipv6(v6));
-                }
-            }
+        if try_resolve_from_ip(addr) {
             return;
         }
 
         match tokio::net::lookup_host(format!("{}:0", addr.host)).await {
             Ok(addrs) => {
                 let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
-                let (ipv4, ipv6) = split_ipv4_ipv6(&ips);
-                if ipv4.is_none() && ipv6.is_none() {
-                    addr.resolve_info = Some(ResolveInfo::from_error("no address found"));
-                } else {
-                    addr.resolve_info = Some(ResolveInfo {
-                        ipv4,
-                        ipv6,
-                        error: None,
-                    });
-                }
+                addr.resolve_info = Some(build_resolve_info(&ips));
             }
             Err(e) => {
                 addr.resolve_info = Some(ResolveInfo::from_error(e.to_string()));
@@ -341,13 +386,25 @@ impl Direct {
             let tokio_socket = tokio::net::TcpSocket::from_std_stream(std_stream);
             tokio::time::timeout(self.timeout, tokio_socket.connect(socket_addr))
                 .await
-                .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+                .map_err(|_| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: "Connection timeout".to_string(),
+                })?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?
         } else {
             tokio::time::timeout(self.timeout, TokioTcpStream::connect(socket_addr))
                 .await
-                .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+                .map_err(|_| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: "Connection timeout".to_string(),
+                })?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?
         };
 
         Ok(stream)
@@ -361,19 +418,31 @@ impl Direct {
         ipv6: Ipv6Addr,
         port: u16,
     ) -> Result<TokioTcpStream> {
-        tokio::select! {
+        let (first_ip, first_err, fallback_ip) = tokio::select! {
             result = self.async_dial_tcp_ip(IpAddr::V4(ipv4), port) => {
                 if result.is_ok() {
                     return result;
                 }
-                self.async_dial_tcp_ip(IpAddr::V6(ipv6), port).await
+                (IpAddr::V4(ipv4), result.unwrap_err(), IpAddr::V6(ipv6))
             }
             result = self.async_dial_tcp_ip(IpAddr::V6(ipv6), port) => {
                 if result.is_ok() {
                     return result;
                 }
-                self.async_dial_tcp_ip(IpAddr::V4(ipv4), port).await
+                (IpAddr::V6(ipv6), result.unwrap_err(), IpAddr::V4(ipv4))
             }
+        };
+
+        let fallback = self.async_dial_tcp_ip(fallback_ip, port).await;
+        match fallback {
+            Ok(stream) => Ok(stream),
+            Err(second_err) => Err(AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!(
+                    "dual-stack connection failed: {} ({}), {} ({})",
+                    first_ip, first_err, fallback_ip, second_err
+                ),
+            }),
         }
     }
 }
@@ -391,64 +460,29 @@ impl Outbound for Direct {
         let info = addr
             .resolve_info
             .as_ref()
-            .ok_or_else(|| AclError::OutboundError("No resolve info".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No resolve info".to_string(),
+            })?;
 
         if !info.has_address() {
-            return Err(AclError::OutboundError(
-                info.error
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: info
+                    .error
                     .clone()
                     .unwrap_or_else(|| "No address available".to_string()),
-            ));
+            });
         }
 
-        let stream = match self.mode {
-            DirectMode::Auto => {
-                if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
-                    self.dual_stack_dial_tcp(ipv4, ipv6, addr.port)?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
+        let stream = if self.mode == DirectMode::Auto {
+            if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
+                self.dual_stack_dial_tcp(ipv4, ipv6, addr.port)?
+            } else {
+                self.dial_tcp_ip(select_ip(self.mode, info)?, addr.port)?
             }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.dial_tcp_ip(IpAddr::V6(ipv6), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.dial_tcp_ip(IpAddr::V4(ipv4), addr.port)?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
+        } else {
+            self.dial_tcp_ip(select_ip(self.mode, info)?, addr.port)?
         };
 
         Ok(Box::new(StdTcpConn::new(stream)))
@@ -461,20 +495,11 @@ impl Outbound for Direct {
 
         let socket = if self.bind_device.is_some() {
             UdpSocket::from(self.create_udp_socket_with_device(use_ipv6)?)
-        } else if use_ipv6 {
-            let bind_addr = self
-                .bind_ip6
-                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
-            UdpSocket::bind(bind_addr)
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         } else {
-            let bind_addr = self
-                .bind_ip4
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            UdpSocket::bind(bind_addr)
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
+            UdpSocket::bind(self.udp_bind_addr(use_ipv6)).map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to bind UDP: {}", e),
+            })?
         };
 
         Ok(Box::new(DirectUdpConn::new(socket, self.mode)))
@@ -490,65 +515,32 @@ impl AsyncOutbound for Direct {
         let info = addr
             .resolve_info
             .as_ref()
-            .ok_or_else(|| AclError::OutboundError("No resolve info".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No resolve info".to_string(),
+            })?;
 
         if !info.has_address() {
-            return Err(AclError::OutboundError(
-                info.error
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: info
+                    .error
                     .clone()
                     .unwrap_or_else(|| "No address available".to_string()),
-            ));
+            });
         }
 
-        let stream = match self.mode {
-            DirectMode::Auto => {
-                if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
-                    self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port)
-                        .await?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
+        let stream = if self.mode == DirectMode::Auto {
+            if let (Some(ipv4), Some(ipv6)) = (info.ipv4, info.ipv6) {
+                self.async_dual_stack_dial_tcp(ipv4, ipv6, addr.port)
+                    .await?
+            } else {
+                self.async_dial_tcp_ip(select_ip(self.mode, info)?, addr.port)
+                    .await?
             }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    self.async_dial_tcp_ip(IpAddr::V6(ipv6), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    self.async_dial_tcp_ip(IpAddr::V4(ipv4), addr.port).await?
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
+        } else {
+            self.async_dial_tcp_ip(select_ip(self.mode, info)?, addr.port)
+                .await?
         };
 
         Ok(Box::new(TokioTcpConn::new(stream)))
@@ -561,29 +553,24 @@ impl AsyncOutbound for Direct {
 
         let socket = if self.bind_device.is_some() {
             let socket = self.create_udp_socket_with_device(use_ipv6)?;
-            socket.set_nonblocking(true).map_err(|e| {
-                AclError::OutboundError(format!("Failed to set nonblocking: {}", e))
-            })?;
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to set nonblocking: {}", e),
+                })?;
             let std_socket: std::net::UdpSocket = socket.into();
-            TokioUdpSocket::from_std(std_socket).map_err(|e| {
-                AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
+            TokioUdpSocket::from_std(std_socket).map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to create UDP socket: {}", e),
             })?
-        } else if use_ipv6 {
-            let bind_addr = self
-                .bind_ip6
-                .map(|ip| SocketAddr::new(IpAddr::V6(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
-            TokioUdpSocket::bind(bind_addr)
-                .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
         } else {
-            let bind_addr = self
-                .bind_ip4
-                .map(|ip| SocketAddr::new(IpAddr::V4(ip), 0))
-                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-            TokioUdpSocket::bind(bind_addr)
+            TokioUdpSocket::bind(self.udp_bind_addr(use_ipv6))
                 .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind UDP: {}", e),
+                })?
         };
 
         Ok(Box::new(AsyncDirectUdpConn::new(socket, self.mode)))
@@ -615,10 +602,13 @@ fn set_tcp_fastopen(socket: &socket2::Socket) -> Result<()> {
         )
     };
     if ret < 0 {
-        return Err(AclError::OutboundError(format!(
-            "Failed to set TCP Fast Open: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!(
+                "Failed to set TCP Fast Open: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
     }
     Ok(())
 }
@@ -631,54 +621,59 @@ fn set_tcp_fastopen(_socket: &socket2::Socket) -> Result<()> {
     ))
 }
 
+/// Select an IP address based on DirectMode preference.
+///
+/// For Auto mode, behaves like Prefer46 (prefers IPv4, falls back to IPv6).
+/// TCP callers should handle Auto's dual-stack case separately before calling this.
+fn select_ip(mode: DirectMode, info: &ResolveInfo) -> Result<IpAddr> {
+    match mode {
+        DirectMode::Auto | DirectMode::Prefer46 => info
+            .ipv4
+            .map(IpAddr::V4)
+            .or(info.ipv6.map(IpAddr::V6))
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address available".to_string(),
+            }),
+        DirectMode::Prefer64 => info
+            .ipv6
+            .map(IpAddr::V6)
+            .or(info.ipv4.map(IpAddr::V4))
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address available".to_string(),
+            }),
+        DirectMode::Only6 => info
+            .ipv6
+            .map(IpAddr::V6)
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No IPv6 address available".to_string(),
+            }),
+        DirectMode::Only4 => info
+            .ipv4
+            .map(IpAddr::V4)
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No IPv4 address available".to_string(),
+            }),
+    }
+}
+
 /// Resolve UDP target address based on DirectMode preference.
 fn resolve_udp_addr(mode: DirectMode, addr: &Addr) -> Result<SocketAddr> {
     if let Some(ref info) = addr.resolve_info {
-        let ip = match mode {
-            DirectMode::Auto | DirectMode::Prefer46 => {
-                if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Prefer64 => {
-                if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else {
-                    return Err(AclError::OutboundError("No address available".to_string()));
-                }
-            }
-            DirectMode::Only6 => {
-                if let Some(ipv6) = info.ipv6 {
-                    IpAddr::V6(ipv6)
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv6 address available".to_string(),
-                    ));
-                }
-            }
-            DirectMode::Only4 => {
-                if let Some(ipv4) = info.ipv4 {
-                    IpAddr::V4(ipv4)
-                } else {
-                    return Err(AclError::OutboundError(
-                        "No IPv4 address available".to_string(),
-                    ));
-                }
-            }
-        };
+        let ip = select_ip(mode, info)?;
         return Ok(SocketAddr::new(ip, addr.port));
     }
 
     // Fall back to parsing the address string
     addr.network_addr()
         .parse()
-        .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Invalid address: {}", e),
+        })
 }
 
 /// Direct UDP connection with mode-aware address selection.
@@ -698,7 +693,10 @@ impl UdpConn for DirectUdpConn {
         let (n, addr) = self
             .socket
             .recv_from(buf)
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
         Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
     }
 
@@ -706,11 +704,10 @@ impl UdpConn for DirectUdpConn {
         let socket_addr = resolve_udp_addr(self.mode, addr)?;
         self.socket
             .send_to(buf, socket_addr)
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
-    }
-
-    fn close(&self) -> Result<()> {
-        Ok(())
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
     }
 }
 
@@ -736,7 +733,10 @@ impl AsyncUdpConn for AsyncDirectUdpConn {
             .socket
             .recv_from(buf)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
         Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
     }
 
@@ -745,11 +745,10 @@ impl AsyncUdpConn for AsyncDirectUdpConn {
         self.socket
             .send_to(buf, socket_addr)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
-    }
-
-    async fn close(&self) -> Result<()> {
-        Ok(())
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
     }
 }
 
@@ -822,6 +821,215 @@ mod tests {
         let info = addr.resolve_info.unwrap();
         assert_eq!(info.ipv4, Some(Ipv4Addr::new(127, 0, 0, 1)));
         assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_select_ip_auto_both_prefers_v4() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_auto_v4_only() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_select_ip_auto_v6_only() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let ip = select_ip(DirectMode::Auto, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_auto_no_address() {
+        let info = ResolveInfo::new();
+        assert!(select_ip(DirectMode::Auto, &info).is_err());
+    }
+
+    #[test]
+    fn test_select_ip_prefer64_both_prefers_v6() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Prefer64, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_prefer64_v4_fallback() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let ip = select_ip(DirectMode::Prefer64, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_prefer46_both_prefers_v4() {
+        let info = ResolveInfo {
+            ipv4: Some(Ipv4Addr::new(1, 2, 3, 4)),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        };
+        let ip = select_ip(DirectMode::Prefer46, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_only6_success() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let ip = select_ip(DirectMode::Only6, &info).unwrap();
+        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_select_ip_only6_fails_when_no_v6() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let err = select_ip(DirectMode::Only6, &info).unwrap_err();
+        assert!(err.to_string().contains("IPv6"));
+    }
+
+    #[test]
+    fn test_select_ip_only4_success() {
+        let info = ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4));
+        let ip = select_ip(DirectMode::Only4, &info).unwrap();
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn test_select_ip_only4_fails_when_no_v4() {
+        let info = ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST);
+        let err = select_ip(DirectMode::Only4, &info).unwrap_err();
+        assert!(err.to_string().contains("IPv4"));
+    }
+
+    #[test]
+    fn test_select_ip_empty_resolve_info() {
+        let info = ResolveInfo::new();
+        assert!(select_ip(DirectMode::Prefer46, &info).is_err());
+        assert!(select_ip(DirectMode::Prefer64, &info).is_err());
+        assert!(select_ip(DirectMode::Only4, &info).is_err());
+        assert!(select_ip(DirectMode::Only6, &info).is_err());
+    }
+
+    #[test]
+    fn test_udp_bind_addr_ipv4_default() {
+        let direct = Direct::new();
+        let addr = direct.udp_bind_addr(false);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+    }
+
+    #[test]
+    fn test_udp_bind_addr_ipv6_default() {
+        let direct = Direct::new();
+        let addr = direct.udp_bind_addr(true);
+        assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
+    }
+
+    #[test]
+    fn test_udp_bind_addr_ipv4_custom() {
+        let direct = Direct::with_options(DirectOptions {
+            bind_ip4: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let addr = direct.udp_bind_addr(false);
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 0)
+        );
+    }
+
+    #[test]
+    fn test_udp_bind_addr_ipv6_custom() {
+        let direct = Direct::with_options(DirectOptions {
+            bind_ip6: Some(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let addr = direct.udp_bind_addr(true);
+        assert_eq!(
+            addr,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 0)
+        );
+    }
+
+    #[test]
+    fn test_dial_tcp_ip_cancellable_skips_when_cancelled() {
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true)); // Already cancelled
+
+        // Should return None without attempting connection
+        let result =
+            direct.dial_tcp_ip_cancellable(IpAddr::V4(Ipv4Addr::LOCALHOST), 80, &cancelled);
+        assert!(result.is_none(), "Should skip connection when cancelled");
+    }
+
+    #[test]
+    fn test_dial_tcp_ip_cancellable_attempts_when_not_cancelled() {
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false)); // Not cancelled
+
+        // Should attempt connection (port 1 → connection refused)
+        let result = direct.dial_tcp_ip_cancellable(IpAddr::V4(Ipv4Addr::LOCALHOST), 1, &cancelled);
+        assert!(
+            result.is_some(),
+            "Should attempt connection when not cancelled"
+        );
+        assert!(result.unwrap().is_err(), "Port 1 should fail");
+    }
+
+    #[test]
+    fn test_dual_stack_both_fail_error_includes_context() {
+        // BUG B3: dual_stack_dial_tcp silently discards the first error.
+        // When both v4 and v6 fail, the error should mention both attempts.
+        use super::Outbound;
+
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(2)),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut addr = Addr::new("test.invalid", 1);
+        // Both loopback on port 1 → "connection refused"
+        addr.resolve_info = Some(ResolveInfo {
+            ipv4: Some(Ipv4Addr::LOCALHOST),
+            ipv6: Some(Ipv6Addr::LOCALHOST),
+            error: None,
+        });
+
+        let result = Outbound::dial_tcp(&direct, &mut addr);
+        match result {
+            Err(e) => {
+                let err_msg = e.to_string();
+                // After fix: error should contain both addresses so the dev
+                // knows BOTH paths were tried and failed.
+                assert!(
+                    (err_msg.contains("127.0.0.1") && err_msg.contains("::1"))
+                        || err_msg.contains("dual")
+                        || err_msg.contains("both"),
+                    "Dual-stack failure should mention both addresses, got: {}",
+                    err_msg
+                );
+            }
+            Ok(_) => panic!("Expected connection error on port 1"),
+        }
     }
 }
 

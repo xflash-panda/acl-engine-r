@@ -2,7 +2,7 @@
 //!
 //! Rejects all connection attempts.
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 #[cfg(feature = "async")]
 use super::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn};
@@ -29,11 +29,17 @@ impl Default for Reject {
 
 impl Outbound for Reject {
     fn dial_tcp(&self, _addr: &mut Addr) -> Result<Box<dyn TcpConn>> {
-        Err(AclError::OutboundError("Connection rejected".to_string()))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "Connection rejected".to_string(),
+        })
     }
 
     fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn UdpConn>> {
-        Err(AclError::OutboundError("Connection rejected".to_string()))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "Connection rejected".to_string(),
+        })
     }
 }
 
@@ -41,11 +47,17 @@ impl Outbound for Reject {
 #[async_trait]
 impl AsyncOutbound for Reject {
     async fn dial_tcp(&self, _addr: &mut Addr) -> Result<Box<dyn AsyncTcpConn>> {
-        Err(AclError::OutboundError("Connection rejected".to_string()))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "Connection rejected".to_string(),
+        })
     }
 
     async fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>> {
-        Err(AclError::OutboundError("Connection rejected".to_string()))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "Connection rejected".to_string(),
+        })
     }
 }
 

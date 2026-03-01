@@ -1,6 +1,7 @@
 //! Integration tests for GeoIP and GeoSite with real data files.
 
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use acl_engine_r::geo::{dat, mmdb, singsite, GeoIpFormat, GeoSiteFormat};
@@ -454,11 +455,39 @@ mod file_geo_loader_tests {
 
         let loader = FileGeoLoader::new().with_geoip_path(&geoip_path);
 
-        // MMDB format doesn't support pre-loading by country code
-        // It uses on-demand lookup via the reader
-        let result = loader.load_geoip("cn");
-        // This may return an empty matcher for MMDB since we don't pre-load
-        assert!(result.is_ok() || result.is_err());
+        let matcher = loader.load_geoip("cn").unwrap();
+
+        // Bug: MMDB load_geoip returns empty HashMap, so matcher never matches.
+        // Verify that MMDB GeoIP actually matches known Chinese IPs.
+        let ip: IpAddr = "114.114.114.114".parse().unwrap();
+        let host = HostInfo::from_ip(ip);
+        assert!(
+            matcher.matches(&host),
+            "114.114.114.114 should be in CN via MMDB FileGeoLoader"
+        );
+    }
+
+    #[test]
+    fn test_file_geo_loader_metadb() {
+        let geoip_path = testdata_path("geoip.metadb");
+
+        if !geoip_path.exists() {
+            eprintln!("Skipping test: geoip.metadb not found");
+            return;
+        }
+
+        let loader = FileGeoLoader::new().with_geoip_path(&geoip_path);
+
+        let matcher = loader.load_geoip("cn").unwrap();
+
+        // Bug: MetaDB load_geoip returns empty HashMap, so matcher never matches.
+        // Verify that MetaDB GeoIP actually matches known Chinese IPs.
+        let ip: IpAddr = "114.114.114.114".parse().unwrap();
+        let host = HostInfo::from_ip(ip);
+        assert!(
+            matcher.matches(&host),
+            "114.114.114.114 should be in CN via MetaDB FileGeoLoader"
+        );
     }
 
     #[test]
@@ -520,6 +549,7 @@ mod format_detection_tests {
 
 mod router_tests {
     use super::*;
+    use acl_engine_r::outbound::Outbound;
     use acl_engine_r::{Direct, OutboundEntry, Reject, Router, RouterOptions};
     use std::sync::Arc;
 
@@ -543,12 +573,13 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -579,12 +610,13 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(1024);
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -631,13 +663,14 @@ mod router_tests {
             proxy(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
-            OutboundEntry::new("reject", Arc::new(Reject::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("reject", Arc::new(Reject::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(2048);
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(2048).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -666,9 +699,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new();
@@ -703,9 +736,9 @@ mod router_tests {
             direct(all)
         "#;
 
-        let outbounds = vec![
-            OutboundEntry::new("direct", Arc::new(Direct::new())),
-            OutboundEntry::new("proxy", Arc::new(Direct::new())),
+        let outbounds: Vec<OutboundEntry> = vec![
+            OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+            OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
         let options: RouterOptions = RouterOptions::new();
@@ -748,7 +781,12 @@ mod compiled_ruleset_tests {
         outbounds.insert("direct".to_string(), "DIRECT".to_string());
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
 
-        let ruleset = compile(&rules, &outbounds, 1024, &geo_loader);
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        );
         assert!(
             ruleset.is_ok(),
             "Failed to compile rules: {:?}",
@@ -797,7 +835,12 @@ mod compiled_ruleset_tests {
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
         outbounds.insert("reject".to_string(), "REJECT".to_string());
 
-        let ruleset = compile(&rules, &outbounds, 1024, &geo_loader);
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        );
         assert!(
             ruleset.is_ok(),
             "Failed to compile rules: {:?}",
@@ -858,7 +901,13 @@ mod compiled_ruleset_tests {
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
         outbounds.insert("reject".to_string(), "REJECT".to_string());
 
-        let ruleset = compile(&rules, &outbounds, 1024, &geo_loader).unwrap();
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        )
+        .unwrap();
 
         // Test UDP 443 (QUIC) should be rejected
         let host = HostInfo::from_name("www.google.com");

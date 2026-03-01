@@ -21,7 +21,3 @@
 mod matcher;
 
 pub use matcher::SuccinctMatcher;
-
-// Note: SuccinctSet is kept for potential future use with true succinct trie implementation
-#[allow(dead_code)]
-mod succinct;

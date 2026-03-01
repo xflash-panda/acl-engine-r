@@ -1,16 +1,26 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use ipnet::IpNet;
 use lru::LruCache;
 use serde::Deserialize;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 
 /// Default cache size for CachedMetaDbReader
 pub const DEFAULT_CACHE_SIZE: usize = 1024;
+
+/// Default cache size as NonZeroUsize (compile-time verified).
+const DEFAULT_CACHE_SIZE_NZ: std::num::NonZeroUsize =
+    // SAFETY: 1024 is non-zero. This is a compile-time constant.
+    match std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE) {
+            Some(v) => v,
+            None => panic!("DEFAULT_CACHE_SIZE must be non-zero"),
+        };
 
 /// MetaDB database types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +57,11 @@ pub struct MetaDbReader {
 impl MetaDbReader {
     /// Open a MetaDB file
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let reader = maxminddb::Reader::open_readfile(path.as_ref())
-            .map_err(|e| AclError::GeoIpError(format!("Failed to open MetaDB: {}", e)))?;
+        let reader =
+            maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+                kind: GeoErrorKind::FileError,
+                message: format!("Failed to open MetaDB: {}", e),
+            })?;
 
         let db_type = DatabaseType::from_str(&reader.metadata.database_type);
 
@@ -127,15 +140,20 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 
 /// Verify MetaDB file integrity
 pub fn verify(path: impl AsRef<Path>) -> Result<()> {
-    maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError(format!("Failed to verify MetaDB: {}", e)))?;
+    maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+        kind: GeoErrorKind::FileError,
+        message: format!("Failed to verify MetaDB: {}", e),
+    })?;
     Ok(())
 }
 
 /// Create a shared MetaDB reader
 pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
-    let reader = maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError(format!("Failed to open MetaDB: {}", e)))?;
+    let reader =
+        maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+            kind: GeoErrorKind::FileError,
+            message: format!("Failed to open MetaDB: {}", e),
+        })?;
     Ok(Arc::new(reader))
 }
 
@@ -159,8 +177,7 @@ impl CachedMetaDbReader {
         Self {
             reader,
             cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(cache_size)
-                    .unwrap_or(std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap()),
+                std::num::NonZeroUsize::new(cache_size).unwrap_or(DEFAULT_CACHE_SIZE_NZ),
             )),
         }
     }
@@ -181,7 +198,7 @@ impl CachedMetaDbReader {
     pub fn lookup_codes(&self, ip: IpAddr) -> Vec<String> {
         // Check cache first
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock();
             if let Some(codes) = cache.get(&ip) {
                 return codes.clone();
             }
@@ -192,7 +209,7 @@ impl CachedMetaDbReader {
 
         // Store in cache
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock();
             cache.put(ip, codes.clone());
         }
 
@@ -206,13 +223,13 @@ impl CachedMetaDbReader {
 
     /// Clear the LRU cache
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock();
         cache.clear();
     }
 
     /// Get the number of items in the cache
     pub fn cache_len(&self) -> usize {
-        let cache = self.cache.lock().unwrap();
+        let cache = self.cache.lock();
         cache.len()
     }
 }

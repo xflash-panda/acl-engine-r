@@ -40,6 +40,13 @@ pub enum Matcher {
     GeoSite(GeoSiteMatcher),
 }
 
+impl Matcher {
+    /// Returns true if this matcher requires IP address resolution to work.
+    pub fn needs_ip(&self) -> bool {
+        matches!(self, Matcher::Ip(_) | Matcher::Cidr(_) | Matcher::GeoIp(_))
+    }
+}
+
 impl HostMatcher for Matcher {
     fn matches(&self, host: &HostInfo) -> bool {
         match self {

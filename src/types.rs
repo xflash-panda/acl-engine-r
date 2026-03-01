@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Network protocol type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,23 +25,32 @@ pub struct HostInfo {
     /// Hostname (domain name)
     pub name: String,
     /// Resolved IPv4 address
-    pub ipv4: Option<IpAddr>,
+    pub ipv4: Option<Ipv4Addr>,
     /// Resolved IPv6 address
-    pub ipv6: Option<IpAddr>,
+    pub ipv6: Option<Ipv6Addr>,
 }
 
 impl HostInfo {
-    /// Create a new HostInfo with just a name
+    /// Create a new HostInfo with just a name.
+    ///
+    /// If the name is an IP address literal (e.g. "192.168.1.1" or "::1"),
+    /// the corresponding ipv4/ipv6 field is auto-populated so that IP/CIDR
+    /// rules work correctly without requiring [`from_ip`](Self::from_ip).
     pub fn from_name(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into().to_lowercase(),
-            ipv4: None,
-            ipv6: None,
-        }
+        let name = name.into().to_lowercase();
+        let (ipv4, ipv6) = if let Ok(ip) = name.parse::<IpAddr>() {
+            match ip {
+                IpAddr::V4(v4) => (Some(v4), None),
+                IpAddr::V6(v6) => (None, Some(v6)),
+            }
+        } else {
+            (None, None)
+        };
+        Self { name, ipv4, ipv6 }
     }
 
     /// Create a new HostInfo with name and IPs
-    pub fn new(name: impl Into<String>, ipv4: Option<IpAddr>, ipv6: Option<IpAddr>) -> Self {
+    pub fn new(name: impl Into<String>, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> Self {
         Self {
             name: name.into().to_lowercase(),
             ipv4,
@@ -52,15 +61,15 @@ impl HostInfo {
     /// Create a HostInfo from an IP address
     pub fn from_ip(ip: IpAddr) -> Self {
         match ip {
-            IpAddr::V4(_) => Self {
+            IpAddr::V4(v4) => Self {
                 name: String::new(),
-                ipv4: Some(ip),
+                ipv4: Some(v4),
                 ipv6: None,
             },
-            IpAddr::V6(_) => Self {
+            IpAddr::V6(v6) => Self {
                 name: String::new(),
                 ipv4: None,
-                ipv6: Some(ip),
+                ipv6: Some(v6),
             },
         }
     }
@@ -90,24 +99,157 @@ pub struct MatchResult<O> {
     pub hijack_ip: Option<IpAddr>,
 }
 
-/// Cache key for LRU cache
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct CacheKey {
-    pub name: String,
-    pub ipv4: Option<IpAddr>,
-    pub ipv6: Option<IpAddr>,
-    pub protocol: Protocol,
-    pub port: u16,
-}
+/// Cache key for LRU cache.
+/// Lightweight u64 hash — does NOT clone the hostname string on construction.
+/// Hash collision safety is handled by storing verification data in the cache
+/// entry (see `CacheEntry` in compile.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey(u64);
 
 impl CacheKey {
-    pub fn from_host(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
-        Self {
-            name: host.name.to_lowercase(),
-            ipv4: host.ipv4,
-            ipv6: host.ipv6,
-            protocol,
-            port,
-        }
+    /// Compute a cache key hash from host info, protocol, and port.
+    /// Zero-allocation: does not clone the hostname string.
+    pub fn compute(host: &HostInfo, protocol: Protocol, port: u16) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        host.name.hash(&mut hasher);
+        host.ipv4.hash(&mut hasher);
+        host.ipv6.hash(&mut hasher);
+        protocol.hash(&mut hasher);
+        port.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hostinfo_typed_ip_fields() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // HostInfo.ipv4 should be Option<Ipv4Addr>, not Option<IpAddr>
+        // HostInfo.ipv6 should be Option<Ipv6Addr>, not Option<IpAddr>
+        // This ensures the compiler prevents putting IPv6 into ipv4 or vice versa.
+        let v4 = Ipv4Addr::new(192, 168, 1, 1);
+        let v6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let host = HostInfo::new("example.com", Some(v4), Some(v6));
+        assert_eq!(host.ipv4, Some(v4));
+        assert_eq!(host.ipv6, Some(v6));
+    }
+
+    #[test]
+    fn test_hostinfo_from_ip_typed() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        let host = HostInfo::from_ip(v4);
+        assert_eq!(host.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(host.ipv6.is_none());
+
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        let host = HostInfo::from_ip(v6);
+        assert!(host.ipv4.is_none());
+        assert_eq!(
+            host.ipv6,
+            Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+    }
+
+    #[test]
+    fn test_cache_key_deterministic() {
+        let host = HostInfo::from_name("example.com");
+        let key1 = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key2 = CacheKey::compute(&host, Protocol::TCP, 443);
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_different_for_different_inputs() {
+        let host = HostInfo::from_name("example.com");
+
+        // Different protocol
+        let key_tcp = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_udp = CacheKey::compute(&host, Protocol::UDP, 443);
+        assert_ne!(key_tcp, key_udp);
+
+        // Different port
+        let key_443 = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_80 = CacheKey::compute(&host, Protocol::TCP, 80);
+        assert_ne!(key_443, key_80);
+
+        // Different host
+        let host2 = HostInfo::from_name("other.com");
+        let key_other = CacheKey::compute(&host2, Protocol::TCP, 443);
+        assert_ne!(key_tcp, key_other);
+    }
+
+    #[test]
+    fn test_cache_key_with_ip() {
+        let host_no_ip = HostInfo::from_name("example.com");
+        let host_with_ip = HostInfo::new("example.com", Some("1.2.3.4".parse().unwrap()), None);
+
+        let key1 = CacheKey::compute(&host_no_ip, Protocol::TCP, 443);
+        let key2 = CacheKey::compute(&host_with_ip, Protocol::TCP, 443);
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn test_cache_key_is_lightweight_hash() {
+        // CacheKey should be a lightweight u64 hash, NOT a full copy of
+        // HostInfo fields. This avoids cloning the hostname String on
+        // every cache lookup. Hash collision safety is handled by storing
+        // verification data in the cache entry (see compile.rs CacheEntry).
+        let key_size = std::mem::size_of::<CacheKey>();
+        assert_eq!(
+            key_size,
+            std::mem::size_of::<u64>(),
+            "CacheKey should be a u64 hash to avoid String clone on lookup (actual size={})",
+            key_size
+        );
+    }
+
+    #[test]
+    fn test_cache_key_is_copy() {
+        let host = HostInfo::from_name("example.com");
+        let key = CacheKey::compute(&host, Protocol::TCP, 443);
+        let key_copy = key; // Copy, not move
+        assert_eq!(key, key_copy);
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_auto_detects_ipv4() {
+        // BUG B5: HostInfo::from_name("192.168.1.1") sets ipv4=None, so
+        // IP/CIDR rules silently don't match. from_name should auto-detect
+        // IP literals and populate the ipv4/ipv6 fields.
+        use std::net::Ipv4Addr;
+        let host = HostInfo::from_name("192.168.1.1");
+        assert_eq!(
+            host.ipv4,
+            Some(Ipv4Addr::new(192, 168, 1, 1)),
+            "from_name should auto-detect IPv4 literals"
+        );
+        // Name should still be preserved for domain matching fallback
+        assert_eq!(host.name, "192.168.1.1");
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_auto_detects_ipv6() {
+        use std::net::Ipv6Addr;
+        let host = HostInfo::from_name("::1");
+        assert_eq!(
+            host.ipv6,
+            Some(Ipv6Addr::LOCALHOST),
+            "from_name should auto-detect IPv6 literals"
+        );
+        assert_eq!(host.name, "::1");
+    }
+
+    #[test]
+    fn test_hostinfo_from_name_domain_unchanged() {
+        // Regular domain names should NOT set ipv4/ipv6
+        let host = HostInfo::from_name("example.com");
+        assert!(host.ipv4.is_none());
+        assert!(host.ipv6.is_none());
+        assert_eq!(host.name, "example.com");
     }
 }

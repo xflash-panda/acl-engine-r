@@ -7,10 +7,10 @@
 //! - `Http`: HTTP/HTTPS proxy connection (CONNECT method)
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 #[cfg(feature = "async")]
 use async_trait::async_trait;
@@ -31,23 +31,70 @@ pub use socks5::Socks5;
 pub const DEFAULT_DIALER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Network address with optional DNS resolution info.
+///
+/// Fields are crate-private to prevent bypassing input validation.
+/// Use [`host()`](Self::host), [`port()`](Self::port), and
+/// [`resolve_info()`](Self::resolve_info) for read access.
 #[derive(Debug, Clone)]
 pub struct Addr {
     /// Hostname or IP address
-    pub host: String,
+    pub(crate) host: String,
     /// Port number
-    pub port: u16,
+    pub(crate) port: u16,
     /// Optional DNS resolution result
-    pub resolve_info: Option<ResolveInfo>,
+    pub(crate) resolve_info: Option<ResolveInfo>,
 }
 
 impl Addr {
-    /// Create a new Addr
+    /// Create a new Addr.
+    ///
+    /// Control characters (bytes < 0x20 and 0x7F) are stripped from the host
+    /// to prevent injection attacks in downstream protocols (HTTP CONNECT, SOCKS5).
+    /// Use [`try_new`](Self::try_new) for strict validation that rejects bad input.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
+        let host: String = host.into().chars().filter(|c| !c.is_control()).collect();
         Self {
-            host: host.into(),
+            host,
             port,
             resolve_info: None,
+        }
+    }
+
+    /// Create a new Addr with strict validation.
+    ///
+    /// Returns an error if:
+    /// - host is empty
+    /// - host contains control characters (bytes < 0x20 or 0x7F)
+    pub fn try_new(host: impl Into<String>, port: u16) -> Result<Self> {
+        let host = host.into();
+        if host.is_empty() {
+            return Err(AclError::InvalidAddress(
+                "host must not be empty".to_string(),
+            ));
+        }
+        if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(AclError::InvalidAddress(
+                "host contains control characters".to_string(),
+            ));
+        }
+        Ok(Self {
+            host,
+            port,
+            resolve_info: None,
+        })
+    }
+
+    /// Create an Addr from a SocketAddr, pre-populating resolve info.
+    /// This avoids redundant DNS resolution for addresses from UDP recv_from.
+    pub fn from_socket_addr(addr: SocketAddr) -> Self {
+        let resolve_info = match addr.ip() {
+            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
+            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
+        };
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            resolve_info: Some(resolve_info),
         }
     }
 
@@ -57,15 +104,38 @@ impl Addr {
         self
     }
 
-    /// Get the address string in host:port format
-    pub fn addr_string(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+    /// Get the hostname or IP address.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Get the port number.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Get the optional DNS resolution info.
+    pub fn resolve_info(&self) -> Option<&ResolveInfo> {
+        self.resolve_info.as_ref()
+    }
+
+    /// Parse the network address into a SocketAddr.
+    /// Returns an error if the address cannot be parsed (e.g. unresolved domain).
+    pub fn to_socket_addr(&self) -> Result<SocketAddr> {
+        self.network_addr()
+            .parse()
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("Invalid address: {}", e),
+            })
     }
 
     /// Get the network address for dialing.
     /// If ResolveInfo contains an IPv4 address, it returns that.
     /// Otherwise, if it contains an IPv6 address, it returns that.
     /// If no resolved address is available, it falls back to Host.
+    ///
+    /// Returns `"0.0.0.0:{port}"` if host is empty (defensive fallback).
     pub fn network_addr(&self) -> String {
         if let Some(ref info) = self.resolve_info {
             if let Some(ipv4) = info.ipv4 {
@@ -75,7 +145,15 @@ impl Addr {
                 return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
             }
         }
-        self.addr_string()
+        if self.host.is_empty() {
+            return SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), self.port)
+                .to_string();
+        }
+        // If host is an IPv6 literal, format as [ip]:port via SocketAddr
+        if let Ok(ipv6) = self.host.parse::<std::net::Ipv6Addr>() {
+            return SocketAddr::new(IpAddr::V6(ipv6), self.port).to_string();
+        }
+        self.to_string()
     }
 }
 
@@ -158,29 +236,29 @@ pub trait AsyncOutbound: Send + Sync {
 /// TCP connection interface.
 pub trait TcpConn: Read + Write + Send + Sync {
     /// Get the local address
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> Result<SocketAddr>;
 
     /// Get the peer address
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn peer_addr(&self) -> Result<SocketAddr>;
 
     /// Set read timeout
-    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()>;
 
     /// Set write timeout
-    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()>;
 
     /// Shutdown the connection
-    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>;
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()>;
 }
 
 /// Async TCP connection interface.
 #[cfg(feature = "async")]
 pub trait AsyncTcpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     /// Get the local address
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> Result<SocketAddr>;
 
     /// Get the peer address
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn peer_addr(&self) -> Result<SocketAddr>;
 }
 
 /// Standard TcpStream wrapper implementing TcpConn
@@ -215,24 +293,24 @@ impl Write for StdTcpConn {
 }
 
 impl TcpConn for StdTcpConn {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.local_addr()?)
     }
 
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.peer_addr()?)
     }
 
-    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.inner.set_read_timeout(dur)
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.inner.set_read_timeout(dur)?)
     }
 
-    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.inner.set_write_timeout(dur)
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.inner.set_write_timeout(dur)?)
     }
 
-    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.inner.shutdown(how)
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        Ok(self.inner.shutdown(how)?)
     }
 }
 
@@ -243,9 +321,6 @@ pub trait UdpConn: Send + Sync {
 
     /// Write to the UDP connection
     fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
-
-    /// Close the connection
-    fn close(&self) -> Result<()>;
 }
 
 /// Async UDP connection interface.
@@ -257,49 +332,6 @@ pub trait AsyncUdpConn: Send + Sync {
 
     /// Write to the UDP connection
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize>;
-
-    /// Close the connection
-    async fn close(&self) -> Result<()>;
-}
-
-/// Standard UdpSocket wrapper implementing UdpConn
-pub struct StdUdpConn {
-    inner: UdpSocket,
-}
-
-impl StdUdpConn {
-    pub fn new(socket: UdpSocket) -> Self {
-        Self { inner: socket }
-    }
-
-    pub fn into_inner(self) -> UdpSocket {
-        self.inner
-    }
-}
-
-impl UdpConn for StdUdpConn {
-    fn read_from(&self, buf: &mut [u8]) -> Result<(usize, Addr)> {
-        let (n, addr) = self
-            .inner
-            .recv_from(buf)
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
-        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
-    }
-
-    fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let socket_addr: SocketAddr = addr
-            .network_addr()
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
-        self.inner
-            .send_to(buf, socket_addr)
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
-    }
-
-    fn close(&self) -> Result<()> {
-        // UdpSocket doesn't have explicit close, it closes on drop
-        Ok(())
-    }
 }
 
 /// Tokio TcpStream wrapper implementing AsyncTcpConn
@@ -357,12 +389,12 @@ impl AsyncWrite for TokioTcpConn {
 
 #[cfg(feature = "async")]
 impl AsyncTcpConn for TokioTcpConn {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.local_addr()?)
     }
 
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.peer_addr()?)
     }
 }
 
@@ -391,28 +423,61 @@ impl AsyncUdpConn for TokioUdpConn {
             .inner
             .recv_from(buf)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
-        Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
+        Ok((n, Addr::from_socket_addr(addr)))
     }
 
     async fn write_to(&self, buf: &[u8], addr: &Addr) -> Result<usize> {
-        let socket_addr: SocketAddr = addr
-            .network_addr()
-            .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))?;
         self.inner
-            .send_to(buf, socket_addr)
+            .send_to(buf, addr.to_socket_addr()?)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
+    }
+}
+
+/// Try to resolve the address from an IP literal.
+/// Returns true if resolve_info is already set or was set from an IP literal.
+/// Returns false if the host is a domain name that needs DNS resolution.
+pub(crate) fn try_resolve_from_ip(addr: &mut Addr) -> bool {
+    if addr.resolve_info.is_some() {
+        return true;
     }
 
-    async fn close(&self) -> Result<()> {
-        Ok(())
+    if let Ok(ip) = addr.host.parse::<IpAddr>() {
+        addr.resolve_info = Some(match ip {
+            IpAddr::V4(v4) => ResolveInfo::from_ipv4(v4),
+            IpAddr::V6(v6) => ResolveInfo::from_ipv6(v6),
+        });
+        return true;
+    }
+
+    false
+}
+
+/// Build ResolveInfo from a list of resolved IP addresses.
+pub(crate) fn build_resolve_info(ips: &[IpAddr]) -> ResolveInfo {
+    let (ipv4, ipv6) = split_ipv4_ipv6(ips);
+    if ipv4.is_none() && ipv6.is_none() {
+        ResolveInfo::from_error("no address found")
+    } else {
+        ResolveInfo {
+            ipv4,
+            ipv6,
+            error: None,
+        }
     }
 }
 
 /// Split IP addresses into IPv4 and IPv6
-pub fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+pub(crate) fn split_ipv4_ipv6(
+    ips: &[IpAddr],
+) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut ipv4 = None;
     let mut ipv6 = None;
 
@@ -428,4 +493,346 @@ pub fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<st
     }
 
     (ipv4, ipv6)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    // D3: TcpConn should return crate::Result (not io::Result) for consistency
+    // with Outbound trait. Consumers should be able to use ? on both dial_tcp()
+    // and TcpConn methods without two different error types.
+    fn _use_tcp_conn_with_unified_error(conn: &dyn TcpConn) -> Result<SocketAddr> {
+        // If TcpConn methods return crate::Result, this compiles with a single ?.
+        // If they return io::Result, this won't compile without map_err.
+        let addr = conn.local_addr()?;
+        Ok(addr)
+    }
+
+    #[cfg(feature = "async")]
+    fn _use_async_tcp_conn_with_unified_error(conn: &dyn AsyncTcpConn) -> Result<SocketAddr> {
+        let addr = conn.local_addr()?;
+        Ok(addr)
+    }
+
+    #[test]
+    fn test_tcp_conn_local_addr_returns_acl_error() {
+        // D3: Verify that TcpConn errors are AclError, not io::Error
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // local_addr should return crate::Result<SocketAddr>
+        let result = conn.local_addr();
+        assert!(result.is_ok());
+
+        // The result type should be crate::Result, meaning the error is AclError
+        let result: Result<SocketAddr> = conn.local_addr();
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_conn_set_read_timeout_returns_acl_error() {
+        // D3: Verify set_read_timeout returns crate::Result
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // set_read_timeout should return crate::Result<()>
+        let result: Result<()> = conn.set_read_timeout(Some(Duration::from_secs(1)));
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_conn_shutdown_returns_acl_error() {
+        // D3: Verify shutdown returns crate::Result
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // shutdown should return crate::Result<()>
+        let result: Result<()> = conn.shutdown(std::net::Shutdown::Both);
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_addr_from_socket_addr_v4() {
+        let sock_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let addr = Addr::from_socket_addr(sock_addr);
+
+        assert_eq!(addr.host, "192.168.1.1");
+        assert_eq!(addr.port, 8080);
+        assert!(addr.resolve_info.is_some());
+        let info = addr.resolve_info.unwrap();
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_addr_from_socket_addr_v6() {
+        let sock_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let addr = Addr::from_socket_addr(sock_addr);
+
+        assert_eq!(addr.host, "::1");
+        assert_eq!(addr.port, 443);
+        assert!(addr.resolve_info.is_some());
+        let info = addr.resolve_info.unwrap();
+        assert!(info.ipv4.is_none());
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_addr_new_basic() {
+        let addr = Addr::new("example.com", 80);
+        assert_eq!(addr.host, "example.com");
+        assert_eq!(addr.port, 80);
+        assert!(addr.resolve_info.is_none());
+    }
+
+    #[test]
+    fn test_addr_display() {
+        let addr = Addr::new("example.com", 443);
+        assert_eq!(format!("{}", addr), "example.com:443");
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_basic() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(v6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_empty() {
+        let ips: Vec<IpAddr> = vec![];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert!(v4.is_none());
+        assert!(v6.is_none());
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_only_v4() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(v6.is_none());
+    }
+
+    #[test]
+    fn test_split_ipv4_ipv6_takes_first() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2)),
+        ];
+        let (v4, v6) = split_ipv4_ipv6(&ips);
+        assert_eq!(v4, Some(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(v6, Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_with_resolve_info() {
+        let addr = Addr::new("example.com", 80)
+            .with_resolve_info(ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4)));
+        let sock = addr.to_socket_addr().unwrap();
+        assert_eq!(
+            sock,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80)
+        );
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_domain_fails() {
+        let addr = Addr::new("example.com", 80);
+        assert!(addr.to_socket_addr().is_err());
+    }
+
+    // ========== Shared resolve helper tests ==========
+
+    #[test]
+    fn test_try_resolve_from_ip_v4() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        assert!(try_resolve_from_ip(&mut addr));
+        let info = addr.resolve_info.unwrap();
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(info.ipv6.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_v6() {
+        let mut addr = Addr::new("::1", 443);
+        assert!(try_resolve_from_ip(&mut addr));
+        let info = addr.resolve_info.unwrap();
+        assert!(info.ipv4.is_none());
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_domain() {
+        let mut addr = Addr::new("example.com", 80);
+        assert!(!try_resolve_from_ip(&mut addr));
+        assert!(addr.resolve_info.is_none());
+    }
+
+    #[test]
+    fn test_try_resolve_from_ip_already_resolved() {
+        let mut addr = Addr::new("10.0.0.1", 80);
+        addr.resolve_info = Some(ResolveInfo::from_ipv6(Ipv6Addr::LOCALHOST));
+        assert!(try_resolve_from_ip(&mut addr));
+        // Should keep original, not overwrite
+        assert_eq!(addr.resolve_info.unwrap().ipv6, Some(Ipv6Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_build_resolve_info_mixed() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ];
+        let info = build_resolve_info(&ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(info.ipv6, Some(Ipv6Addr::LOCALHOST));
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn test_build_resolve_info_empty() {
+        let info = build_resolve_info(&[]);
+        assert!(info.ipv4.is_none());
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_some());
+    }
+
+    #[test]
+    fn test_build_resolve_info_v4_only() {
+        let ips = vec![IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))];
+        let info = build_resolve_info(&ips);
+        assert_eq!(info.ipv4, Some(Ipv4Addr::new(192, 168, 0, 1)));
+        assert!(info.ipv6.is_none());
+        assert!(info.error.is_none());
+    }
+
+    // ===== Bug verification tests =====
+
+    #[test]
+    fn test_addr_empty_host_network_addr_should_be_valid() {
+        // P0-2: Addr::new("", 80) creates ":80" which is not a valid address.
+        // network_addr() should produce a parseable SocketAddr or host:port.
+        let addr = Addr::new("", 80);
+        let network = addr.network_addr();
+        // ":80" is not valid — this exposes the lack of validation
+        assert_ne!(
+            network, ":80",
+            "empty host should not produce ':port' address"
+        );
+    }
+
+    #[test]
+    fn test_addr_control_chars_in_host() {
+        // P0-2: Addr accepts control chars in host, can cause injection downstream
+        let addr = Addr::new("evil\r\nHost: injected\r\n", 80);
+        // Host should not contain control characters
+        assert!(
+            !addr.host.bytes().any(|b| b < 0x20),
+            "Addr should reject control characters in host"
+        );
+    }
+
+    #[test]
+    fn test_addr_to_socket_addr_ipv6_literal_without_resolve_info() {
+        // BUG B1: Addr::new("::1", 80) without resolve_info
+        // to_socket_addr() calls network_addr() which falls back to Display
+        // Display produces "::1:80" which is NOT a valid SocketAddr.
+        // Should produce "[::1]:80" instead.
+        let addr = Addr::new("::1", 80);
+        let result = addr.to_socket_addr();
+        assert!(
+            result.is_ok(),
+            "to_socket_addr should parse IPv6 literal '::1' without resolve_info, got: {:?}",
+            result
+        );
+        let sock = result.unwrap();
+        assert_eq!(sock.port(), 80);
+        assert!(sock.ip().is_loopback());
+    }
+
+    #[test]
+    fn test_addr_host_getter_returns_filtered_value() {
+        // S1: Addr fields should not be directly writable by third-party consumers.
+        // Getters ensure the host value is always the validated one from construction.
+        let addr = Addr::new("evil\r\nHost: injected\r\n", 80);
+        assert!(
+            !addr.host().bytes().any(|b| b < 0x20),
+            "host() getter should return the filtered value"
+        );
+    }
+
+    #[test]
+    fn test_addr_port_getter() {
+        let addr = Addr::new("example.com", 8080);
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_addr_resolve_info_getter() {
+        let addr = Addr::new("example.com", 80);
+        assert!(addr.resolve_info().is_none());
+
+        let addr = Addr::from_socket_addr("1.2.3.4:80".parse().unwrap());
+        assert!(addr.resolve_info().is_some());
+        assert!(addr.resolve_info().unwrap().has_address());
+    }
+
+    #[test]
+    fn test_addr_network_addr_ipv6_literal_without_resolve_info() {
+        // BUG B1: network_addr() for IPv6 literal without resolve_info
+        // falls back to self.to_string() = "::1:80" which is unparseable.
+        let addr = Addr::new("2001:db8::1", 443);
+        let network = addr.network_addr();
+        // Must be parseable as a SocketAddr
+        assert!(
+            network.parse::<std::net::SocketAddr>().is_ok(),
+            "network_addr for IPv6 literal should be parseable, got: {}",
+            network
+        );
+    }
 }
