@@ -10,7 +10,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 #[cfg(feature = "async")]
 use async_trait::async_trait;
@@ -126,7 +126,10 @@ impl Addr {
     pub fn to_socket_addr(&self) -> Result<SocketAddr> {
         self.network_addr()
             .parse()
-            .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("Invalid address: {}", e),
+            })
     }
 
     /// Get the network address for dialing.
@@ -428,7 +431,10 @@ impl AsyncUdpConn for TokioUdpConn {
             .inner
             .recv_from(buf)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
         Ok((n, Addr::from_socket_addr(addr)))
     }
 
@@ -436,7 +442,10 @@ impl AsyncUdpConn for TokioUdpConn {
         self.inner
             .send_to(buf, addr.to_socket_addr()?)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
     }
 
     async fn close(&self) -> Result<()> {

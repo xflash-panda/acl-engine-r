@@ -6,7 +6,7 @@ use std::path::Path;
 use ipnet::IpNet;
 use prost::Message;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 use crate::matcher::{DomainEntry, DomainType};
 
 // Include the generated protobuf code
@@ -17,10 +17,10 @@ pub mod geodat {
 /// Load GeoIP data from V2Ray DAT format
 pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>> {
     let data = fs::read(path.as_ref())
-        .map_err(|e| AclError::GeoIpError(format!("Failed to read DAT file: {}", e)))?;
+        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to read DAT file: {}", e) })?;
 
     let list = geodat::GeoIpList::decode(&data[..])
-        .map_err(|e| AclError::GeoIpError(format!("Failed to decode GeoIP DAT: {}", e)))?;
+        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::InvalidData, message: format!("Failed to decode GeoIP DAT: {}", e) })?;
 
     let mut result = HashMap::new();
 
@@ -43,10 +43,10 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 /// Load GeoSite data from V2Ray DAT format
 pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<DomainEntry>>> {
     let data = fs::read(path.as_ref())
-        .map_err(|e| AclError::GeoSiteError(format!("Failed to read DAT file: {}", e)))?;
+        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to read DAT file: {}", e) })?;
 
     let list = geodat::GeoSiteList::decode(&data[..])
-        .map_err(|e| AclError::GeoSiteError(format!("Failed to decode GeoSite DAT: {}", e)))?;
+        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Failed to decode GeoSite DAT: {}", e) })?;
 
     let mut result = HashMap::new();
 
@@ -100,10 +100,10 @@ fn domain_to_entry(domain: &geodat::Domain) -> Result<Option<DomainEntry>> {
         Ok(Type::Regex) => match regex::Regex::new(&value) {
             Ok(re) => DomainType::Regex(re),
             Err(e) => {
-                return Err(AclError::GeoSiteError(format!(
-                    "Invalid regex pattern '{}': {}",
-                    value, e
-                )));
+                return Err(AclError::GeoSiteError {
+                    kind: GeoErrorKind::InvalidData,
+                    message: format!("Invalid regex pattern '{}': {}", value, e),
+                });
             }
         },
         Ok(Type::RootDomain) => {

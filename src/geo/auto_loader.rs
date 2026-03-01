@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 
 use ipnet::IpNet;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 use crate::matcher::{DomainEntry, GeoIpMatcher, GeoSiteMatcher};
 
 use super::dat;
@@ -259,7 +259,7 @@ impl AutoGeoLoader {
 
         let response = ureq::get(url)
             .call()
-            .map_err(|e| AclError::GeoIpError(format!("Download failed: {}", e)))?;
+            .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::DownloadFailed, message: format!("Download failed: {}", e) })?;
 
         let mut file = fs::File::create(&tmp_path)?;
         let (_, body) = response.into_parts();
@@ -271,7 +271,7 @@ impl AutoGeoLoader {
         // Verify the downloaded file
         if let Err(e) = verify_fn(&tmp_path) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(AclError::GeoIpError(format!("Verification failed: {}", e)));
+            return Err(AclError::GeoIpError { kind: GeoErrorKind::DownloadFailed, message: format!("Verification failed: {}", e) });
         }
 
         // Move to final location
@@ -285,11 +285,11 @@ impl AutoGeoLoader {
     fn ensure_geoip_downloaded(&self) -> Result<PathBuf> {
         let format = self
             .geoip_format
-            .ok_or_else(|| AclError::GeoIpError("GeoIP format not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured".to_string() })?;
 
         let path = self
             .get_geoip_path()
-            .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
 
         self.log(&format!("Checking geoip file: {}", path.display()));
 
@@ -334,7 +334,7 @@ impl AutoGeoLoader {
         let path = self.ensure_geoip_downloaded()?;
         let reader = Arc::new(
             maxminddb::Reader::open_readfile(&path)
-                .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
+                .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB/MetaDB: {}", e) })?,
         );
 
         *self.mmdb_reader.write() = Some(reader.clone());
@@ -350,18 +350,19 @@ impl AutoGeoLoader {
 
         let format = self
             .geosite_format
-            .ok_or_else(|| AclError::GeoSiteError("GeoSite format not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured".to_string() })?;
 
         // Currently only Sing format supports lazy loading
         if format != GeoSiteFormat::Sing {
-            return Err(AclError::GeoSiteError(
-                "Lazy loading only supported for Sing format".to_string(),
-            ));
+            return Err(AclError::GeoSiteError {
+                kind: GeoErrorKind::InvalidData,
+                message: "Lazy loading only supported for Sing format".to_string(),
+            });
         }
 
         let path = self
             .get_geosite_path()
-            .ok_or_else(|| AclError::GeoSiteError("GeoSite path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
 
         // Try to download if needed
         if self.should_download(&path) {
@@ -390,7 +391,7 @@ impl AutoGeoLoader {
 
         let path = self
             .get_geosite_path()
-            .ok_or_else(|| AclError::GeoSiteError("GeoSite path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
 
         // Try to download if needed
         if self.should_download(&path) {
@@ -428,7 +429,7 @@ impl AutoGeoLoader {
 
         let format = self
             .geosite_format
-            .ok_or_else(|| AclError::GeoSiteError("GeoSite format not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite format not configured".to_string() })?;
 
         match format {
             GeoSiteFormat::Dat => {
@@ -452,7 +453,7 @@ impl AutoGeoLoader {
                 let domains = {
                     let mut reader_guard = self.geosite_reader.lock();
                     let reader = reader_guard.as_mut().ok_or_else(|| {
-                        AclError::GeoSiteError("GeoSite reader not initialized".to_string())
+                        AclError::GeoSiteError { kind: GeoErrorKind::NotLoaded, message: "GeoSite reader not initialized".to_string() }
                     })?;
                     let items = reader.read(&code_lower)?;
                     singsite::convert_items_to_entries(items)?
@@ -475,7 +476,7 @@ impl GeoLoader for AutoGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
         let format = self
             .geoip_format
-            .ok_or_else(|| AclError::GeoIpError("GeoIP format not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP format not configured".to_string() })?;
 
         let code = country_code.to_lowercase();
 
@@ -484,7 +485,7 @@ impl GeoLoader for AutoGeoLoader {
                 self.ensure_geoip_loaded()?;
                 let guard = self.geoip_data.read();
                 let data = guard.as_ref().ok_or_else(|| {
-                    AclError::GeoIpError("GeoIP data not loaded".to_string())
+                    AclError::GeoIpError { kind: GeoErrorKind::NotLoaded, message: "GeoIP data not loaded".to_string() }
                 })?;
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))

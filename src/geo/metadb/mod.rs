@@ -9,7 +9,7 @@ use ipnet::IpNet;
 use lru::LruCache;
 use serde::Deserialize;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 
 /// Default cache size for CachedMetaDbReader
 pub const DEFAULT_CACHE_SIZE: usize = 1024;
@@ -58,7 +58,7 @@ impl MetaDbReader {
     /// Open a MetaDB file
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let reader = maxminddb::Reader::open_readfile(path.as_ref())
-            .map_err(|e| AclError::GeoIpError(format!("Failed to open MetaDB: {}", e)))?;
+            .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MetaDB: {}", e) })?;
 
         let db_type = DatabaseType::from_str(&reader.metadata.database_type);
 
@@ -138,14 +138,14 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 /// Verify MetaDB file integrity
 pub fn verify(path: impl AsRef<Path>) -> Result<()> {
     maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError(format!("Failed to verify MetaDB: {}", e)))?;
+        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to verify MetaDB: {}", e) })?;
     Ok(())
 }
 
 /// Create a shared MetaDB reader
 pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
     let reader = maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError(format!("Failed to open MetaDB: {}", e)))?;
+        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MetaDB: {}", e) })?;
     Ok(Arc::new(reader))
 }
 

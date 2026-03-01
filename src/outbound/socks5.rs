@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 use super::{Addr, Outbound, StdTcpConn, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
@@ -58,16 +58,16 @@ fn socks5_rep_to_string(rep: u8) -> &'static str {
 /// Validate SOCKS5 response header fields.
 fn validate_socks5_response(ver: u8, rep: u8) -> Result<()> {
     if ver != SOCKS5_VERSION {
-        return Err(AclError::OutboundError(format!(
-            "Invalid SOCKS version in response: {}",
-            ver
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Invalid SOCKS version in response: {}", ver),
+        });
     }
     if rep != SOCKS5_REP_SUCCESS {
-        return Err(AclError::OutboundError(format!(
-            "SOCKS5 request failed: {}",
-            socks5_rep_to_string(rep)
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("SOCKS5 request failed: {}", socks5_rep_to_string(rep)),
+        });
     }
     Ok(())
 }
@@ -98,9 +98,10 @@ fn parse_bound_addr(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
     match atyp {
         SOCKS5_ATYP_IPV4 => {
             if data.len() < 6 {
-                return Err(AclError::OutboundError(
-                    "Truncated IPv4 bound address".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Truncated IPv4 bound address".to_string(),
+                });
             }
             let ip = IpAddr::V4(std::net::Ipv4Addr::new(data[0], data[1], data[2], data[3]));
             let port = u16::from_be_bytes([data[4], data[5]]);
@@ -108,9 +109,10 @@ fn parse_bound_addr(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
         }
         SOCKS5_ATYP_IPV6 => {
             if data.len() < 18 {
-                return Err(AclError::OutboundError(
-                    "Truncated IPv6 bound address".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Truncated IPv6 bound address".to_string(),
+                });
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&data[..16]);
@@ -120,24 +122,26 @@ fn parse_bound_addr(atyp: u8, data: &[u8]) -> Result<(String, u16, usize)> {
         }
         SOCKS5_ATYP_DOMAIN => {
             if data.is_empty() {
-                return Err(AclError::OutboundError(
-                    "Truncated domain bound address".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Truncated domain bound address".to_string(),
+                });
             }
             let len = data[0] as usize;
             if data.len() < 1 + len + 2 {
-                return Err(AclError::OutboundError(
-                    "Truncated domain bound address".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Truncated domain bound address".to_string(),
+                });
             }
             let domain = String::from_utf8_lossy(&data[1..1 + len]).to_string();
             let port = u16::from_be_bytes([data[1 + len], data[1 + len + 1]]);
             Ok((domain, port, 1 + len + 2))
         }
-        _ => Err(AclError::OutboundError(format!(
-            "Unknown address type: {}",
-            atyp
-        ))),
+        _ => Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Unknown address type: {}", atyp),
+        }),
     }
 }
 
@@ -150,10 +154,10 @@ fn bound_addr_fixed_size(atyp: u8) -> Option<Result<usize>> {
         SOCKS5_ATYP_IPV4 => Some(Ok(4 + 2)),
         SOCKS5_ATYP_IPV6 => Some(Ok(16 + 2)),
         SOCKS5_ATYP_DOMAIN => None,
-        _ => Some(Err(AclError::OutboundError(format!(
-            "Unknown address type: {}",
-            atyp
-        )))),
+        _ => Some(Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Unknown address type: {}", atyp),
+        })),
     }
 }
 
@@ -167,10 +171,10 @@ fn addr_to_socks5(host: &str) -> Result<(u8, Vec<u8>)> {
     } else {
         let domain = host.as_bytes();
         if domain.len() > 255 {
-            return Err(AclError::OutboundError(format!(
-                "Domain name too long for SOCKS5: {} bytes (max 255)",
-                domain.len()
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("Domain name too long for SOCKS5: {} bytes (max 255)", domain.len()),
+            });
         }
         let mut addr = vec![domain.len() as u8];
         addr.extend(domain);
@@ -215,16 +219,16 @@ impl Socks5 {
         let username = username.into();
         let password = password.into();
         if username.len() > 255 {
-            return Err(AclError::OutboundError(format!(
-                "SOCKS5 username too long: {} bytes (max 255)",
-                username.len()
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("SOCKS5 username too long: {} bytes (max 255)", username.len()),
+            });
         }
         if password.len() > 255 {
-            return Err(AclError::OutboundError(format!(
-                "SOCKS5 password too long: {} bytes (max 255)",
-                password.len()
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("SOCKS5 password too long: {} bytes (max 255)", password.len()),
+            });
         }
         Ok(Self {
             addr: addr.into(),
@@ -255,12 +259,12 @@ impl Socks5 {
         let addr: SocketAddr = self
             .addr
             .to_socket_addrs()
-            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::DnsFailed, message: format!("Failed to resolve proxy address: {}", e) })?
             .next()
-            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError { kind: OutboundErrorKind::DnsFailed, message: "No address resolved for proxy".to_string() })?;
 
         let mut stream = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to connect to proxy: {}", e) })?;
 
         stream
             .set_read_timeout(Some(SOCKS5_NEGOTIATION_TIMEOUT))
@@ -280,19 +284,19 @@ impl Socks5 {
         req.extend(&auth_methods);
         stream
             .write_all(&req)
-            .map_err(|e| AclError::OutboundError(format!("Failed to send negotiation: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send negotiation: {}", e) })?;
 
         // Read negotiation response
         let mut resp = [0u8; 2];
         stream.read_exact(&mut resp).map_err(|e| {
-            AclError::OutboundError(format!("Failed to read negotiation response: {}", e))
+            AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read negotiation response: {}", e) }
         })?;
 
         if resp[0] != SOCKS5_VERSION {
-            return Err(AclError::OutboundError(format!(
-                "Invalid SOCKS version: {}",
-                resp[0]
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Invalid SOCKS version: {}", resp[0]),
+            });
         }
 
         match resp[1] {
@@ -302,44 +306,48 @@ impl Socks5 {
             SOCKS5_AUTH_PASSWORD => {
                 // Username/password authentication
                 let username = self.username.as_ref().ok_or_else(|| {
-                    AclError::OutboundError(
-                        "Server requires authentication but no credentials provided".to_string(),
-                    )
+                    AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "Server requires authentication but no credentials provided".to_string(),
+                    }
                 })?;
                 let password = self.password.as_ref().ok_or_else(|| {
-                    AclError::OutboundError(
-                        "Server requires authentication but no credentials provided".to_string(),
-                    )
+                    AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "Server requires authentication but no credentials provided".to_string(),
+                    }
                 })?;
 
                 // Send auth request
                 let auth_req = build_auth_request(username, password);
                 stream
                     .write_all(&auth_req)
-                    .map_err(|e| AclError::OutboundError(format!("Failed to send auth: {}", e)))?;
+                    .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send auth: {}", e) })?;
 
                 // Read auth response
                 let mut auth_resp = [0u8; 2];
                 stream.read_exact(&mut auth_resp).map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read auth response: {}", e))
+                    AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read auth response: {}", e) }
                 })?;
 
                 if auth_resp[1] != 0x00 {
-                    return Err(AclError::OutboundError(
-                        "SOCKS5 authentication failed".to_string(),
-                    ));
+                    return Err(AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "SOCKS5 authentication failed".to_string(),
+                    });
                 }
             }
             SOCKS5_AUTH_NO_ACCEPTABLE => {
-                return Err(AclError::OutboundError(
-                    "No acceptable authentication method".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::AuthFailed,
+                    message: "No acceptable authentication method".to_string(),
+                });
             }
             method => {
-                return Err(AclError::OutboundError(format!(
-                    "Unsupported authentication method: {}",
-                    method
-                )));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::AuthFailed,
+                    message: format!("Unsupported authentication method: {}", method),
+                });
             }
         }
 
@@ -358,13 +366,13 @@ impl Socks5 {
         let req = build_socks5_request(cmd, addr)?;
         stream
             .write_all(&req)
-            .map_err(|e| AclError::OutboundError(format!("Failed to send request: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send request: {}", e) })?;
 
         // Read response header
         let mut resp_header = [0u8; 4];
         stream
             .read_exact(&mut resp_header)
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read response: {}", e) })?;
 
         validate_socks5_response(resp_header[0], resp_header[1])?;
 
@@ -375,7 +383,7 @@ impl Socks5 {
             Some(r) => r?,
             None => {
                 stream.read_exact(&mut bound_buf[..1]).map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read domain length: {}", e))
+                    AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read domain length: {}", e) }
                 })?;
                 1 + bound_buf[0] as usize + 2
             }
@@ -385,7 +393,7 @@ impl Socks5 {
         stream
             .read_exact(&mut bound_buf[start..needed])
             .map_err(|e| {
-                AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read bound address: {}", e) }
             })?;
 
         let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
@@ -432,15 +440,15 @@ impl Socks5 {
         let addr: SocketAddr = tokio::net::lookup_host(&self.addr)
             .await
             .map_err(|e| {
-                AclError::OutboundError(format!("Failed to resolve proxy address: {}", e))
+                AclError::OutboundError { kind: OutboundErrorKind::DnsFailed, message: format!("Failed to resolve proxy address: {}", e) }
             })?
             .next()
-            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError { kind: OutboundErrorKind::DnsFailed, message: "No address resolved for proxy".to_string() })?;
 
         let mut stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
             .await
-            .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
+            .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Connection timeout".to_string() })?
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to connect to proxy: {}", e) })?;
 
         let auth_methods = if self.username.is_some() && self.password.is_some() {
             vec![SOCKS5_AUTH_NONE, SOCKS5_AUTH_PASSWORD]
@@ -453,68 +461,72 @@ impl Socks5 {
 
         tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.write_all(&req))
             .await
-            .map_err(|_| AclError::OutboundError("Negotiation timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to send negotiation: {}", e)))?;
+            .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Negotiation timeout".to_string() })?
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send negotiation: {}", e) })?;
 
         let mut resp = [0u8; 2];
         tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.read_exact(&mut resp))
             .await
-            .map_err(|_| AclError::OutboundError("Negotiation timeout".to_string()))?
+            .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Negotiation timeout".to_string() })?
             .map_err(|e| {
-                AclError::OutboundError(format!("Failed to read negotiation response: {}", e))
+                AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read negotiation response: {}", e) }
             })?;
 
         if resp[0] != SOCKS5_VERSION {
-            return Err(AclError::OutboundError(format!(
-                "Invalid SOCKS version: {}",
-                resp[0]
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Invalid SOCKS version: {}", resp[0]),
+            });
         }
 
         match resp[1] {
             SOCKS5_AUTH_NONE => {}
             SOCKS5_AUTH_PASSWORD => {
                 let username = self.username.as_ref().ok_or_else(|| {
-                    AclError::OutboundError(
-                        "Server requires authentication but no credentials provided".to_string(),
-                    )
+                    AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "Server requires authentication but no credentials provided".to_string(),
+                    }
                 })?;
                 let password = self.password.as_ref().ok_or_else(|| {
-                    AclError::OutboundError(
-                        "Server requires authentication but no credentials provided".to_string(),
-                    )
+                    AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "Server requires authentication but no credentials provided".to_string(),
+                    }
                 })?;
 
                 let auth_req = build_auth_request(username, password);
                 tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.write_all(&auth_req))
                     .await
-                    .map_err(|_| AclError::OutboundError("Auth send timeout".to_string()))?
-                    .map_err(|e| AclError::OutboundError(format!("Failed to send auth: {}", e)))?;
+                    .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Auth send timeout".to_string() })?
+                    .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send auth: {}", e) })?;
 
                 let mut auth_resp = [0u8; 2];
                 tokio::time::timeout(SOCKS5_NEGOTIATION_TIMEOUT, stream.read_exact(&mut auth_resp))
                     .await
-                    .map_err(|_| AclError::OutboundError("Auth response timeout".to_string()))?
+                    .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Auth response timeout".to_string() })?
                     .map_err(|e| {
-                        AclError::OutboundError(format!("Failed to read auth response: {}", e))
+                        AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read auth response: {}", e) }
                     })?;
 
                 if auth_resp[1] != 0x00 {
-                    return Err(AclError::OutboundError(
-                        "SOCKS5 authentication failed".to_string(),
-                    ));
+                    return Err(AclError::OutboundError {
+                        kind: OutboundErrorKind::AuthFailed,
+                        message: "SOCKS5 authentication failed".to_string(),
+                    });
                 }
             }
             SOCKS5_AUTH_NO_ACCEPTABLE => {
-                return Err(AclError::OutboundError(
-                    "No acceptable authentication method".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::AuthFailed,
+                    message: "No acceptable authentication method".to_string(),
+                });
             }
             method => {
-                return Err(AclError::OutboundError(format!(
-                    "Unsupported authentication method: {}",
-                    method
-                )));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::AuthFailed,
+                    message: format!("Unsupported authentication method: {}", method),
+                });
             }
         }
 
@@ -533,14 +545,14 @@ impl Socks5 {
 
         tokio::time::timeout(SOCKS5_REQUEST_TIMEOUT, stream.write_all(&req))
             .await
-            .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to send request: {}", e)))?;
+            .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Request timeout".to_string() })?
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to send request: {}", e) })?;
 
         let mut resp_header = [0u8; 4];
         tokio::time::timeout(SOCKS5_REQUEST_TIMEOUT, stream.read_exact(&mut resp_header))
             .await
-            .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+            .map_err(|_| AclError::OutboundError { kind: OutboundErrorKind::Timeout, message: "Request timeout".to_string() })?
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read response: {}", e) })?;
 
         validate_socks5_response(resp_header[0], resp_header[1])?;
 
@@ -551,7 +563,7 @@ impl Socks5 {
             Some(r) => r?,
             None => {
                 stream.read_exact(&mut bound_buf[..1]).await.map_err(|e| {
-                    AclError::OutboundError(format!("Failed to read domain length: {}", e))
+                    AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read domain length: {}", e) }
                 })?;
                 1 + bound_buf[0] as usize + 2
             }
@@ -562,7 +574,7 @@ impl Socks5 {
             .read_exact(&mut bound_buf[start..needed])
             .await
             .map_err(|e| {
-                AclError::OutboundError(format!("Failed to read bound address: {}", e))
+                AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("Failed to read bound address: {}", e) }
             })?;
 
         let (bound_host, bound_port, _) = parse_bound_addr(resp_header[3], &bound_buf[..needed])?;
@@ -592,11 +604,11 @@ impl Outbound for Socks5 {
             "0.0.0.0:0"
         };
         let udp_socket = UdpSocket::bind(bind_addr)
-            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to bind UDP: {}", e) })?;
 
         udp_socket
             .connect(&udp_addr)
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to connect UDP: {}", e) })?;
 
         Ok(Box::new(Socks5UdpConn::new(stream, udp_socket)))
     }
@@ -629,12 +641,12 @@ impl AsyncOutbound for Socks5 {
         };
         let udp_socket = TokioUdpSocket::bind(bind_addr)
             .await
-            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to bind UDP: {}", e) })?;
 
         udp_socket
             .connect(&udp_addr)
             .await
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::ConnectionFailed, message: format!("Failed to connect UDP: {}", e) })?;
 
         Ok(Box::new(AsyncSocks5UdpConn::new(stream, udp_socket)))
     }
@@ -664,10 +676,10 @@ fn socks5_udp_encode_addr(addr: &Addr) -> Result<Vec<u8>> {
     } else {
         let domain = addr.host.as_bytes();
         if domain.len() > 255 {
-            return Err(AclError::OutboundError(format!(
-                "Domain name too long for SOCKS5: {} bytes (max 255)",
-                domain.len()
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::InvalidInput,
+                message: format!("Domain name too long for SOCKS5: {} bytes (max 255)", domain.len()),
+            });
         }
         data.push(SOCKS5_ATYP_DOMAIN);
         data.push(domain.len() as u8);
@@ -685,9 +697,10 @@ fn socks5_udp_encode_addr(addr: &Addr) -> Result<Vec<u8>> {
 /// Parses: RSV(2) + FRAG(1) + ATYP(1) + ADDR + PORT(2) from a byte slice.
 fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
     if data.len() < 4 {
-        return Err(AclError::OutboundError(
-            "Invalid SOCKS5 datagram".to_string(),
-        ));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: "Invalid SOCKS5 datagram".to_string(),
+        });
     }
 
     // Skip RSV (2 bytes) + FRAG (1 byte)
@@ -697,7 +710,7 @@ fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
     let (host, port) = match atyp {
         SOCKS5_ATYP_IPV4 => {
             if data.len() < offset + 6 {
-                return Err(AclError::OutboundError("Invalid IPv4 datagram".to_string()));
+                return Err(AclError::OutboundError { kind: OutboundErrorKind::Protocol, message: "Invalid IPv4 datagram".to_string() });
             }
             let ip = std::net::Ipv4Addr::new(
                 data[offset],
@@ -712,7 +725,7 @@ fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
         }
         SOCKS5_ATYP_IPV6 => {
             if data.len() < offset + 18 {
-                return Err(AclError::OutboundError("Invalid IPv6 datagram".to_string()));
+                return Err(AclError::OutboundError { kind: OutboundErrorKind::Protocol, message: "Invalid IPv6 datagram".to_string() });
             }
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&data[offset..offset + 16]);
@@ -724,16 +737,18 @@ fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
         }
         SOCKS5_ATYP_DOMAIN => {
             if data.len() < offset + 1 {
-                return Err(AclError::OutboundError(
-                    "Invalid domain datagram".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Invalid domain datagram".to_string(),
+                });
             }
             let len = data[offset] as usize;
             offset += 1;
             if data.len() < offset + len + 2 {
-                return Err(AclError::OutboundError(
-                    "Invalid domain datagram".to_string(),
-                ));
+                return Err(AclError::OutboundError {
+                    kind: OutboundErrorKind::Protocol,
+                    message: "Invalid domain datagram".to_string(),
+                });
             }
             let domain = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
             offset += len;
@@ -742,10 +757,10 @@ fn socks5_udp_decode_addr(data: &[u8]) -> Result<(Addr, usize)> {
             (domain, port)
         }
         _ => {
-            return Err(AclError::OutboundError(format!(
-                "Unknown address type: {}",
-                atyp
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Unknown address type: {}", atyp),
+            });
         }
     };
 
@@ -773,7 +788,7 @@ impl UdpConn for Socks5UdpConn {
         let n = self
             .udp_socket
             .recv(&mut recv_buf)
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("UDP recv error: {}", e) })?;
 
         let (addr, header_len) = socks5_udp_decode_addr(&recv_buf[..n])?;
         let data_len = n - header_len;
@@ -789,7 +804,7 @@ impl UdpConn for Socks5UdpConn {
 
         self.udp_socket
             .send(&packet)
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("UDP send error: {}", e) })?;
 
         Ok(buf.len())
     }
@@ -826,7 +841,7 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
             .udp_socket
             .recv(&mut recv_buf)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("UDP recv error: {}", e) })?;
 
         let (addr, header_len) = socks5_udp_decode_addr(&recv_buf[..n])?;
         let data_len = n - header_len;
@@ -843,7 +858,7 @@ impl AsyncUdpConn for AsyncSocks5UdpConn {
         self.udp_socket
             .send(&packet)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError { kind: OutboundErrorKind::Io, message: format!("UDP send error: {}", e) })?;
 
         Ok(buf.len())
     }

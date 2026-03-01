@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use ipnet::IpNet;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 use crate::matcher::{DomainEntry, GeoIpMatcher, GeoSiteMatcher};
 
 use super::format::{GeoIpFormat, GeoSiteFormat};
@@ -97,7 +97,7 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
 
         let data = dat::load_geoip(path)?;
 
@@ -117,11 +117,11 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError("GeoIP path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
 
         let reader = Arc::new(
             maxminddb::Reader::open_readfile(path)
-                .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB/MetaDB: {}", e)))?,
+                .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB/MetaDB: {}", e) })?,
         );
 
         *self.mmdb_reader.write() = Some(reader.clone());
@@ -138,11 +138,11 @@ impl FileGeoLoader {
         let path = self
             .geosite_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoSiteError("GeoSite path not configured".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
 
         let format = self
             .get_geosite_format()
-            .ok_or_else(|| AclError::GeoSiteError("Cannot detect GeoSite format".to_string()))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: "Cannot detect GeoSite format".to_string() })?;
 
         let data = load_geosite_file(path, format)?;
 
@@ -161,7 +161,7 @@ impl GeoLoader for FileGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
         let format = self
             .get_geoip_format()
-            .ok_or_else(|| AclError::GeoIpError("Cannot detect GeoIP format".to_string()))?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::InvalidData, message: "Cannot detect GeoIP format".to_string() })?;
 
         let code = country_code.to_lowercase();
 
@@ -171,7 +171,7 @@ impl GeoLoader for FileGeoLoader {
                 self.ensure_geoip_loaded()?;
                 let guard = self.geoip_data.read();
                 let data = guard.as_ref().ok_or_else(|| {
-                    AclError::GeoIpError("GeoIP data not loaded".to_string())
+                    AclError::GeoIpError { kind: GeoErrorKind::NotLoaded, message: "GeoIP data not loaded".to_string() }
                 })?;
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
@@ -190,7 +190,7 @@ impl GeoLoader for FileGeoLoader {
         let (name, attrs) = GeoSiteMatcher::parse_pattern(site_name);
         let guard = self.geosite_data.read();
         let data = guard.as_ref().ok_or_else(|| {
-            AclError::GeoSiteError("GeoSite data not loaded".to_string())
+            AclError::GeoSiteError { kind: GeoErrorKind::NotLoaded, message: "GeoSite data not loaded".to_string() }
         })?;
 
         let domains = data.get(&name).cloned().unwrap_or_default();
@@ -203,17 +203,17 @@ pub struct NilGeoLoader;
 
 impl GeoLoader for NilGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
-        Err(AclError::GeoIpError(format!(
-            "GeoIP not available (requested: {})",
-            country_code
-        )))
+        Err(AclError::GeoIpError {
+            kind: GeoErrorKind::NotLoaded,
+            message: format!("GeoIP not available (requested: {})", country_code),
+        })
     }
 
     fn load_geosite(&self, site_name: &str) -> Result<GeoSiteMatcher> {
-        Err(AclError::GeoSiteError(format!(
-            "GeoSite not available (requested: {})",
-            site_name
-        )))
+        Err(AclError::GeoSiteError {
+            kind: GeoErrorKind::NotLoaded,
+            message: format!("GeoSite not available (requested: {})", site_name),
+        })
     }
 }
 

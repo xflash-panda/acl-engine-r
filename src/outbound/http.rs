@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 use super::{Addr, Outbound, StdTcpConn, TcpConn, UdpConn, DEFAULT_DIALER_TIMEOUT};
 
@@ -108,9 +108,10 @@ async fn async_read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
 /// HTTP header injection (CRLF) in the CONNECT request.
 fn validate_connect_host(host: &str) -> Result<()> {
     if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(AclError::OutboundError(
-            "Invalid host: contains control characters".to_string(),
-        ));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::InvalidInput,
+            message: "Invalid host: contains control characters".to_string(),
+        });
     }
     Ok(())
 }
@@ -143,22 +144,28 @@ fn build_connect_request(host: &str, port: u16, basic_auth: Option<&str>) -> Str
 fn parse_connect_status(status_line: &str) -> Result<()> {
     let parts: Vec<&str> = status_line.split_whitespace().collect();
     if parts.len() < 2 {
-        return Err(AclError::OutboundError(format!(
-            "Invalid HTTP response: {}",
-            status_line.trim()
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Invalid HTTP response: {}", status_line.trim()),
+        });
     }
 
     let status_code: u16 = parts[1]
         .parse()
-        .map_err(|_| AclError::OutboundError(format!("Invalid status code: {}", parts[1])))?;
+        .map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!("Invalid status code: {}", parts[1]),
+        })?;
 
     if status_code != 200 {
-        return Err(AclError::OutboundError(format!(
-            "HTTP CONNECT failed: {} {}",
-            status_code,
-            parts.get(2..).unwrap_or(&[]).join(" ")
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Protocol,
+            message: format!(
+                "HTTP CONNECT failed: {} {}",
+                status_code,
+                parts.get(2..).unwrap_or(&[]).join(" ")
+            ),
+        });
     }
 
     Ok(())
@@ -171,15 +178,19 @@ fn drain_headers<R: BufRead>(reader: &mut R) -> Result<()> {
     loop {
         let mut line = String::new();
         read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
-            .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read headers: {}", e),
+            })?;
         if line.trim().is_empty() {
             break;
         }
         header_count += 1;
         if header_count > MAX_RESPONSE_HEADERS {
-            return Err(AclError::OutboundError(format!(
-                "Too many response headers (>{MAX_RESPONSE_HEADERS})"
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Too many response headers (>{MAX_RESPONSE_HEADERS})"),
+            });
         }
     }
     Ok(())
@@ -193,15 +204,19 @@ async fn async_drain_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
         let mut line = String::new();
         async_read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
             .await
-            .map_err(|e| AclError::OutboundError(format!("Failed to read headers: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read headers: {}", e),
+            })?;
         if line.trim().is_empty() {
             break;
         }
         header_count += 1;
         if header_count > MAX_RESPONSE_HEADERS {
-            return Err(AclError::OutboundError(format!(
-                "Too many response headers (>{MAX_RESPONSE_HEADERS})"
-            )));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: format!("Too many response headers (>{MAX_RESPONSE_HEADERS})"),
+            });
         }
     }
     Ok(())
@@ -239,17 +254,19 @@ impl Http {
         let url = url.trim();
 
         if url.starts_with("https://") {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            });
         }
 
         let rest = if let Some(rest) = url.strip_prefix("http://") {
             rest
         } else {
-            return Err(AclError::OutboundError(
-                "Unsupported scheme for HTTP proxy (use http://)".to_string(),
-            ));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "Unsupported scheme for HTTP proxy (use http://)".to_string(),
+            });
         };
 
         // Parse auth and host
@@ -329,9 +346,10 @@ impl Http {
     /// Returns an error if `https` is `true` (not yet supported).
     pub fn try_new(addr: impl Into<String>, https: bool) -> Result<Self> {
         if https {
-            return Err(AclError::OutboundError(
-                "HTTPS proxy not yet supported (use http:// instead)".to_string(),
-            ));
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::Protocol,
+                message: "HTTPS proxy not yet supported (use http:// instead)".to_string(),
+            });
         }
         Ok(Self {
             addr: addr.into(),
@@ -369,12 +387,21 @@ impl Http {
         let addr: SocketAddr = self
             .addr
             .to_socket_addrs()
-            .map_err(|e| AclError::OutboundError(format!("Failed to resolve proxy address: {}", e)))?
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: format!("Failed to resolve proxy address: {}", e),
+            })?
             .next()
-            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address resolved for proxy".to_string(),
+            })?;
 
         let stream = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to connect to proxy: {}", e),
+            })?;
 
         Ok(stream)
     }
@@ -385,16 +412,26 @@ impl Http {
     async fn async_dial(&self) -> Result<TokioTcpStream> {
         let addr: SocketAddr = tokio::net::lookup_host(&self.addr)
             .await
-            .map_err(|e| {
-                AclError::OutboundError(format!("Failed to resolve proxy address: {}", e))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: format!("Failed to resolve proxy address: {}", e),
             })?
             .next()
-            .ok_or_else(|| AclError::OutboundError("No address resolved for proxy".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address resolved for proxy".to_string(),
+            })?;
 
         let stream = tokio::time::timeout(self.timeout, TokioTcpStream::connect(addr))
             .await
-            .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-            .map_err(|e| AclError::OutboundError(format!("Failed to connect to proxy: {}", e)))?;
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::Timeout,
+                message: "Connection timeout".to_string(),
+            })?
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to connect to proxy: {}", e),
+            })?;
 
         Ok(stream)
     }
@@ -410,13 +447,19 @@ impl Outbound for Http {
 
         let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
         stream.write_all(request.as_bytes()).map_err(|e| {
-            AclError::OutboundError(format!("Failed to send CONNECT request: {}", e))
+            AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to send CONNECT request: {}", e),
+            }
         })?;
 
         let mut reader = BufReader::new(&stream);
         let mut status_line = String::new();
         read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH)
-            .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to read response: {}", e),
+            })?;
         parse_connect_status(&status_line)?;
         drain_headers(&mut reader)?;
 
@@ -429,21 +472,28 @@ impl Outbound for Http {
             let stream = reader.into_inner();
             return Ok(Box::new(BufferedTcpConn::new(
                 stream.try_clone().map_err(|e| {
-                    AclError::OutboundError(format!("Failed to clone stream: {}", e))
+                    AclError::OutboundError {
+                        kind: OutboundErrorKind::ConnectionFailed,
+                        message: format!("Failed to clone stream: {}", e),
+                    }
                 })?,
                 buffered_data,
             )));
         }
 
         Ok(Box::new(StdTcpConn::new(stream.try_clone().map_err(
-            |e| AclError::OutboundError(format!("Failed to clone stream: {}", e)),
+            |e| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!("Failed to clone stream: {}", e),
+            },
         )?)))
     }
 
     fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn UdpConn>> {
-        Err(AclError::OutboundError(
-            "UDP not supported by HTTP proxy".to_string(),
-        ))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "UDP not supported by HTTP proxy".to_string(),
+        })
     }
 }
 
@@ -462,8 +512,14 @@ impl AsyncOutbound for Http {
             reader.get_mut().write_all(request.as_bytes()),
         )
         .await
-        .map_err(|_| AclError::OutboundError("Request timeout".to_string()))?
-        .map_err(|e| AclError::OutboundError(format!("Failed to send CONNECT request: {}", e)))?;
+        .map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::Timeout,
+            message: "Request timeout".to_string(),
+        })?
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Failed to send CONNECT request: {}", e),
+        })?;
 
         let mut status_line = String::new();
         tokio::time::timeout(
@@ -471,14 +527,23 @@ impl AsyncOutbound for Http {
             async_read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH),
         )
         .await
-        .map_err(|_| AclError::OutboundError("Response timeout".to_string()))?
-        .map_err(|e| AclError::OutboundError(format!("Failed to read response: {}", e)))?;
+        .map_err(|_| AclError::OutboundError {
+            kind: OutboundErrorKind::Timeout,
+            message: "Response timeout".to_string(),
+        })?
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Failed to read response: {}", e),
+        })?;
 
         parse_connect_status(&status_line)?;
 
         tokio::time::timeout(HTTP_REQUEST_TIMEOUT, async_drain_headers(&mut reader))
             .await
-            .map_err(|_| AclError::OutboundError("Header read timeout".to_string()))??;
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::Timeout,
+                message: "Header read timeout".to_string(),
+            })??;
 
         let buffered = reader.buffer();
         if !buffered.is_empty() {
@@ -491,9 +556,10 @@ impl AsyncOutbound for Http {
     }
 
     async fn dial_udp(&self, _addr: &mut Addr) -> Result<Box<dyn AsyncUdpConn>> {
-        Err(AclError::OutboundError(
-            "UDP not supported by HTTP proxy".to_string(),
-        ))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Unsupported,
+            message: "UDP not supported by HTTP proxy".to_string(),
+        })
     }
 }
 

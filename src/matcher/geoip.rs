@@ -6,7 +6,7 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use super::HostMatcher;
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 use crate::types::HostInfo;
 
 /// A single address-family CIDR list sorted by network address, with a
@@ -121,7 +121,7 @@ impl GeoIpMatcher {
     /// Create a new GeoIP matcher from MMDB file
     pub fn from_mmdb(path: impl AsRef<Path>, country_code: &str) -> Result<Self> {
         let reader = maxminddb::Reader::open_readfile(path.as_ref())
-            .map_err(|e| AclError::GeoIpError(format!("Failed to open MMDB file: {}", e)))?;
+            .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB file: {}", e) })?;
 
         Ok(Self {
             country_code: country_code.to_uppercase(),

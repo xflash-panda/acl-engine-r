@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, GeoErrorKind, Result};
 use crate::matcher::{DomainEntry, DomainType};
 
 /// Item types in sing-geosite format
@@ -48,7 +48,7 @@ impl SingSiteReader {
     /// Open a sing-geosite database file
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<String>)> {
         let file = File::open(path.as_ref()).map_err(|e| {
-            AclError::GeoSiteError(format!("Failed to open sing-geosite file: {}", e))
+            AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to open sing-geosite file: {}", e) }
         })?;
 
         let mut reader = BufReader::new(file);
@@ -56,10 +56,10 @@ impl SingSiteReader {
         // Read version (must be 0)
         let version = read_byte(&mut reader)?;
         if version != 0 {
-            return Err(AclError::GeoSiteError(format!(
-                "Unknown sing-geosite version: {}",
-                version
-            )));
+            return Err(AclError::GeoSiteError {
+                kind: GeoErrorKind::InvalidData,
+                message: format!("Unknown sing-geosite version: {}", version),
+            });
         }
 
         // Read entry count
@@ -83,7 +83,7 @@ impl SingSiteReader {
 
         for (code, length) in &code_lengths {
             let offset = reader.stream_position().map_err(|e| {
-                AclError::GeoSiteError(format!("Failed to get stream position: {}", e))
+                AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to get stream position: {}", e) }
             })?;
             let lower_code = code.to_lowercase();
             domain_offset.insert(lower_code.clone(), offset);
@@ -113,21 +113,21 @@ impl SingSiteReader {
             .domain_offset
             .get(&code)
             .copied()
-            .ok_or_else(|| AclError::GeoSiteError(format!("Code not found: {}", code)))?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Code not found: {}", code) })?;
 
         let length = self.domain_length.get(&code).copied().unwrap_or(0);
 
         // Seek directly to this code's data
         self.reader
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| AclError::GeoSiteError(format!("Failed to seek: {}", e)))?;
+            .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to seek: {}", e) })?;
 
         // Read the items for this code
         let mut items = Vec::with_capacity(length);
         for _ in 0..length {
             let item_type_byte = read_byte(&mut self.reader)?;
             let item_type = ItemType::try_from(item_type_byte).map_err(|_| {
-                AclError::GeoSiteError(format!("Unknown item type: {}", item_type_byte))
+                AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Unknown item type: {}", item_type_byte) }
             })?;
 
             let value = read_vstring(&mut self.reader)?;
@@ -180,10 +180,10 @@ pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Result<Vec<DomainEntr
             ItemType::DomainRegex => match regex::Regex::new(&item.value) {
                 Ok(re) => DomainType::Regex(re),
                 Err(e) => {
-                    return Err(AclError::GeoSiteError(format!(
-                        "Invalid regex pattern '{}': {}",
-                        item.value, e
-                    )));
+                    return Err(AclError::GeoSiteError {
+                        kind: GeoErrorKind::InvalidData,
+                        message: format!("Invalid regex pattern '{}': {}", item.value, e),
+                    });
                 }
             },
         };
@@ -209,7 +209,7 @@ fn read_byte<R: Read>(reader: &mut R) -> Result<u8> {
     let mut buf = [0u8; 1];
     reader
         .read_exact(&mut buf)
-        .map_err(|e| AclError::GeoSiteError(format!("Failed to read byte: {}", e)))?;
+        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to read byte: {}", e) })?;
     Ok(buf[0])
 }
 
@@ -227,7 +227,7 @@ fn read_uvarint<R: Read>(reader: &mut R) -> Result<u64> {
 
         shift += 7;
         if shift >= 64 {
-            return Err(AclError::GeoSiteError("Varint overflow".to_string()));
+            return Err(AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: "Varint overflow".to_string() });
         }
     }
 
@@ -241,18 +241,18 @@ const MAX_VSTRING_LENGTH: usize = 10 * 1024 * 1024;
 fn read_vstring<R: Read>(reader: &mut R) -> Result<String> {
     let length = read_uvarint(reader)? as usize;
     if length > MAX_VSTRING_LENGTH {
-        return Err(AclError::GeoSiteError(format!(
-            "String length {} exceeds limit of {} bytes",
-            length, MAX_VSTRING_LENGTH
-        )));
+        return Err(AclError::GeoSiteError {
+            kind: GeoErrorKind::InvalidData,
+            message: format!("String length {} exceeds limit of {} bytes", length, MAX_VSTRING_LENGTH),
+        });
     }
     let mut buf = vec![0u8; length];
     reader
         .read_exact(&mut buf)
-        .map_err(|e| AclError::GeoSiteError(format!("Failed to read string: {}", e)))?;
+        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to read string: {}", e) })?;
 
     String::from_utf8(buf)
-        .map_err(|e| AclError::GeoSiteError(format!("Invalid UTF-8 string: {}", e)))
+        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Invalid UTF-8 string: {}", e) })
 }
 
 #[cfg(test)]

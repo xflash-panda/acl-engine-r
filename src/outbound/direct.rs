@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use crate::error::{AclError, Result};
+use crate::error::{AclError, OutboundErrorKind, Result};
 
 use super::{
     build_resolve_info, try_resolve_from_ip, Addr, Outbound, ResolveInfo, StdTcpConn, TcpConn,
@@ -142,14 +142,20 @@ impl Direct {
         };
         let socket =
             socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(|e| AclError::OutboundError(format!("Failed to create socket: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to create socket: {}", e),
+                })?;
 
         // Bind to IP address
         if let Some(bind_ip) = self.get_bind_ip(ip) {
             let bind_addr = SocketAddr::new(bind_ip, 0);
             socket
                 .bind(&bind_addr.into())
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind: {}", e),
+                })?;
         }
 
         // Bind to network device (Linux only)
@@ -157,7 +163,10 @@ impl Direct {
         if let Some(ref device) = self.bind_device {
             socket
                 .bind_device(Some(device.as_bytes()))
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind device: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind device: {}", e),
+                })?;
         }
 
         // Enable TCP Fast Open (client-side)
@@ -191,11 +200,17 @@ impl Direct {
             socket.set_nonblocking(false).ok();
             socket
                 .connect_timeout(&socket_addr.into(), self.timeout)
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?;
             TcpStream::from(socket)
         } else {
             TcpStream::connect_timeout(&socket_addr, self.timeout)
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?
         };
 
         Ok(stream)
@@ -231,8 +246,9 @@ impl Direct {
         };
         let socket =
             socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
-                .map_err(|e| {
-                    AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to create UDP socket: {}", e),
                 })?;
 
         let bind_addr = if use_ipv6 {
@@ -242,13 +258,19 @@ impl Direct {
         };
         socket
             .bind(&bind_addr.into())
-            .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("Failed to bind UDP: {}", e),
+            })?;
 
         #[cfg(target_os = "linux")]
         if let Some(ref device) = self.bind_device {
             socket
                 .bind_device(Some(device.as_bytes()))
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind device: {}", e)))?;
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind device: {}", e),
+                })?;
         }
 
         Ok(socket)
@@ -303,7 +325,10 @@ impl Direct {
         // Get first result
         let (first_ip, first) = rx
             .recv()
-            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: "Channel error".to_string(),
+            })?;
 
         if first.is_ok() {
             cancelled.store(true, Ordering::Relaxed);
@@ -314,7 +339,10 @@ impl Direct {
         // First failed, try second
         let (second_ip, second) = rx
             .recv()
-            .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
+            .map_err(|_| AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: "Channel error".to_string(),
+            })?;
 
         if second.is_ok() {
             return second;
@@ -322,10 +350,13 @@ impl Direct {
         let second_err = second.unwrap_err();
 
         // Both failed — combine errors so the caller sees both attempts
-        Err(AclError::OutboundError(format!(
-            "dual-stack connection failed: {} ({}), {} ({})",
-            first_ip, first_err, second_ip, second_err
-        )))
+        Err(AclError::OutboundError {
+            kind: OutboundErrorKind::ConnectionFailed,
+            message: format!(
+                "dual-stack connection failed: {} ({}), {} ({})",
+                first_ip, first_err, second_ip, second_err
+            ),
+        })
     }
 
     /// Async resolve the address using system DNS if ResolveInfo is not available.
@@ -358,13 +389,25 @@ impl Direct {
             let tokio_socket = tokio::net::TcpSocket::from_std_stream(std_stream);
             tokio::time::timeout(self.timeout, tokio_socket.connect(socket_addr))
                 .await
-                .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+                .map_err(|_| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: "Connection timeout".to_string(),
+                })?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?
         } else {
             tokio::time::timeout(self.timeout, TokioTcpStream::connect(socket_addr))
                 .await
-                .map_err(|_| AclError::OutboundError("Connection timeout".to_string()))?
-                .map_err(|e| AclError::OutboundError(format!("Failed to connect: {}", e)))?
+                .map_err(|_| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: "Connection timeout".to_string(),
+                })?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to connect: {}", e),
+                })?
         };
 
         Ok(stream)
@@ -396,10 +439,13 @@ impl Direct {
         let fallback = self.async_dial_tcp_ip(fallback_ip, port).await;
         match fallback {
             Ok(stream) => Ok(stream),
-            Err(second_err) => Err(AclError::OutboundError(format!(
-                "dual-stack connection failed: {} ({}), {} ({})",
-                first_ip, first_err, fallback_ip, second_err
-            ))),
+            Err(second_err) => Err(AclError::OutboundError {
+                kind: OutboundErrorKind::ConnectionFailed,
+                message: format!(
+                    "dual-stack connection failed: {} ({}), {} ({})",
+                    first_ip, first_err, fallback_ip, second_err
+                ),
+            }),
         }
     }
 }
@@ -417,14 +463,18 @@ impl Outbound for Direct {
         let info = addr
             .resolve_info
             .as_ref()
-            .ok_or_else(|| AclError::OutboundError("No resolve info".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No resolve info".to_string(),
+            })?;
 
         if !info.has_address() {
-            return Err(AclError::OutboundError(
-                info.error
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: info.error
                     .clone()
                     .unwrap_or_else(|| "No address available".to_string()),
-            ));
+            });
         }
 
         let stream = if self.mode == DirectMode::Auto {
@@ -449,7 +499,10 @@ impl Outbound for Direct {
             UdpSocket::from(self.create_udp_socket_with_device(use_ipv6)?)
         } else {
             UdpSocket::bind(self.udp_bind_addr(use_ipv6))
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind UDP: {}", e),
+                })?
         };
 
         Ok(Box::new(DirectUdpConn::new(socket, self.mode)))
@@ -465,14 +518,18 @@ impl AsyncOutbound for Direct {
         let info = addr
             .resolve_info
             .as_ref()
-            .ok_or_else(|| AclError::OutboundError("No resolve info".to_string()))?;
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No resolve info".to_string(),
+            })?;
 
         if !info.has_address() {
-            return Err(AclError::OutboundError(
-                info.error
+            return Err(AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: info.error
                     .clone()
                     .unwrap_or_else(|| "No address available".to_string()),
-            ));
+            });
         }
 
         let stream = if self.mode == DirectMode::Auto {
@@ -499,16 +556,25 @@ impl AsyncOutbound for Direct {
         let socket = if self.bind_device.is_some() {
             let socket = self.create_udp_socket_with_device(use_ipv6)?;
             socket.set_nonblocking(true).map_err(|e| {
-                AclError::OutboundError(format!("Failed to set nonblocking: {}", e))
+                AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to set nonblocking: {}", e),
+                }
             })?;
             let std_socket: std::net::UdpSocket = socket.into();
             TokioUdpSocket::from_std(std_socket).map_err(|e| {
-                AclError::OutboundError(format!("Failed to create UDP socket: {}", e))
+                AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to create UDP socket: {}", e),
+                }
             })?
         } else {
             TokioUdpSocket::bind(self.udp_bind_addr(use_ipv6))
                 .await
-                .map_err(|e| AclError::OutboundError(format!("Failed to bind UDP: {}", e)))?
+                .map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::Io,
+                    message: format!("Failed to bind UDP: {}", e),
+                })?
         };
 
         Ok(Box::new(AsyncDirectUdpConn::new(socket, self.mode)))
@@ -540,10 +606,13 @@ fn set_tcp_fastopen(socket: &socket2::Socket) -> Result<()> {
         )
     };
     if ret < 0 {
-        return Err(AclError::OutboundError(format!(
-            "Failed to set TCP Fast Open: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!(
+                "Failed to set TCP Fast Open: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
     }
     Ok(())
 }
@@ -566,20 +635,32 @@ fn select_ip(mode: DirectMode, info: &ResolveInfo) -> Result<IpAddr> {
             .ipv4
             .map(IpAddr::V4)
             .or(info.ipv6.map(IpAddr::V6))
-            .ok_or_else(|| AclError::OutboundError("No address available".to_string())),
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address available".to_string(),
+            }),
         DirectMode::Prefer64 => info
             .ipv6
             .map(IpAddr::V6)
             .or(info.ipv4.map(IpAddr::V4))
-            .ok_or_else(|| AclError::OutboundError("No address available".to_string())),
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No address available".to_string(),
+            }),
         DirectMode::Only6 => info
             .ipv6
             .map(IpAddr::V6)
-            .ok_or_else(|| AclError::OutboundError("No IPv6 address available".to_string())),
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No IPv6 address available".to_string(),
+            }),
         DirectMode::Only4 => info
             .ipv4
             .map(IpAddr::V4)
-            .ok_or_else(|| AclError::OutboundError("No IPv4 address available".to_string())),
+            .ok_or_else(|| AclError::OutboundError {
+                kind: OutboundErrorKind::DnsFailed,
+                message: "No IPv4 address available".to_string(),
+            }),
     }
 }
 
@@ -593,7 +674,10 @@ fn resolve_udp_addr(mode: DirectMode, addr: &Addr) -> Result<SocketAddr> {
     // Fall back to parsing the address string
     addr.network_addr()
         .parse()
-        .map_err(|e| AclError::OutboundError(format!("Invalid address: {}", e)))
+        .map_err(|e| AclError::OutboundError {
+            kind: OutboundErrorKind::Io,
+            message: format!("Invalid address: {}", e),
+        })
 }
 
 /// Direct UDP connection with mode-aware address selection.
@@ -613,7 +697,10 @@ impl UdpConn for DirectUdpConn {
         let (n, addr) = self
             .socket
             .recv_from(buf)
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
         Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
     }
 
@@ -621,7 +708,10 @@ impl UdpConn for DirectUdpConn {
         let socket_addr = resolve_udp_addr(self.mode, addr)?;
         self.socket
             .send_to(buf, socket_addr)
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
     }
 
     fn close(&self) -> Result<()> {
@@ -651,7 +741,10 @@ impl AsyncUdpConn for AsyncDirectUdpConn {
             .socket
             .recv_from(buf)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP recv error: {}", e)))?;
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP recv error: {}", e),
+            })?;
         Ok((n, Addr::new(addr.ip().to_string(), addr.port())))
     }
 
@@ -660,7 +753,10 @@ impl AsyncUdpConn for AsyncDirectUdpConn {
         self.socket
             .send_to(buf, socket_addr)
             .await
-            .map_err(|e| AclError::OutboundError(format!("UDP send error: {}", e)))
+            .map_err(|e| AclError::OutboundError {
+                kind: OutboundErrorKind::Io,
+                message: format!("UDP send error: {}", e),
+            })
     }
 
     async fn close(&self) -> Result<()> {
