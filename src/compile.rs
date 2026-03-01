@@ -122,10 +122,13 @@ impl<O: Clone> CompiledRuleSet<O> {
             let mut cache = self.cache.lock();
             if let Some(entry) = cache.get(&key) {
                 if entry.matches_query(host, proto, port) {
-                    return entry.result.clone().map(|(outbound, hijack_ip)| MatchResult {
-                        outbound,
-                        hijack_ip,
-                    });
+                    return entry
+                        .result
+                        .clone()
+                        .map(|(outbound, hijack_ip)| MatchResult {
+                            outbound,
+                            hijack_ip,
+                        });
                 }
                 // Hash collision (extremely rare) — treat as cache miss
             }
@@ -307,7 +310,13 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
         assert_eq!(compiled.rule_count(), 3);
     }
 
@@ -320,7 +329,13 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // Match private IP
         let host = HostInfo::new("", Some("192.168.1.1".parse().unwrap()), None);
@@ -350,7 +365,13 @@ block(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // Exact match
         let host = HostInfo::from_name("example.com");
@@ -392,7 +413,13 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // Block UDP 443
         let host = HostInfo::from_name("example.com");
@@ -416,7 +443,13 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host = HostInfo::from_name("dns.google");
         let result = compiled.match_host(&host, Protocol::UDP, 53);
@@ -434,7 +467,13 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // First call - populates cache
         let host = HostInfo::from_name("example.com");
@@ -457,7 +496,13 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host = HostInfo::from_name("unknown.com");
         let result1 = compiled.match_host(&host, Protocol::TCP, 443);
@@ -476,7 +521,13 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host1 = HostInfo::from_name("example.com");
         let r1 = compiled.match_host(&host1, Protocol::TCP, 443);
@@ -504,7 +555,13 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // Direct construction with mixed-case (simulates Router's match_outbound)
         let host = HostInfo {
@@ -514,7 +571,8 @@ proxy(all)
         };
         let result = compiled.match_host(&host, Protocol::TCP, 443);
         assert_eq!(
-            result.unwrap().outbound, "PROXY",
+            result.unwrap().outbound,
+            "PROXY",
             "Mixed-case hostname should match domain rules"
         );
     }
@@ -528,7 +586,13 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host = HostInfo {
             name: "WWW.YouTube.COM".to_string(),
@@ -537,7 +601,8 @@ proxy(all)
         };
         let result = compiled.match_host(&host, Protocol::TCP, 443);
         assert_eq!(
-            result.unwrap().outbound, "PROXY",
+            result.unwrap().outbound,
+            "PROXY",
             "Mixed-case hostname should match suffix rules"
         );
     }
@@ -558,7 +623,15 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = Arc::new(compile(&rules, &outbounds, NonZeroUsize::new(64).unwrap(), &NilGeoLoader).unwrap());
+        let compiled = Arc::new(
+            compile(
+                &rules,
+                &outbounds,
+                NonZeroUsize::new(64).unwrap(),
+                &NilGeoLoader,
+            )
+            .unwrap(),
+        );
 
         let handles: Vec<_> = (0..8)
             .map(|i| {
@@ -570,11 +643,7 @@ proxy(all)
                         let host = if (i + j) % 3 == 0 {
                             HostInfo::from_name("www.google.com")
                         } else if (i + j) % 3 == 1 {
-                            HostInfo::new(
-                                "",
-                                Some("10.1.2.3".parse().unwrap()),
-                                None,
-                            )
+                            HostInfo::new("", Some("10.1.2.3".parse().unwrap()), None)
                         } else {
                             HostInfo::from_name("unknown.example.org")
                         };
@@ -609,7 +678,13 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // Verify matches() works correctly
         let host = HostInfo::from_name("example.com");
@@ -640,12 +715,24 @@ proxy(all)
         let rules = parse_rules(text).unwrap();
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
         assert!(compiled.needs_ip_matching());
 
         let text = "proxy(example.com)";
         let rules = parse_rules(text).unwrap();
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
         assert!(!compiled.needs_ip_matching());
     }
 
@@ -657,7 +744,13 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(2).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(2).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host = HostInfo::from_name("a.com");
         compiled.match_host(&host, Protocol::TCP, 80);
@@ -681,13 +774,20 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         // from_name with an IP literal should match CIDR rules
         let host = HostInfo::from_name("192.168.1.1");
         let result = compiled.match_host(&host, Protocol::TCP, 80);
         assert_eq!(
-            result.unwrap().outbound, "DIRECT",
+            result.unwrap().outbound,
+            "DIRECT",
             "from_name('192.168.1.1') should match CIDR rule 192.168.0.0/16"
         );
     }
@@ -702,12 +802,19 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
 
         let host = HostInfo::from_name("1.2.3.4");
         let result = compiled.match_host(&host, Protocol::TCP, 80);
         assert_eq!(
-            result.unwrap().outbound, "DIRECT",
+            result.unwrap().outbound,
+            "DIRECT",
             "from_name('1.2.3.4') should match exact IP rule"
         );
     }
@@ -723,7 +830,12 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let result = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader);
+        let result = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        );
         match result {
             Err(e) => {
                 let err_msg = e.to_string();

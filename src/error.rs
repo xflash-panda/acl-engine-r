@@ -67,16 +67,10 @@ pub enum AclError {
     InvalidIp(String),
 
     #[error("GeoIP error: {message}")]
-    GeoIpError {
-        kind: GeoErrorKind,
-        message: String,
-    },
+    GeoIpError { kind: GeoErrorKind, message: String },
 
     #[error("GeoSite error: {message}")]
-    GeoSiteError {
-        kind: GeoErrorKind,
-        message: String,
-    },
+    GeoSiteError { kind: GeoErrorKind, message: String },
 
     #[error("Config error: {0}")]
     ConfigError(String),
@@ -233,7 +227,11 @@ mod tests {
         }
         let display = format!("{}", err);
         assert!(!display.contains("line"), "got: {}", display);
-        assert!(display.contains("Failed to read rules file"), "got: {}", display);
+        assert!(
+            display.contains("Failed to read rules file"),
+            "got: {}",
+            display
+        );
     }
 
     #[test]

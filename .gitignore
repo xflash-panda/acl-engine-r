@@ -26,8 +26,15 @@ Cargo.lock
 # Test
 *.test
 *.out
+*.tmp
 coverage.txt
 coverage.html
+
+# Geo data files
+*.dat
+*.mmdb
+*.metadb
+geosite.db
 
 # Dependencies
 vendor/

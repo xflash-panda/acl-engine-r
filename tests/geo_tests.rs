@@ -578,7 +578,8 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -614,7 +615,8 @@ mod router_tests {
             OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(1024).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -667,7 +669,8 @@ mod router_tests {
             OutboundEntry::new("reject", Arc::new(Reject::new()) as Arc<dyn Outbound>),
         ];
 
-        let options: RouterOptions = RouterOptions::new().with_cache_size(NonZeroUsize::new(2048).unwrap());
+        let options: RouterOptions =
+            RouterOptions::new().with_cache_size(NonZeroUsize::new(2048).unwrap());
 
         let router = Router::new(rules, outbounds, &geo_loader, options);
         assert!(
@@ -778,7 +781,12 @@ mod compiled_ruleset_tests {
         outbounds.insert("direct".to_string(), "DIRECT".to_string());
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
 
-        let ruleset = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &geo_loader);
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        );
         assert!(
             ruleset.is_ok(),
             "Failed to compile rules: {:?}",
@@ -827,7 +835,12 @@ mod compiled_ruleset_tests {
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
         outbounds.insert("reject".to_string(), "REJECT".to_string());
 
-        let ruleset = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &geo_loader);
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        );
         assert!(
             ruleset.is_ok(),
             "Failed to compile rules: {:?}",
@@ -888,7 +901,13 @@ mod compiled_ruleset_tests {
         outbounds.insert("proxy".to_string(), "PROXY".to_string());
         outbounds.insert("reject".to_string(), "REJECT".to_string());
 
-        let ruleset = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &geo_loader).unwrap();
+        let ruleset = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &geo_loader,
+        )
+        .unwrap();
 
         // Test UDP 443 (QUIC) should be rejected
         let host = HostInfo::from_name("www.google.com");

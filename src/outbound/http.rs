@@ -65,7 +65,11 @@ fn process_line_chunk(
 }
 
 /// Read a line from a BufRead reader with a maximum length limit.
-fn read_line_limited<R: BufRead>(reader: &mut R, buf: &mut String, max_len: usize) -> std::io::Result<usize> {
+fn read_line_limited<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    max_len: usize,
+) -> std::io::Result<usize> {
     let mut total = 0;
     loop {
         let available = reader.fill_buf()?;
@@ -150,12 +154,10 @@ fn parse_connect_status(status_line: &str) -> Result<()> {
         });
     }
 
-    let status_code: u16 = parts[1]
-        .parse()
-        .map_err(|_| AclError::OutboundError {
-            kind: OutboundErrorKind::Protocol,
-            message: format!("Invalid status code: {}", parts[1]),
-        })?;
+    let status_code: u16 = parts[1].parse().map_err(|_| AclError::OutboundError {
+        kind: OutboundErrorKind::Protocol,
+        message: format!("Invalid status code: {}", parts[1]),
+    })?;
 
     if status_code != 200 {
         return Err(AclError::OutboundError {
@@ -177,11 +179,12 @@ fn drain_headers<R: BufRead>(reader: &mut R) -> Result<()> {
     let mut header_count = 0;
     loop {
         let mut line = String::new();
-        read_line_limited(reader, &mut line, MAX_LINE_LENGTH)
-            .map_err(|e| AclError::OutboundError {
+        read_line_limited(reader, &mut line, MAX_LINE_LENGTH).map_err(|e| {
+            AclError::OutboundError {
                 kind: OutboundErrorKind::Io,
                 message: format!("Failed to read headers: {}", e),
-            })?;
+            }
+        })?;
         if line.trim().is_empty() {
             break;
         }
@@ -381,11 +384,12 @@ impl Http {
                 message: "No address resolved for proxy".to_string(),
             })?;
 
-        let stream = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| AclError::OutboundError {
+        let stream = TcpStream::connect_timeout(&addr, self.timeout).map_err(|e| {
+            AclError::OutboundError {
                 kind: OutboundErrorKind::ConnectionFailed,
                 message: format!("Failed to connect to proxy: {}", e),
-            })?;
+            }
+        })?;
 
         Ok(stream)
     }
@@ -430,20 +434,21 @@ impl Outbound for Http {
         stream.set_write_timeout(Some(HTTP_REQUEST_TIMEOUT)).ok();
 
         let request = build_connect_request(&addr.host, addr.port, self.basic_auth.as_deref());
-        stream.write_all(request.as_bytes()).map_err(|e| {
-            AclError::OutboundError {
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| AclError::OutboundError {
                 kind: OutboundErrorKind::Io,
                 message: format!("Failed to send CONNECT request: {}", e),
-            }
-        })?;
+            })?;
 
         let mut reader = BufReader::new(&stream);
         let mut status_line = String::new();
-        read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH)
-            .map_err(|e| AclError::OutboundError {
+        read_line_limited(&mut reader, &mut status_line, MAX_LINE_LENGTH).map_err(|e| {
+            AclError::OutboundError {
                 kind: OutboundErrorKind::Io,
                 message: format!("Failed to read response: {}", e),
-            })?;
+            }
+        })?;
         parse_connect_status(&status_line)?;
         drain_headers(&mut reader)?;
 
@@ -455,11 +460,9 @@ impl Outbound for Http {
             let buffered_data = buffered.to_vec();
             let stream = reader.into_inner();
             return Ok(Box::new(BufferedTcpConn::new(
-                stream.try_clone().map_err(|e| {
-                    AclError::OutboundError {
-                        kind: OutboundErrorKind::ConnectionFailed,
-                        message: format!("Failed to clone stream: {}", e),
-                    }
+                stream.try_clone().map_err(|e| AclError::OutboundError {
+                    kind: OutboundErrorKind::ConnectionFailed,
+                    message: format!("Failed to clone stream: {}", e),
                 })?,
                 buffered_data,
             )));
@@ -1171,10 +1174,7 @@ mod tests {
         // NULL bytes in hostnames can cause issues with C-based DNS resolvers
         // and can be used for smuggling attacks.
         let result = validate_connect_host("evil.com\0injected");
-        assert!(
-            result.is_err(),
-            "NULL byte in hostname should be rejected"
-        );
+        assert!(result.is_err(), "NULL byte in hostname should be rejected");
     }
 
     #[test]
@@ -1219,7 +1219,6 @@ mod async_tests {
     async fn test_async_http_from_url() {
         let http = Http::from_url("http://proxy.example.com:8080").unwrap();
         assert_eq!(http.addr, "proxy.example.com:8080");
-
     }
 
     #[tokio::test]
@@ -1398,8 +1397,14 @@ mod async_tests {
         // CRLF injection is now prevented at the Addr layer:
         // Addr::new() strips control characters before reaching HTTP.
         let addr = Addr::new("evil.com\r\nX-Injected: true", 80);
-        assert!(!addr.host.contains('\r'), "CRLF should be stripped by Addr::new");
-        assert!(!addr.host.contains('\n'), "CRLF should be stripped by Addr::new");
+        assert!(
+            !addr.host.contains('\r'),
+            "CRLF should be stripped by Addr::new"
+        );
+        assert!(
+            !addr.host.contains('\n'),
+            "CRLF should be stripped by Addr::new"
+        );
     }
 
     #[tokio::test]
@@ -1418,7 +1423,8 @@ mod async_tests {
         assert!(
             result.is_err() || buf.len() <= max_len,
             "async_read_line_limited should enforce max_len={} on lines with newline, got {} bytes",
-            max_len, buf.len()
+            max_len,
+            buf.len()
         );
     }
 

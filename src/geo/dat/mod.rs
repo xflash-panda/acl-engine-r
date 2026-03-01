@@ -16,11 +16,15 @@ pub mod geodat {
 
 /// Load GeoIP data from V2Ray DAT format
 pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>> {
-    let data = fs::read(path.as_ref())
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to read DAT file: {}", e) })?;
+    let data = fs::read(path.as_ref()).map_err(|e| AclError::GeoIpError {
+        kind: GeoErrorKind::FileError,
+        message: format!("Failed to read DAT file: {}", e),
+    })?;
 
-    let list = geodat::GeoIpList::decode(&data[..])
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::InvalidData, message: format!("Failed to decode GeoIP DAT: {}", e) })?;
+    let list = geodat::GeoIpList::decode(&data[..]).map_err(|e| AclError::GeoIpError {
+        kind: GeoErrorKind::InvalidData,
+        message: format!("Failed to decode GeoIP DAT: {}", e),
+    })?;
 
     let mut result = HashMap::new();
 
@@ -42,11 +46,15 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 
 /// Load GeoSite data from V2Ray DAT format
 pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<DomainEntry>>> {
-    let data = fs::read(path.as_ref())
-        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::FileError, message: format!("Failed to read DAT file: {}", e) })?;
+    let data = fs::read(path.as_ref()).map_err(|e| AclError::GeoSiteError {
+        kind: GeoErrorKind::FileError,
+        message: format!("Failed to read DAT file: {}", e),
+    })?;
 
-    let list = geodat::GeoSiteList::decode(&data[..])
-        .map_err(|e| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Failed to decode GeoSite DAT: {}", e) })?;
+    let list = geodat::GeoSiteList::decode(&data[..]).map_err(|e| AclError::GeoSiteError {
+        kind: GeoErrorKind::InvalidData,
+        message: format!("Failed to decode GeoSite DAT: {}", e),
+    })?;
 
     let mut result = HashMap::new();
 
@@ -69,7 +77,13 @@ pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<Domain
 /// Convert protobuf CIDR to IpNet
 fn cidr_to_ipnet(cidr: &geodat::Cidr) -> Option<IpNet> {
     let ip = &cidr.ip;
-    let max_prefix = if ip.len() == 4 { 32 } else if ip.len() == 16 { 128 } else { return None };
+    let max_prefix = if ip.len() == 4 {
+        32
+    } else if ip.len() == 16 {
+        128
+    } else {
+        return None;
+    };
 
     if cidr.prefix > max_prefix {
         return None;
@@ -197,10 +211,15 @@ mod tests {
             }],
         };
 
-        let entry = domain_to_entry(&domain).expect("should parse domain").expect("should not be None");
+        let entry = domain_to_entry(&domain)
+            .expect("should parse domain")
+            .expect("should not be None");
 
         // The attribute key should be present
-        assert!(!entry.attributes.is_empty(), "attributes should not be empty");
+        assert!(
+            !entry.attributes.is_empty(),
+            "attributes should not be empty"
+        );
 
         // BUG: The value is always empty string instead of the actual typed value.
         // For bool_value=true, we expect some non-empty representation (e.g., "true").

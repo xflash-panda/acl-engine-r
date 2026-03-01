@@ -18,9 +18,9 @@ pub const DEFAULT_CACHE_SIZE: usize = 1024;
 const DEFAULT_CACHE_SIZE_NZ: std::num::NonZeroUsize =
     // SAFETY: 1024 is non-zero. This is a compile-time constant.
     match std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE) {
-        Some(v) => v,
-        None => panic!("DEFAULT_CACHE_SIZE must be non-zero"),
-    };
+            Some(v) => v,
+            None => panic!("DEFAULT_CACHE_SIZE must be non-zero"),
+        };
 
 /// MetaDB database types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,8 +57,11 @@ pub struct MetaDbReader {
 impl MetaDbReader {
     /// Open a MetaDB file
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let reader = maxminddb::Reader::open_readfile(path.as_ref())
-            .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MetaDB: {}", e) })?;
+        let reader =
+            maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+                kind: GeoErrorKind::FileError,
+                message: format!("Failed to open MetaDB: {}", e),
+            })?;
 
         let db_type = DatabaseType::from_str(&reader.metadata.database_type);
 
@@ -137,15 +140,20 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 
 /// Verify MetaDB file integrity
 pub fn verify(path: impl AsRef<Path>) -> Result<()> {
-    maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to verify MetaDB: {}", e) })?;
+    maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+        kind: GeoErrorKind::FileError,
+        message: format!("Failed to verify MetaDB: {}", e),
+    })?;
     Ok(())
 }
 
 /// Create a shared MetaDB reader
 pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
-    let reader = maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MetaDB: {}", e) })?;
+    let reader =
+        maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+            kind: GeoErrorKind::FileError,
+            message: format!("Failed to open MetaDB: {}", e),
+        })?;
     Ok(Arc::new(reader))
 }
 

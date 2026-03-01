@@ -40,15 +40,20 @@ pub fn load_geoip(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<IpNet>>>
 
 /// Verify MMDB file integrity
 pub fn verify(path: impl AsRef<Path>) -> Result<()> {
-    maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to verify MMDB: {}", e) })?;
+    maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+        kind: GeoErrorKind::FileError,
+        message: format!("Failed to verify MMDB: {}", e),
+    })?;
     Ok(())
 }
 
 /// Open a shared MMDB reader
 pub fn open_shared(path: impl AsRef<Path>) -> Result<Arc<maxminddb::Reader<Vec<u8>>>> {
-    let reader = maxminddb::Reader::open_readfile(path.as_ref())
-        .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB: {}", e) })?;
+    let reader =
+        maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+            kind: GeoErrorKind::FileError,
+            message: format!("Failed to open MMDB: {}", e),
+        })?;
     Ok(Arc::new(reader))
 }
 

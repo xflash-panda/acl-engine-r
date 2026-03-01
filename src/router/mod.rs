@@ -135,10 +135,7 @@ impl<T: ?Sized + DefaultOutbounds> RouterInner<T> {
         let ob_map = entries_to_map(outbounds);
         let rule_set = compile(&text_rules, &ob_map, options.cache_size, geo_loader)?;
 
-        let default_outbound = ob_map
-            .get("default")
-            .cloned()
-            .unwrap_or_else(T::direct);
+        let default_outbound = ob_map.get("default").cloned().unwrap_or_else(T::direct);
 
         Ok(Self {
             rule_set,
@@ -153,11 +150,10 @@ impl<T: ?Sized + DefaultOutbounds> RouterInner<T> {
         geo_loader: &dyn GeoLoader,
         options: RouterOptions,
     ) -> Result<Self> {
-        let rules = fs::read_to_string(path.as_ref())
-            .map_err(|e| AclError::ParseError {
-                line: None,
-                message: format!("Failed to read rules file: {}", e),
-            })?;
+        let rules = fs::read_to_string(path.as_ref()).map_err(|e| AclError::ParseError {
+            line: None,
+            message: format!("Failed to read rules file: {}", e),
+        })?;
         Self::new(&rules, outbounds, geo_loader, options)
     }
 
@@ -412,7 +408,8 @@ mod async_tests {
     #[tokio::test]
     async fn test_async_router_outbound_entry() {
         // AsyncOutboundEntry should work like OutboundEntry but with AsyncOutbound
-        let entry = AsyncOutboundEntry::new("proxy", Arc::new(Reject::new()) as Arc<dyn AsyncOutbound>);
+        let entry =
+            AsyncOutboundEntry::new("proxy", Arc::new(Reject::new()) as Arc<dyn AsyncOutbound>);
         assert_eq!(entry.name, "proxy");
     }
 }
@@ -424,7 +421,10 @@ mod tests {
 
     #[test]
     fn test_entries_to_map_inserts_defaults() {
-        let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>)];
+        let outbounds = vec![OutboundEntry::new(
+            "proxy",
+            Arc::new(Direct::new()) as Arc<dyn Outbound>,
+        )];
         let map = entries_to_map(outbounds);
         assert!(map.contains_key("proxy"));
         assert!(map.contains_key("direct"));
@@ -470,7 +470,10 @@ mod tests {
             direct(all)
         "#;
 
-        let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Reject::new()) as Arc<dyn Outbound>)];
+        let outbounds = vec![OutboundEntry::new(
+            "proxy",
+            Arc::new(Reject::new()) as Arc<dyn Outbound>,
+        )];
         let geo_loader = NilGeoLoader;
         let options = RouterOptions::new();
 
@@ -490,7 +493,10 @@ mod tests {
             proxy(all)
         "#;
 
-        let outbounds = vec![OutboundEntry::new("proxy", Arc::new(Reject::new()) as Arc<dyn Outbound>)];
+        let outbounds = vec![OutboundEntry::new(
+            "proxy",
+            Arc::new(Reject::new()) as Arc<dyn Outbound>,
+        )];
         let geo_loader = NilGeoLoader;
         let options = RouterOptions::new();
 
@@ -524,8 +530,16 @@ mod tests {
     fn test_outbound_entry_debug() {
         let entry = OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>);
         let debug_str = format!("{:?}", entry);
-        assert!(debug_str.contains("OutboundEntry"), "Debug should contain type name, got: {}", debug_str);
-        assert!(debug_str.contains("proxy"), "Debug should contain outbound name, got: {}", debug_str);
+        assert!(
+            debug_str.contains("OutboundEntry"),
+            "Debug should contain type name, got: {}",
+            debug_str
+        );
+        assert!(
+            debug_str.contains("proxy"),
+            "Debug should contain outbound name, got: {}",
+            debug_str
+        );
     }
 
     #[test]
@@ -544,14 +558,22 @@ mod tests {
         let options = RouterOptions::new();
         let router = Router::new(rules, outbounds, &geo_loader, options).unwrap();
         let debug_str = format!("{:?}", router);
-        assert!(debug_str.contains("Router"), "Debug should contain type name, got: {}", debug_str);
+        assert!(
+            debug_str.contains("Router"),
+            "Debug should contain type name, got: {}",
+            debug_str
+        );
     }
 
     #[test]
     fn test_router_options_debug_clone() {
         let options = RouterOptions::new();
         let debug_str = format!("{:?}", options);
-        assert!(debug_str.contains("RouterOptions"), "Debug should contain type name, got: {}", debug_str);
+        assert!(
+            debug_str.contains("RouterOptions"),
+            "Debug should contain type name, got: {}",
+            debug_str
+        );
 
         let cloned = options.clone();
         assert_eq!(cloned.cache_size, DEFAULT_CACHE_SIZE);

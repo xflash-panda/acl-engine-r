@@ -50,11 +50,7 @@ impl HostInfo {
     }
 
     /// Create a new HostInfo with name and IPs
-    pub fn new(
-        name: impl Into<String>,
-        ipv4: Option<Ipv4Addr>,
-        ipv6: Option<Ipv6Addr>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> Self {
         Self {
             name: name.into().to_lowercase(),
             ipv4,
@@ -190,11 +186,7 @@ mod tests {
     #[test]
     fn test_cache_key_with_ip() {
         let host_no_ip = HostInfo::from_name("example.com");
-        let host_with_ip = HostInfo::new(
-            "example.com",
-            Some("1.2.3.4".parse().unwrap()),
-            None,
-        );
+        let host_with_ip = HostInfo::new("example.com", Some("1.2.3.4".parse().unwrap()), None);
 
         let key1 = CacheKey::compute(&host_no_ip, Protocol::TCP, 443);
         let key2 = CacheKey::compute(&host_with_ip, Protocol::TCP, 443);

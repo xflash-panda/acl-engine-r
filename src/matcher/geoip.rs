@@ -120,8 +120,11 @@ pub struct GeoIpMatcher {
 impl GeoIpMatcher {
     /// Create a new GeoIP matcher from MMDB file
     pub fn from_mmdb(path: impl AsRef<Path>, country_code: &str) -> Result<Self> {
-        let reader = maxminddb::Reader::open_readfile(path.as_ref())
-            .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB file: {}", e) })?;
+        let reader =
+            maxminddb::Reader::open_readfile(path.as_ref()).map_err(|e| AclError::GeoIpError {
+                kind: GeoErrorKind::FileError,
+                message: format!("Failed to open MMDB file: {}", e),
+            })?;
 
         Ok(Self {
             country_code: country_code.to_uppercase(),
@@ -223,12 +226,8 @@ impl HostMatcher for GeoIpMatcher {
                 v4 || v6
             }
             GeoIpData::Dat(sorted) => {
-                let v4 = host
-                    .ipv4
-                    .is_some_and(|ip| sorted.contains(IpAddr::V4(ip)));
-                let v6 = host
-                    .ipv6
-                    .is_some_and(|ip| sorted.contains(IpAddr::V6(ip)));
+                let v4 = host.ipv4.is_some_and(|ip| sorted.contains(IpAddr::V4(ip)));
+                let v6 = host.ipv6.is_some_and(|ip| sorted.contains(IpAddr::V6(ip)));
                 v4 || v6
             }
         };

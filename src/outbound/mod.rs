@@ -52,11 +52,7 @@ impl Addr {
     /// to prevent injection attacks in downstream protocols (HTTP CONNECT, SOCKS5).
     /// Use [`try_new`](Self::try_new) for strict validation that rejects bad input.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
-        let host: String = host
-            .into()
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect();
+        let host: String = host.into().chars().filter(|c| !c.is_control()).collect();
         Self {
             host,
             port,
@@ -72,7 +68,9 @@ impl Addr {
     pub fn try_new(host: impl Into<String>, port: u16) -> Result<Self> {
         let host = host.into();
         if host.is_empty() {
-            return Err(AclError::InvalidAddress("host must not be empty".to_string()));
+            return Err(AclError::InvalidAddress(
+                "host must not be empty".to_string(),
+            ));
         }
         if host.bytes().any(|b| b < 0x20 || b == 0x7f) {
             return Err(AclError::InvalidAddress(
@@ -441,7 +439,6 @@ impl AsyncUdpConn for TokioUdpConn {
                 message: format!("UDP send error: {}", e),
             })
     }
-
 }
 
 /// Try to resolve the address from an IP literal.
@@ -478,7 +475,9 @@ pub(crate) fn build_resolve_info(ips: &[IpAddr]) -> ResolveInfo {
 }
 
 /// Split IP addresses into IPv4 and IPv6
-pub(crate) fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
+pub(crate) fn split_ipv4_ipv6(
+    ips: &[IpAddr],
+) -> (Option<std::net::Ipv4Addr>, Option<std::net::Ipv6Addr>) {
     let mut ipv4 = None;
     let mut ipv6 = None;
 
@@ -675,7 +674,10 @@ mod tests {
         let addr = Addr::new("example.com", 80)
             .with_resolve_info(ResolveInfo::from_ipv4(Ipv4Addr::new(1, 2, 3, 4)));
         let sock = addr.to_socket_addr().unwrap();
-        assert_eq!(sock, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80));
+        assert_eq!(
+            sock,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 80)
+        );
     }
 
     #[test]
@@ -758,7 +760,10 @@ mod tests {
         let addr = Addr::new("", 80);
         let network = addr.network_addr();
         // ":80" is not valid — this exposes the lack of validation
-        assert_ne!(network, ":80", "empty host should not produce ':port' address");
+        assert_ne!(
+            network, ":80",
+            "empty host should not produce ':port' address"
+        );
     }
 
     #[test]

@@ -146,7 +146,13 @@ proxy(all)
         outbounds.insert("reject".to_string(), "REJECT");
 
         // Compile rules
-        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
+        let compiled = compile(
+            &rules,
+            &outbounds,
+            NonZeroUsize::new(1024).unwrap(),
+            &NilGeoLoader,
+        )
+        .unwrap();
         assert_eq!(compiled.rule_count(), 6);
 
         // Test private IP -> direct

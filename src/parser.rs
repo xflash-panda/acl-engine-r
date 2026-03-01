@@ -8,11 +8,10 @@ use crate::types::{Protocol, TextRule};
 
 /// Regex pattern for parsing ACL rules
 /// Format: outbound(address[, protoPort][, hijackAddress])
-static RULE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| {
-        Regex::new(r"^([\w.\-]+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$")
-            .expect("RULE_PATTERN: hardcoded regex is invalid")
-    });
+static RULE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^([\w.\-]+)\s*\(([^,]+)(?:,\s*([^,]+))?(?:,\s*([^,]+))?\)$")
+        .expect("RULE_PATTERN: hardcoded regex is invalid")
+});
 
 /// Maximum nesting depth for `file:` include directives.
 const MAX_INCLUDE_DEPTH: usize = 10;
@@ -75,15 +74,9 @@ pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
 
 fn parse_rules_from_file_inner(path: impl AsRef<Path>, depth: usize) -> Result<Vec<TextRule>> {
     let path = path.as_ref();
-    let text = fs::read_to_string(path).map_err(|e| {
-        AclError::ParseError {
-            line: None,
-            message: format!(
-                "Failed to read rules file '{}': {}",
-                path.display(),
-                e
-            ),
-        }
+    let text = fs::read_to_string(path).map_err(|e| AclError::ParseError {
+        line: None,
+        message: format!("Failed to read rules file '{}': {}", path.display(), e),
     })?;
     parse_rules_inner(&text, depth)
 }
@@ -123,9 +116,9 @@ pub fn parse_proto_port(spec: &str) -> Result<(Protocol, u16, u16)> {
     let spec = spec.trim().to_lowercase();
 
     // Split by '/' using split_once to avoid Vec allocation
-    let (proto_str, port_spec) = spec.split_once('/').ok_or_else(|| {
-        AclError::InvalidProtoPort(format!("Invalid format: {}", spec))
-    })?;
+    let (proto_str, port_spec) = spec
+        .split_once('/')
+        .ok_or_else(|| AclError::InvalidProtoPort(format!("Invalid format: {}", spec)))?;
 
     // Parse protocol
     let protocol = match proto_str {
@@ -350,7 +343,9 @@ proxy(all)
         assert!(result.is_err(), "Circular file include should return error");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
-            err_msg.contains("include") || err_msg.contains("depth") || err_msg.contains("recursive"),
+            err_msg.contains("include")
+                || err_msg.contains("depth")
+                || err_msg.contains("recursive"),
             "Error should mention include depth issue, got: {}",
             err_msg
         );
@@ -384,7 +379,10 @@ proxy(all)
         }
 
         let result = parse_rules_from_file(&paths[0]);
-        assert!(result.is_err(), "Deeply nested includes should return error");
+        assert!(
+            result.is_err(),
+            "Deeply nested includes should return error"
+        );
 
         for p in &paths {
             let _ = fs::remove_file(p);

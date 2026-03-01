@@ -13,7 +13,8 @@ use super::format::{GeoIpFormat, GeoSiteFormat};
 use super::{dat, metadb, mmdb, singsite};
 
 /// Default update interval: 7 days
-pub const DEFAULT_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+pub const DEFAULT_UPDATE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Trait for loading GeoIP and GeoSite data
 pub trait GeoLoader: Send + Sync {
@@ -97,7 +98,10 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_geoip_path() to set it".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError {
+                kind: GeoErrorKind::NotConfigured,
+                message: "GeoIP path not configured, call with_geoip_path() to set it".to_string(),
+            })?;
 
         let data = dat::load_geoip(path)?;
 
@@ -117,12 +121,18 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_geoip_path() to set it".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError {
+                kind: GeoErrorKind::NotConfigured,
+                message: "GeoIP path not configured, call with_geoip_path() to set it".to_string(),
+            })?;
 
-        let reader = Arc::new(
-            maxminddb::Reader::open_readfile(path)
-                .map_err(|e| AclError::GeoIpError { kind: GeoErrorKind::FileError, message: format!("Failed to open MMDB/MetaDB: {}", e) })?,
-        );
+        let reader =
+            Arc::new(
+                maxminddb::Reader::open_readfile(path).map_err(|e| AclError::GeoIpError {
+                    kind: GeoErrorKind::FileError,
+                    message: format!("Failed to open MMDB/MetaDB: {}", e),
+                })?,
+            );
 
         *self.mmdb_reader.write() = Some(reader.clone());
         Ok(reader)
@@ -138,11 +148,21 @@ impl FileGeoLoader {
         let path = self
             .geosite_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured, call with_geosite_path() to set it".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError {
+                kind: GeoErrorKind::NotConfigured,
+                message: "GeoSite path not configured, call with_geosite_path() to set it"
+                    .to_string(),
+            })?;
 
         let format = self
             .get_geosite_format()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Cannot detect GeoSite format from '{}', supported extensions: .dat, .db", path.display()) })?;
+            .ok_or_else(|| AclError::GeoSiteError {
+                kind: GeoErrorKind::InvalidData,
+                message: format!(
+                    "Cannot detect GeoSite format from '{}', supported extensions: .dat, .db",
+                    path.display()
+                ),
+            })?;
 
         let data = load_geosite_file(path, format)?;
 
@@ -171,8 +191,9 @@ impl GeoLoader for FileGeoLoader {
                 // DAT: pre-load all CIDRs, lookup by country code
                 self.ensure_geoip_loaded()?;
                 let guard = self.geoip_data.read();
-                let data = guard.as_ref().ok_or_else(|| {
-                    AclError::GeoIpError { kind: GeoErrorKind::NotLoaded, message: "GeoIP data not loaded".to_string() }
+                let data = guard.as_ref().ok_or_else(|| AclError::GeoIpError {
+                    kind: GeoErrorKind::NotLoaded,
+                    message: "GeoIP data not loaded".to_string(),
                 })?;
                 let cidrs = data.get(&code).cloned().unwrap_or_default();
                 Ok(GeoIpMatcher::from_cidrs(&code, cidrs))
@@ -190,8 +211,9 @@ impl GeoLoader for FileGeoLoader {
 
         let (name, attrs) = GeoSiteMatcher::parse_pattern(site_name);
         let guard = self.geosite_data.read();
-        let data = guard.as_ref().ok_or_else(|| {
-            AclError::GeoSiteError { kind: GeoErrorKind::NotLoaded, message: "GeoSite data not loaded".to_string() }
+        let data = guard.as_ref().ok_or_else(|| AclError::GeoSiteError {
+            kind: GeoErrorKind::NotLoaded,
+            message: "GeoSite data not loaded".to_string(),
         })?;
 
         let domains = data.get(&name).cloned().unwrap_or_default();
