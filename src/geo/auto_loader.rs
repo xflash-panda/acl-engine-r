@@ -455,7 +455,7 @@ impl AutoGeoLoader {
                         AclError::GeoSiteError("GeoSite reader not initialized".to_string())
                     })?;
                     let items = reader.read(&code_lower)?;
-                    singsite::convert_items_to_entries(items)
+                    singsite::convert_items_to_entries(items)?
                 };
 
                 cache.insert(code_lower, domains.clone());

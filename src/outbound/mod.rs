@@ -31,14 +31,18 @@ pub use socks5::Socks5;
 pub const DEFAULT_DIALER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Network address with optional DNS resolution info.
+///
+/// Fields are crate-private to prevent bypassing input validation.
+/// Use [`host()`](Self::host), [`port()`](Self::port), and
+/// [`resolve_info()`](Self::resolve_info) for read access.
 #[derive(Debug, Clone)]
 pub struct Addr {
     /// Hostname or IP address
-    pub host: String,
+    pub(crate) host: String,
     /// Port number
-    pub port: u16,
+    pub(crate) port: u16,
     /// Optional DNS resolution result
-    pub resolve_info: Option<ResolveInfo>,
+    pub(crate) resolve_info: Option<ResolveInfo>,
 }
 
 impl Addr {
@@ -100,6 +104,21 @@ impl Addr {
     pub fn with_resolve_info(mut self, info: ResolveInfo) -> Self {
         self.resolve_info = Some(info);
         self
+    }
+
+    /// Get the hostname or IP address.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Get the port number.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Get the optional DNS resolution info.
+    pub fn resolve_info(&self) -> Option<&ResolveInfo> {
+        self.resolve_info.as_ref()
     }
 
     /// Parse the network address into a SocketAddr.
@@ -680,6 +699,33 @@ mod tests {
         let sock = result.unwrap();
         assert_eq!(sock.port(), 80);
         assert!(sock.ip().is_loopback());
+    }
+
+    #[test]
+    fn test_addr_host_getter_returns_filtered_value() {
+        // S1: Addr fields should not be directly writable by third-party consumers.
+        // Getters ensure the host value is always the validated one from construction.
+        let addr = Addr::new("evil\r\nHost: injected\r\n", 80);
+        assert!(
+            !addr.host().bytes().any(|b| b < 0x20),
+            "host() getter should return the filtered value"
+        );
+    }
+
+    #[test]
+    fn test_addr_port_getter() {
+        let addr = Addr::new("example.com", 8080);
+        assert_eq!(addr.port(), 8080);
+    }
+
+    #[test]
+    fn test_addr_resolve_info_getter() {
+        let addr = Addr::new("example.com", 80);
+        assert!(addr.resolve_info().is_none());
+
+        let addr = Addr::from_socket_addr("1.2.3.4:80".parse().unwrap());
+        assert!(addr.resolve_info().is_some());
+        assert!(addr.resolve_info().unwrap().has_address());
     }
 
     #[test]

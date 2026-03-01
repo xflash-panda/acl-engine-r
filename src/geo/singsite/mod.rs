@@ -147,7 +147,7 @@ pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<Domain
 
     for code in &codes {
         let items = reader.read(code)?;
-        let domains = convert_items_to_entries(items);
+        let domains = convert_items_to_entries(items)?;
         result.insert(code.to_lowercase(), domains);
     }
 
@@ -158,11 +158,13 @@ pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<Domain
 pub fn load_geosite_code(path: impl AsRef<Path>, code: &str) -> Result<Vec<DomainEntry>> {
     let (mut reader, _codes) = SingSiteReader::open(path)?;
     let items = reader.read(&code.to_lowercase())?;
-    Ok(convert_items_to_entries(items))
+    convert_items_to_entries(items)
 }
 
-/// Convert DomainItems to DomainEntries
-pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
+/// Convert DomainItems to DomainEntries.
+///
+/// Returns `Err` if any regex pattern is invalid.
+pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Result<Vec<DomainEntry>> {
     let mut domains = Vec::with_capacity(items.len());
 
     for item in items {
@@ -177,7 +179,12 @@ pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
             ItemType::DomainKeyword => DomainType::Plain(item.value.to_lowercase()),
             ItemType::DomainRegex => match regex::Regex::new(&item.value) {
                 Ok(re) => DomainType::Regex(re),
-                Err(_) => continue,
+                Err(e) => {
+                    return Err(AclError::GeoSiteError(format!(
+                        "Invalid regex pattern '{}': {}",
+                        item.value, e
+                    )));
+                }
             },
         };
 
@@ -187,7 +194,7 @@ pub fn convert_items_to_entries(items: Vec<DomainItem>) -> Vec<DomainEntry> {
         });
     }
 
-    domains
+    Ok(domains)
 }
 
 /// Verify sing-geosite file integrity
@@ -401,6 +408,71 @@ mod tests {
             result.is_ok(),
             "Uppercase lookup of mixed-case code should succeed, got: {:?}",
             result.err()
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_convert_items_returns_error_on_invalid_regex() {
+        // B1: convert_items_to_entries should return Err for invalid regex,
+        // not silently skip it.
+        let items = vec![
+            DomainItem {
+                item_type: ItemType::Domain,
+                value: "good.com".to_string(),
+            },
+            DomainItem {
+                item_type: ItemType::DomainRegex,
+                value: "[invalid(regex".to_string(),
+            },
+        ];
+
+        let result = convert_items_to_entries(items);
+        assert!(
+            result.is_err(),
+            "invalid regex should return Err, not silently skip"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("[invalid(regex"),
+            "error should mention the bad pattern, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_convert_items_valid_regex_succeeds() {
+        let items = vec![
+            DomainItem {
+                item_type: ItemType::DomainRegex,
+                value: r"^google\.com$".to_string(),
+            },
+        ];
+
+        let result = convert_items_to_entries(items);
+        assert!(result.is_ok(), "valid regex should succeed");
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_load_geosite_code_returns_error_on_invalid_regex() {
+        // B1: load_geosite_code should propagate invalid regex errors.
+        let dir = std::env::temp_dir().join("acl_engine_test_singsite_regex");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_bad_regex.srs");
+
+        // item_type 3 = DomainRegex
+        let file_data = build_singsite_file(&[
+            ("test", &[("good.com", 0), ("[broken(regex", 3)]),
+        ]);
+        std::fs::write(&file_path, &file_data).unwrap();
+
+        let result = load_geosite_code(&file_path, "test");
+        assert!(
+            result.is_err(),
+            "load_geosite_code should return error for invalid regex, not silently skip"
         );
 
         let _ = std::fs::remove_file(&file_path);

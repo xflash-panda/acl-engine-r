@@ -55,7 +55,7 @@ pub fn load_geosite(path: impl AsRef<Path>) -> Result<HashMap<String, Vec<Domain
         let mut domains = Vec::new();
 
         for domain in entry.domain {
-            if let Some(entry) = domain_to_entry(&domain) {
+            if let Some(entry) = domain_to_entry(&domain)? {
                 domains.push(entry);
             }
         }
@@ -87,8 +87,11 @@ fn cidr_to_ipnet(cidr: &geodat::Cidr) -> Option<IpNet> {
     }
 }
 
-/// Convert protobuf Domain to DomainEntry
-fn domain_to_entry(domain: &geodat::Domain) -> Option<DomainEntry> {
+/// Convert protobuf Domain to DomainEntry.
+///
+/// Returns `Err` if a regex pattern is invalid.
+/// Returns `Ok(None)` for unknown domain types (forward compatibility).
+fn domain_to_entry(domain: &geodat::Domain) -> Result<Option<DomainEntry>> {
     use geodat::domain::Type;
 
     let value = domain.value.to_lowercase();
@@ -96,14 +99,19 @@ fn domain_to_entry(domain: &geodat::Domain) -> Option<DomainEntry> {
         Ok(Type::Plain) => DomainType::Plain(value),
         Ok(Type::Regex) => match regex::Regex::new(&value) {
             Ok(re) => DomainType::Regex(re),
-            Err(_) => return None,
+            Err(e) => {
+                return Err(AclError::GeoSiteError(format!(
+                    "Invalid regex pattern '{}': {}",
+                    value, e
+                )));
+            }
         },
         Ok(Type::RootDomain) => {
             let dot_pattern = format!(".{}", value);
             DomainType::RootDomain(value, dot_pattern)
         }
         Ok(Type::Full) => DomainType::Full(value),
-        Err(_) => return None,
+        Err(_) => return Ok(None),
     };
 
     // Parse attributes with their typed values
@@ -120,10 +128,10 @@ fn domain_to_entry(domain: &geodat::Domain) -> Option<DomainEntry> {
         })
         .collect();
 
-    Some(DomainEntry {
+    Ok(Some(DomainEntry {
         domain_type,
         attributes,
-    })
+    }))
 }
 
 /// Verify DAT file integrity by attempting to load it
@@ -189,7 +197,7 @@ mod tests {
             }],
         };
 
-        let entry = domain_to_entry(&domain).expect("should parse domain");
+        let entry = domain_to_entry(&domain).expect("should parse domain").expect("should not be None");
 
         // The attribute key should be present
         assert!(!entry.attributes.is_empty(), "attributes should not be empty");
@@ -202,5 +210,49 @@ mod tests {
             !value.is_empty(),
             "attribute value should not be empty when typed_value is set, got empty string"
         );
+    }
+
+    #[test]
+    fn test_load_geosite_returns_error_on_invalid_regex() {
+        // B1: load_geosite silently skips entries with invalid regex.
+        // It should return Err so consumers know their rules are incomplete.
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("acl_engine_test_dat_regex");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("test_bad_regex.dat");
+
+        let site_list = geodat::GeoSiteList {
+            entry: vec![geodat::GeoSite {
+                country_code: "TEST".to_string(),
+                domain: vec![
+                    geodat::Domain {
+                        r#type: 2, // RootDomain (valid)
+                        value: "example.com".to_string(),
+                        attribute: vec![],
+                    },
+                    geodat::Domain {
+                        r#type: 1, // Regex (invalid pattern)
+                        value: "[broken(regex".to_string(),
+                        attribute: vec![],
+                    },
+                ],
+                resource_hash: vec![],
+                code: String::new(),
+            }],
+        };
+
+        let encoded = prost::Message::encode_to_vec(&site_list);
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        file.write_all(&encoded).unwrap();
+
+        let result = load_geosite(&file_path);
+        assert!(
+            result.is_err(),
+            "load_geosite should return error for invalid regex, not silently skip it"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
