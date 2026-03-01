@@ -13,8 +13,7 @@
 - **高性能缓存**: LRU 缓存加速重复查询
 - **线程安全**: 支持多线程并发访问
 - **出口连接**: 支持 Direct、Reject、SOCKS5、HTTP 代理
-- **DNS 解析**: 可配置的 DNS 解析器
-- **路由器**: 整合 ACL + Resolver + Outbound 的完整路由解决方案
+- **路由器**: 整合 ACL + Outbound 的完整路由解决方案
 
 ## 安装
 
@@ -22,15 +21,16 @@
 
 ```toml
 [dependencies]
-acl-engine = { git = "https://github.com/xflash-panda/acl-engine-r" }
+acl-engine-r = { git = "https://github.com/xflash-panda/acl-engine-r" }
 ```
 
 ## 快速开始
 
 ```rust
 use std::collections::HashMap;
-use acl_engine::{parse_rules, compile, Protocol, HostInfo};
-use acl_engine::geo::NilGeoLoader;
+use std::num::NonZeroUsize;
+use acl_engine_r::{parse_rules, compile, Protocol, HostInfo};
+use acl_engine_r::geo::NilGeoLoader;
 
 fn main() {
     // 1. 定义规则
@@ -53,7 +53,7 @@ fn main() {
     outbounds.insert("reject".to_string(), "REJECT");
 
     // 4. 编译规则 (缓存大小: 1024)
-    let engine = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+    let engine = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
     // 5. 匹配流量
     let host = HostInfo::from_name("www.google.com");
@@ -136,32 +136,30 @@ proxy(all)
 ### 使用 FileGeoLoader
 
 ```rust
-use acl_engine::geo::FileGeoLoader;
+use acl_engine_r::geo::FileGeoLoader;
 
 // 根据文件扩展名自动检测格式
 let geo_loader = FileGeoLoader::new()
     .with_geoip_path("/path/to/geoip.dat")      // 或 .mmdb, .metadb
     .with_geosite_path("/path/to/geosite.dat"); // 或 .db
 
-let engine = compile(&rules, &outbounds, 1024, &geo_loader).unwrap();
+let engine = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &geo_loader).unwrap();
 ```
 
 ### 使用 AutoGeoLoader (自动下载)
 
 ```rust
-use acl_engine::geo::{AutoGeoLoader, GeoIpFormat, GeoSiteFormat};
+use acl_engine_r::geo::{AutoGeoLoader, GeoIpFormat, GeoSiteFormat};
 use std::time::Duration;
 
-// 创建自动下载的 GeoLoader
-let geo_loader = AutoGeoLoader::new("/path/to/data/dir")
-    .with_geoip_format(GeoIpFormat::Dat)       // 可选: Dat, Mmdb, MetaDb
-    .with_geosite_format(GeoSiteFormat::Sing)  // 可选: Dat, Sing
+// 创建自动下载的 GeoLoader (builder 模式)
+let geo_loader = AutoGeoLoader::new()
+    .with_data_dir("/path/to/data/dir")
+    .with_geoip(GeoIpFormat::Dat)              // 可选: Dat, Mmdb, MetaDb
+    .with_geosite(GeoSiteFormat::Sing)         // 可选: Dat, Sing
     .with_update_interval(Duration::from_secs(7 * 24 * 3600)); // 7天更新
 
-// 预下载数据文件 (可选)
-geo_loader.ensure_files()?;
-
-let engine = compile(&rules, &outbounds, 1024, &geo_loader).unwrap();
+let engine = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &geo_loader).unwrap();
 ```
 
 AutoGeoLoader 特性：
@@ -173,11 +171,11 @@ AutoGeoLoader 特性：
 ### 使用 IP 地址匹配
 
 ```rust
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 
 // 创建带 IP 的 HostInfo
-let ip: IpAddr = "8.8.8.8".parse().unwrap();
-let host = HostInfo::new("dns.google", Some(ip), None);
+let ipv4: Ipv4Addr = "8.8.8.8".parse().unwrap();
+let host = HostInfo::new("dns.google", Some(ipv4), None);
 
 let result = engine.match_host(&host, Protocol::UDP, 53);
 ```
@@ -197,7 +195,7 @@ outbounds.insert("direct".to_string(), MyOutbound::Direct);
 outbounds.insert("proxy".to_string(), MyOutbound::Proxy("server1".into()));
 outbounds.insert("reject".to_string(), MyOutbound::Reject);
 
-let engine = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+let engine = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 ```
 
 ## API 参考
@@ -213,7 +211,7 @@ let engine = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
 ### 主要函数
 
 - `parse_rules(text: &str) -> Result<Vec<TextRule>>`: 解析规则文本
-- `compile(rules, outbounds, cache_size, geo_loader) -> Result<CompiledRuleSet<O>>`: 编译规则
+- `compile(rules, outbounds, cache_size: NonZeroUsize, geo_loader) -> Result<CompiledRuleSet<O>>`: 编译规则
 - `CompiledRuleSet::match_host(host, protocol, port) -> Option<MatchResult<O>>`: 匹配主机
 
 ### GeoLoader 特征
@@ -228,7 +226,7 @@ pub trait GeoLoader: Send + Sync {
 ### Geo 格式枚举
 
 ```rust
-use acl_engine::geo::{GeoIpFormat, GeoSiteFormat};
+use acl_engine_r::geo::{GeoIpFormat, GeoSiteFormat};
 
 // GeoIP 格式
 pub enum GeoIpFormat {
@@ -251,7 +249,7 @@ pub enum GeoSiteFormat {
 ### Direct (直连)
 
 ```rust
-use acl_engine::{Direct, DirectMode, Outbound, Addr};
+use acl_engine_r::{Direct, DirectMode, Outbound, Addr};
 
 // 创建直连出口
 let direct = Direct::new();
@@ -267,7 +265,7 @@ let conn = direct.dial_tcp(&mut addr)?;
 ### Reject (拒绝)
 
 ```rust
-use acl_engine::{Reject, Outbound};
+use acl_engine_r::{Reject, Outbound};
 
 let reject = Reject::new();
 // 所有连接都会被拒绝
@@ -276,13 +274,13 @@ let reject = Reject::new();
 ### SOCKS5 代理
 
 ```rust
-use acl_engine::{Socks5, Outbound, Addr};
+use acl_engine_r::{Socks5, Outbound, Addr};
 
 // 无认证
 let socks5 = Socks5::new("127.0.0.1:1080");
 
-// 带认证
-let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass");
+// 带认证 (返回 Result，校验凭据长度)
+let socks5 = Socks5::with_auth("127.0.0.1:1080", "user", "pass")?;
 
 let mut addr = Addr::new("example.com", 80);
 let conn = socks5.dial_tcp(&mut addr)?;
@@ -291,7 +289,7 @@ let conn = socks5.dial_tcp(&mut addr)?;
 ### HTTP 代理
 
 ```rust
-use acl_engine::{Http, Outbound, Addr};
+use acl_engine_r::{Http, Outbound, Addr};
 
 // 从 URL 创建 (支持 http:// 和 https://)
 let http = Http::from_url("http://proxy.example.com:8080")?;
@@ -306,20 +304,21 @@ let conn = http.dial_tcp(&mut addr)?;
 
 ## Router 路由器
 
-Router 整合了 ACL 规则、DNS 解析和出口连接：
+Router 整合了 ACL 规则和出口连接：
 
 ```rust
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use acl_engine::{
+use acl_engine_r::{
     Router, RouterOptions, OutboundEntry,
-    Direct, Socks5, SystemResolver,
-    NilGeoLoader,
+    Direct, Socks5, Addr, Outbound,
 };
+use acl_engine_r::geo::NilGeoLoader;
 
 // 定义出口
 let outbounds = vec![
-    OutboundEntry::new("direct", Arc::new(Direct::new())),
-    OutboundEntry::new("proxy", Arc::new(Socks5::new("127.0.0.1:1080"))),
+    OutboundEntry::new("direct", Arc::new(Direct::new()) as Arc<dyn Outbound>),
+    OutboundEntry::new("proxy", Arc::new(Socks5::new("127.0.0.1:1080")) as Arc<dyn Outbound>),
 ];
 
 // ACL 规则
@@ -336,29 +335,12 @@ let router = Router::new(
     outbounds,
     &NilGeoLoader,
     RouterOptions::new()
-        .with_cache_size(1024)
-        .with_resolver(SystemResolver::new()),
+        .with_cache_size(NonZeroUsize::new(1024).unwrap()),
 )?;
 
 // 路由连接
 let mut addr = Addr::new("www.google.com", 443);
 let conn = router.dial_tcp(&mut addr)?;
-```
-
-## Resolver DNS 解析器
-
-```rust
-use acl_engine::{SystemResolver, StaticResolver, NilResolver, Resolver};
-
-// 系统解析器 (使用 OS DNS)
-let resolver = SystemResolver::new();
-
-// 静态解析器 (预定义映射)
-let resolver = StaticResolver::new()
-    .with_mapping("example.com", Some("93.184.216.34".parse().unwrap()), None);
-
-// 空解析器 (不解析)
-let resolver = NilResolver::new();
 ```
 
 ## 性能优化
@@ -373,7 +355,7 @@ let resolver = NilResolver::new();
 - **大幅降低内存**: 相比传统 Trie 结构减少约 80% 内存占用
 
 ```rust
-use acl_engine_r::matcher::domain::SuccinctMatcher;
+use acl_engine_r::matcher::SuccinctMatcher;
 
 // 精确匹配域名
 let exact = vec!["example.com".to_string()];
@@ -398,7 +380,7 @@ assert!(!matcher.matches("notgoogle.com"));   // 不匹配 (不是后缀)
 - **线程安全**: 支持多线程并发访问
 
 ```rust
-use acl_engine_r::geo::metadb::{CachedMetaDbReader, DEFAULT_CACHE_SIZE};
+use acl_engine_r::geo::metadb::CachedMetaDbReader;
 
 // 使用默认缓存大小 (1024)
 let reader = CachedMetaDbReader::open("/path/to/geoip.metadb")?;
@@ -430,7 +412,6 @@ let size = reader.cache_len();  // 获取缓存条目数
 - **GeoSite 格式**: 支持 DAT、sing-geosite (与 Go 版本对齐)
 - **AutoGeoLoader**: 自动下载功能，与 Go 版本行为一致
 - **Outbound**: Direct、Reject、SOCKS5、HTTP (与 Go 版本对齐)
-- **Resolver**: DNS 解析器接口 (与 Go 版本对齐)
 - **Router**: 完整路由器实现 (与 Go 版本对齐)
 
 ### 默认 CDN 源
@@ -446,4 +427,3 @@ let size = reader.cache_len();  // 获取缓存条目数
 ## 许可证
 
 MIT License
-    
