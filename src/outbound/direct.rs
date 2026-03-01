@@ -3,7 +3,8 @@
 //! Connects directly to the target using the local network.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -167,6 +168,20 @@ impl Direct {
         Ok(socket)
     }
 
+    /// Dial TCP to a specific IP address, checking a cancellation flag first.
+    /// Returns `None` if cancelled (the caller should not attempt the connection).
+    fn dial_tcp_ip_cancellable(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        cancelled: &AtomicBool,
+    ) -> Option<Result<TcpStream>> {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.dial_tcp_ip(ip, port))
+    }
+
     /// Dial TCP to a specific IP address.
     fn dial_tcp_ip(&self, ip: IpAddr, port: u16) -> Result<TcpStream> {
         let socket_addr = SocketAddr::new(ip, port);
@@ -252,20 +267,37 @@ impl Direct {
     }
 
     /// Dual-stack dial TCP, racing IPv4 and IPv6 connections.
+    ///
+    /// Spawns two threads to race IPv4 and IPv6 connections. When the first
+    /// succeeds, a shared cancellation flag is set so the other thread can
+    /// skip its connection attempt if it hasn't started yet.
+    ///
+    /// Note: if the losing thread has already entered `connect_timeout`,
+    /// the flag cannot interrupt the in-progress syscall — the thread will
+    /// run until the OS connect times out. This is a limitation of
+    /// std::thread (no cooperative cancellation). For full cancellation,
+    /// use the async API which leverages `tokio::select!`.
     fn dual_stack_dial_tcp(&self, ipv4: Ipv4Addr, ipv6: Ipv6Addr, port: u16) -> Result<TcpStream> {
         let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
 
         let clone_v4 = self.clone();
         let tx_v4 = tx.clone();
         let ip_v4 = IpAddr::V4(ipv4);
+        let cancelled_v4 = cancelled.clone();
         thread::spawn(move || {
-            let _ = tx_v4.send((ip_v4, clone_v4.dial_tcp_ip(ip_v4, port)));
+            if let Some(result) = clone_v4.dial_tcp_ip_cancellable(ip_v4, port, &cancelled_v4) {
+                let _ = tx_v4.send((ip_v4, result));
+            }
         });
 
         let clone_v6 = self.clone();
         let ip_v6 = IpAddr::V6(ipv6);
+        let cancelled_v6 = cancelled.clone();
         thread::spawn(move || {
-            let _ = tx.send((ip_v6, clone_v6.dial_tcp_ip(ip_v6, port)));
+            if let Some(result) = clone_v6.dial_tcp_ip_cancellable(ip_v6, port, &cancelled_v6) {
+                let _ = tx.send((ip_v6, result));
+            }
         });
 
         // Get first result
@@ -274,6 +306,7 @@ impl Direct {
             .map_err(|_| AclError::OutboundError("Channel error".to_string()))?;
 
         if first.is_ok() {
+            cancelled.store(true, Ordering::Relaxed);
             return first;
         }
         let first_err = first.unwrap_err();
@@ -835,6 +868,40 @@ mod tests {
         }).unwrap();
         let addr = direct.udp_bind_addr(true);
         assert_eq!(addr, SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 0));
+    }
+
+    #[test]
+    fn test_dial_tcp_ip_cancellable_skips_when_cancelled() {
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(true)); // Already cancelled
+
+        // Should return None without attempting connection
+        let result =
+            direct.dial_tcp_ip_cancellable(IpAddr::V4(Ipv4Addr::LOCALHOST), 80, &cancelled);
+        assert!(result.is_none(), "Should skip connection when cancelled");
+    }
+
+    #[test]
+    fn test_dial_tcp_ip_cancellable_attempts_when_not_cancelled() {
+        let direct = Direct::with_options(DirectOptions {
+            timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        })
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false)); // Not cancelled
+
+        // Should attempt connection (port 1 → connection refused)
+        let result =
+            direct.dial_tcp_ip_cancellable(IpAddr::V4(Ipv4Addr::LOCALHOST), 1, &cancelled);
+        assert!(
+            result.is_some(),
+            "Should attempt connection when not cancelled"
+        );
+        assert!(result.unwrap().is_err(), "Port 1 should fail");
     }
 
     #[test]
