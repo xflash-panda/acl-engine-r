@@ -561,6 +561,56 @@ mod tests {
     }
 
     #[test]
+    fn test_geoip_not_configured_error_includes_hint() {
+        let loader = AutoGeoLoader::new();
+        let err = loader.load_geoip("cn").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_geoip"),
+            "error should hint at with_geoip(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geosite_not_configured_error_includes_hint() {
+        let loader = AutoGeoLoader::new();
+        let err = loader.load_geosite("google").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_geosite"),
+            "error should hint at with_geosite(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geoip_path_not_configured_error_includes_hint() {
+        // Format set but no data_dir or path
+        let loader = AutoGeoLoader::new().with_geoip(GeoIpFormat::Dat);
+        let err = loader.load_geoip("cn").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_data_dir") || msg.contains("with_geoip_path"),
+            "error should hint at with_data_dir()/with_geoip_path(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geosite_path_not_configured_error_includes_hint() {
+        // Format set but no data_dir or path
+        let loader = AutoGeoLoader::new().with_geosite(GeoSiteFormat::Sing);
+        let err = loader.load_geosite("google").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_data_dir") || msg.contains("with_geosite_path"),
+            "error should hint at with_data_dir()/with_geosite_path(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn test_auto_geoloader_dat_format_geosite() {
         use prost::Message;
         use std::io::Write;

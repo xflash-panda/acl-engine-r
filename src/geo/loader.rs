@@ -97,7 +97,7 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_geoip_path() to set it".to_string() })?;
 
         let data = dat::load_geoip(path)?;
 
@@ -117,7 +117,7 @@ impl FileGeoLoader {
         let path = self
             .geoip_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_geoip_path() to set it".to_string() })?;
 
         let reader = Arc::new(
             maxminddb::Reader::open_readfile(path)
@@ -138,11 +138,11 @@ impl FileGeoLoader {
         let path = self
             .geosite_path
             .as_ref()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::NotConfigured, message: "GeoSite path not configured, call with_geosite_path() to set it".to_string() })?;
 
         let format = self
             .get_geosite_format()
-            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: "Cannot detect GeoSite format".to_string() })?;
+            .ok_or_else(|| AclError::GeoSiteError { kind: GeoErrorKind::InvalidData, message: format!("Cannot detect GeoSite format from '{}', supported extensions: .dat, .db", path.display()) })?;
 
         let data = load_geosite_file(path, format)?;
 
@@ -159,9 +159,10 @@ impl Default for FileGeoLoader {
 
 impl GeoLoader for FileGeoLoader {
     fn load_geoip(&self, country_code: &str) -> Result<GeoIpMatcher> {
-        let format = self
-            .get_geoip_format()
-            .ok_or_else(|| AclError::GeoIpError { kind: GeoErrorKind::InvalidData, message: "Cannot detect GeoIP format".to_string() })?;
+        let format = self.get_geoip_format().ok_or_else(|| match &self.geoip_path {
+            None => AclError::GeoIpError { kind: GeoErrorKind::NotConfigured, message: "GeoIP path not configured, call with_geoip_path() to set it".to_string() },
+            Some(p) => AclError::GeoIpError { kind: GeoErrorKind::InvalidData, message: format!("Cannot detect GeoIP format from '{}', supported extensions: .dat, .mmdb, .metadb", p.display()) },
+        })?;
 
         let code = country_code.to_lowercase();
 
@@ -347,6 +348,64 @@ mod tests {
         // Load with attribute filter
         let matcher = loader.load_geosite("google@cn").unwrap();
         assert_eq!(matcher.site_name(), "google");
+    }
+
+    #[test]
+    fn test_geoip_not_configured_error_includes_hint() {
+        let loader = FileGeoLoader::new();
+        let err = loader.load_geoip("cn").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_geoip_path"),
+            "error should hint at with_geoip_path(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geosite_not_configured_error_includes_hint() {
+        let loader = FileGeoLoader::new();
+        let err = loader.load_geosite("google").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_geosite_path"),
+            "error should hint at with_geosite_path(), got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geoip_format_detection_error_includes_path_and_formats() {
+        let loader = FileGeoLoader::new().with_geoip_path("/tmp/geoip.txt");
+        let err = loader.load_geoip("cn").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("geoip.txt"),
+            "error should include the path, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(".dat") && msg.contains(".mmdb") && msg.contains(".metadb"),
+            "error should list supported extensions, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_geosite_format_detection_error_includes_path_and_formats() {
+        let loader = FileGeoLoader::new().with_geosite_path("/tmp/geosite.txt");
+        let err = loader.load_geosite("google").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("geosite.txt"),
+            "error should include the path, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(".dat") && msg.contains(".db"),
+            "error should list supported extensions, got: {}",
+            msg
+        );
     }
 
     #[test]
