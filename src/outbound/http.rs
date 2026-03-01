@@ -232,8 +232,6 @@ async fn async_drain_headers<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R)
 pub struct Http {
     /// Proxy server address
     addr: String,
-    /// Skip TLS certificate verification (reserved for future HTTPS support)
-    insecure: bool,
     /// Basic auth header value (base64 encoded)
     basic_auth: Option<String>,
     /// Connection timeout
@@ -243,13 +241,8 @@ pub struct Http {
 impl Http {
     /// Create a new HTTP proxy outbound from URL.
     ///
-    /// URL format: `http://[user:pass@]host:port` or `https://[user:pass@]host:port`
+    /// URL format: `http://[user:pass@]host:port`
     pub fn from_url(url: &str) -> Result<Self> {
-        Self::from_url_with_options(url, false)
-    }
-
-    /// Create a new HTTP proxy outbound from URL with options.
-    pub fn from_url_with_options(url: &str, insecure: bool) -> Result<Self> {
         // Simple URL parsing
         let url = url.trim();
 
@@ -322,7 +315,6 @@ impl Http {
 
         Ok(Self {
             addr,
-            insecure,
             basic_auth,
             timeout: DEFAULT_DIALER_TIMEOUT,
         })
@@ -335,7 +327,6 @@ impl Http {
     pub fn new(addr: impl Into<String>) -> Self {
         Self {
             addr: addr.into(),
-            insecure: false,
             basic_auth: None,
             timeout: DEFAULT_DIALER_TIMEOUT,
         }
@@ -353,7 +344,6 @@ impl Http {
         }
         Ok(Self {
             addr: addr.into(),
-            insecure: false,
             basic_auth: None,
             timeout: DEFAULT_DIALER_TIMEOUT,
         })
@@ -373,12 +363,6 @@ impl Http {
     /// Set connection timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    /// Set insecure mode (skip TLS verification).
-    pub fn with_insecure(mut self, insecure: bool) -> Self {
-        self.insecure = insecure;
         self
     }
 
@@ -852,7 +836,6 @@ mod tests {
         // Http::new() creates an HTTP-only proxy (no https param needed).
         let http = Http::new("127.0.0.1:8080");
         assert_eq!(http.addr, "127.0.0.1:8080");
-        assert!(!http.insecure);
     }
 
     #[test]
