@@ -83,8 +83,7 @@ pub struct CompiledRuleSet<O: Clone> {
 
 impl<O: Clone> CompiledRuleSet<O> {
     /// Create a new compiled rule set
-    pub fn new(rules: Vec<CompiledRule<O>>, cache_size: usize) -> Self {
-        let cache_size = NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(1).unwrap());
+    pub fn new(rules: Vec<CompiledRule<O>>, cache_size: NonZeroUsize) -> Self {
         let has_ip_rules = rules.iter().any(|r| r.matcher.needs_ip());
         Self {
             rules,
@@ -189,7 +188,7 @@ impl<O: Clone> CompiledRuleSet<O> {
 pub fn compile<O: Clone>(
     rules: &[TextRule],
     outbounds: &HashMap<String, O>,
-    cache_size: usize,
+    cache_size: NonZeroUsize,
     geo_loader: &dyn GeoLoader,
 ) -> Result<CompiledRuleSet<O>> {
     let mut compiled_rules = Vec::with_capacity(rules.len());
@@ -197,8 +196,8 @@ pub fn compile<O: Clone>(
     for rule in rules {
         let compiled = compile_rule(rule, outbounds, geo_loader).map_err(|e| {
             if rule.line_num > 0 {
-                AclError::ParseErrorAtLine {
-                    line: rule.line_num,
+                AclError::ParseError {
+                    line: Some(rule.line_num),
                     message: e.to_string(),
                 }
             } else {
@@ -308,7 +307,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
         assert_eq!(compiled.rule_count(), 3);
     }
 
@@ -321,7 +320,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // Match private IP
         let host = HostInfo::new("", Some("192.168.1.1".parse().unwrap()), None);
@@ -351,7 +350,7 @@ block(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // Exact match
         let host = HostInfo::from_name("example.com");
@@ -393,7 +392,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // Block UDP 443
         let host = HostInfo::from_name("example.com");
@@ -417,7 +416,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         let host = HostInfo::from_name("dns.google");
         let result = compiled.match_host(&host, Protocol::UDP, 53);
@@ -435,7 +434,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // First call - populates cache
         let host = HostInfo::from_name("example.com");
@@ -458,7 +457,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         let host = HostInfo::from_name("unknown.com");
         let result1 = compiled.match_host(&host, Protocol::TCP, 443);
@@ -477,7 +476,7 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         let host1 = HostInfo::from_name("example.com");
         let r1 = compiled.match_host(&host1, Protocol::TCP, 443);
@@ -505,7 +504,7 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // Direct construction with mixed-case (simulates Router's match_outbound)
         let host = HostInfo {
@@ -529,7 +528,7 @@ proxy(all)
         outbounds.insert("proxy".to_string(), "PROXY");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         let host = HostInfo {
             name: "WWW.YouTube.COM".to_string(),
@@ -559,7 +558,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("block".to_string(), "BLOCK");
 
-        let compiled = Arc::new(compile(&rules, &outbounds, 64, &NilGeoLoader).unwrap());
+        let compiled = Arc::new(compile(&rules, &outbounds, NonZeroUsize::new(64).unwrap(), &NilGeoLoader).unwrap());
 
         let handles: Vec<_> = (0..8)
             .map(|i| {
@@ -610,7 +609,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // Verify matches() works correctly
         let host = HostInfo::from_name("example.com");
@@ -641,12 +640,12 @@ proxy(all)
         let rules = parse_rules(text).unwrap();
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
         assert!(compiled.needs_ip_matching());
 
         let text = "proxy(example.com)";
         let rules = parse_rules(text).unwrap();
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
         assert!(!compiled.needs_ip_matching());
     }
 
@@ -658,7 +657,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 2, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(2).unwrap(), &NilGeoLoader).unwrap();
 
         let host = HostInfo::from_name("a.com");
         compiled.match_host(&host, Protocol::TCP, 80);
@@ -668,8 +667,6 @@ proxy(all)
         let result = compiled.match_host(&host, Protocol::TCP, 80);
         assert_eq!(result.unwrap().outbound, "PROXY");
     }
-
-    // P1-4 verified: cache_size=0 → 1 is acceptable (NonZeroUsize fallback works fine)
 
     #[test]
     fn test_from_name_ip_matches_cidr_rule() {
@@ -684,7 +681,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         // from_name with an IP literal should match CIDR rules
         let host = HostInfo::from_name("192.168.1.1");
@@ -705,7 +702,7 @@ proxy(all)
         outbounds.insert("direct".to_string(), "DIRECT");
         outbounds.insert("proxy".to_string(), "PROXY");
 
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 
         let host = HostInfo::from_name("1.2.3.4");
         let result = compiled.match_host(&host, Protocol::TCP, 80);
@@ -726,7 +723,7 @@ proxy(all)
         let mut outbounds = HashMap::new();
         outbounds.insert("direct".to_string(), "DIRECT");
 
-        let result = compile(&rules, &outbounds, 1024, &NilGeoLoader);
+        let result = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader);
         match result {
             Err(e) => {
                 let err_msg = e.to_string();

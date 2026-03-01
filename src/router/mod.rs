@@ -3,8 +3,10 @@
 //! Routes connections to different outbounds based on ACL rules.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::net::{IpAddr, ToSocketAddrs};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,14 +26,26 @@ use crate::outbound::{AsyncOutbound, AsyncTcpConn, AsyncUdpConn};
 use async_trait::async_trait;
 
 /// Default LRU cache size
-pub const DEFAULT_CACHE_SIZE: usize = 1024;
+pub const DEFAULT_CACHE_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1024) };
 
 /// Generic router that routes connections to outbounds based on ACL rules.
 ///
 /// Use the type aliases `Router` (sync) and `AsyncRouter` (async) for concrete usage.
+///
+/// Not `Clone` because it contains a compiled rule set with an LRU cache.
+/// Share via `Arc<Router>` or `Arc<AsyncRouter>` instead.
 pub struct RouterInner<T: ?Sized> {
     rule_set: CompiledRuleSet<Arc<T>>,
     default_outbound: Arc<T>,
+}
+
+impl<T: ?Sized> fmt::Debug for RouterInner<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Router")
+            .field("rule_count", &self.rule_set.rule_count())
+            .field("needs_ip_matching", &self.rule_set.needs_ip_matching())
+            .finish()
+    }
 }
 
 /// Sync router type alias (backward compatible).
@@ -52,6 +66,23 @@ pub struct OutboundEntry<T: ?Sized = dyn Outbound> {
     pub outbound: Arc<T>,
 }
 
+impl<T: ?Sized> Clone for OutboundEntry<T> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            outbound: self.outbound.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for OutboundEntry<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutboundEntry")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: ?Sized> OutboundEntry<T> {
     /// Create a new outbound entry.
     pub fn new(name: impl Into<String>, outbound: Arc<T>) -> Self {
@@ -63,9 +94,10 @@ impl<T: ?Sized> OutboundEntry<T> {
 }
 
 /// Router builder options.
+#[derive(Debug, Clone)]
 pub struct RouterOptions {
     /// LRU cache size for rule matching results
-    pub cache_size: usize,
+    pub cache_size: NonZeroUsize,
 }
 
 impl Default for RouterOptions {
@@ -83,7 +115,7 @@ impl RouterOptions {
     }
 
     /// Set cache size.
-    pub fn with_cache_size(mut self, size: usize) -> Self {
+    pub fn with_cache_size(mut self, size: NonZeroUsize) -> Self {
         self.cache_size = size;
         self
     }
@@ -122,7 +154,10 @@ impl<T: ?Sized + DefaultOutbounds> RouterInner<T> {
         options: RouterOptions,
     ) -> Result<Self> {
         let rules = fs::read_to_string(path.as_ref())
-            .map_err(|e| AclError::ParseError(format!("Failed to read rules file: {}", e)))?;
+            .map_err(|e| AclError::ParseError {
+                line: None,
+                message: format!("Failed to read rules file: {}", e),
+            })?;
         Self::new(&rules, outbounds, geo_loader, options)
     }
 
@@ -484,4 +519,41 @@ mod tests {
     }
 
     // P1-8 verified: DNS error stored in ResolveInfo is by-design (router continues to default outbound)
+
+    #[test]
+    fn test_outbound_entry_debug() {
+        let entry = OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>);
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("OutboundEntry"), "Debug should contain type name, got: {}", debug_str);
+        assert!(debug_str.contains("proxy"), "Debug should contain outbound name, got: {}", debug_str);
+    }
+
+    #[test]
+    fn test_outbound_entry_clone() {
+        let entry = OutboundEntry::new("proxy", Arc::new(Direct::new()) as Arc<dyn Outbound>);
+        let cloned = entry.clone();
+        assert_eq!(cloned.name, "proxy");
+        assert!(Arc::ptr_eq(&entry.outbound, &cloned.outbound));
+    }
+
+    #[test]
+    fn test_router_debug() {
+        let rules = "direct(all)";
+        let outbounds = vec![];
+        let geo_loader = NilGeoLoader;
+        let options = RouterOptions::new();
+        let router = Router::new(rules, outbounds, &geo_loader, options).unwrap();
+        let debug_str = format!("{:?}", router);
+        assert!(debug_str.contains("Router"), "Debug should contain type name, got: {}", debug_str);
+    }
+
+    #[test]
+    fn test_router_options_debug_clone() {
+        let options = RouterOptions::new();
+        let debug_str = format!("{:?}", options);
+        assert!(debug_str.contains("RouterOptions"), "Debug should contain type name, got: {}", debug_str);
+
+        let cloned = options.clone();
+        assert_eq!(cloned.cache_size, DEFAULT_CACHE_SIZE);
+    }
 }

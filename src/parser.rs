@@ -26,9 +26,12 @@ pub fn parse_rules(text: &str) -> Result<Vec<TextRule>> {
 
 fn parse_rules_inner(text: &str, depth: usize) -> Result<Vec<TextRule>> {
     if depth > MAX_INCLUDE_DEPTH {
-        return Err(AclError::ParseError(format!(
-            "file include depth exceeds maximum ({MAX_INCLUDE_DEPTH}), possible circular include"
-        )));
+        return Err(AclError::ParseError {
+            line: None,
+            message: format!(
+                "file include depth exceeds maximum ({MAX_INCLUDE_DEPTH}), possible circular include"
+            ),
+        });
     }
 
     let mut rules = Vec::new();
@@ -73,11 +76,14 @@ pub fn parse_rules_from_file(path: impl AsRef<Path>) -> Result<Vec<TextRule>> {
 fn parse_rules_from_file_inner(path: impl AsRef<Path>, depth: usize) -> Result<Vec<TextRule>> {
     let path = path.as_ref();
     let text = fs::read_to_string(path).map_err(|e| {
-        AclError::ParseError(format!(
-            "Failed to read rules file '{}': {}",
-            path.display(),
-            e
-        ))
+        AclError::ParseError {
+            line: None,
+            message: format!(
+                "Failed to read rules file '{}': {}",
+                path.display(),
+                e
+            ),
+        }
     })?;
     parse_rules_inner(&text, depth)
 }
@@ -86,16 +92,16 @@ fn parse_rules_from_file_inner(path: impl AsRef<Path>, depth: usize) -> Result<V
 fn parse_single_rule(line: &str, line_num: usize) -> Result<TextRule> {
     let captures = RULE_PATTERN
         .captures(line)
-        .ok_or_else(|| AclError::ParseErrorAtLine {
-            line: line_num,
+        .ok_or_else(|| AclError::ParseError {
+            line: Some(line_num),
             message: format!("Invalid rule format: {}", line),
         })?;
 
     let outbound = captures.get(1).unwrap().as_str().to_string();
     let address = captures.get(2).unwrap().as_str().trim().to_string();
     if address.is_empty() {
-        return Err(AclError::ParseErrorAtLine {
-            line: line_num,
+        return Err(AclError::ParseError {
+            line: Some(line_num),
             message: "Empty address".to_string(),
         });
     }

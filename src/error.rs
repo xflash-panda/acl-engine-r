@@ -39,8 +39,14 @@ pub enum GeoErrorKind {
 /// ACL Engine error types
 #[derive(Error, Debug)]
 pub enum AclError {
-    #[error("Parse error at line {line}: {message}")]
-    ParseErrorAtLine { line: usize, message: String },
+    #[error("{}", match line {
+        Some(l) => format!("Parse error at line {}: {}", l, message),
+        None => format!("Parse error: {}", message),
+    })]
+    ParseError {
+        line: Option<usize>,
+        message: String,
+    },
 
     #[error("Invalid rule format: {0}")]
     InvalidRuleFormat(String),
@@ -83,9 +89,6 @@ pub enum AclError {
 
     #[error("Resolve error: {0}")]
     ResolveError(String),
-
-    #[error("Parse error: {0}")]
-    ParseError(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -193,6 +196,60 @@ mod tests {
                 assert!(matches!(kind, GeoErrorKind::InvalidData));
             }
             _ => panic!("expected GeoSiteError"),
+        }
+    }
+
+    // D6: Unified ParseError — consumers match a single variant for all parse errors
+    #[test]
+    fn test_parse_error_with_line_number() {
+        let err = AclError::ParseError {
+            line: Some(42),
+            message: "Invalid rule format".into(),
+        };
+        match &err {
+            AclError::ParseError { line, message } => {
+                assert_eq!(*line, Some(42));
+                assert!(message.contains("Invalid rule format"));
+            }
+            _ => panic!("expected ParseError"),
+        }
+        let display = format!("{}", err);
+        assert!(display.contains("line 42"), "got: {}", display);
+        assert!(display.contains("Invalid rule format"), "got: {}", display);
+    }
+
+    #[test]
+    fn test_parse_error_without_line_number() {
+        let err = AclError::ParseError {
+            line: None,
+            message: "Failed to read rules file".into(),
+        };
+        match &err {
+            AclError::ParseError { line, message } => {
+                assert_eq!(*line, None);
+                assert!(message.contains("Failed to read rules file"));
+            }
+            _ => panic!("expected ParseError"),
+        }
+        let display = format!("{}", err);
+        assert!(!display.contains("line"), "got: {}", display);
+        assert!(display.contains("Failed to read rules file"), "got: {}", display);
+    }
+
+    #[test]
+    fn test_parse_error_single_match_handles_both() {
+        // D6: consumers only need to match ONE variant for all parse errors
+        let with_line = AclError::ParseError {
+            line: Some(1),
+            message: "bad".into(),
+        };
+        let without_line = AclError::ParseError {
+            line: None,
+            message: "bad".into(),
+        };
+        // Both match the same pattern — no need for two arms
+        for err in [&with_line, &without_line] {
+            assert!(matches!(err, AclError::ParseError { .. }));
         }
     }
 }

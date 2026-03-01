@@ -12,6 +12,7 @@
 //!
 //! ```rust
 //! use std::collections::HashMap;
+//! use std::num::NonZeroUsize;
 //! use acl_engine_r::{parse_rules, compile, Protocol, HostInfo};
 //! use acl_engine_r::geo::NilGeoLoader;
 //!
@@ -34,7 +35,7 @@
 //! outbounds.insert("reject".to_string(), "REJECT");
 //!
 //! // Compile rules
-//! let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+//! let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
 //!
 //! // Match traffic
 //! let host = HostInfo::from_name("www.google.com");
@@ -114,6 +115,7 @@ pub use router::{AsyncOutboundEntry, AsyncRouter};
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::num::NonZeroUsize;
 
     #[test]
     fn test_full_workflow() {
@@ -144,7 +146,7 @@ proxy(all)
         outbounds.insert("reject".to_string(), "REJECT");
 
         // Compile rules
-        let compiled = compile(&rules, &outbounds, 1024, &NilGeoLoader).unwrap();
+        let compiled = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilGeoLoader).unwrap();
         assert_eq!(compiled.rule_count(), 6);
 
         // Test private IP -> direct

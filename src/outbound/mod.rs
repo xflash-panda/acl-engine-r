@@ -238,29 +238,29 @@ pub trait AsyncOutbound: Send + Sync {
 /// TCP connection interface.
 pub trait TcpConn: Read + Write + Send + Sync {
     /// Get the local address
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> Result<SocketAddr>;
 
     /// Get the peer address
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn peer_addr(&self) -> Result<SocketAddr>;
 
     /// Set read timeout
-    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()>;
 
     /// Set write timeout
-    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()>;
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()>;
 
     /// Shutdown the connection
-    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()>;
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()>;
 }
 
 /// Async TCP connection interface.
 #[cfg(feature = "async")]
 pub trait AsyncTcpConn: AsyncRead + AsyncWrite + Send + Sync + Unpin {
     /// Get the local address
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn local_addr(&self) -> Result<SocketAddr>;
 
     /// Get the peer address
-    fn peer_addr(&self) -> io::Result<SocketAddr>;
+    fn peer_addr(&self) -> Result<SocketAddr>;
 }
 
 /// Standard TcpStream wrapper implementing TcpConn
@@ -295,24 +295,24 @@ impl Write for StdTcpConn {
 }
 
 impl TcpConn for StdTcpConn {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.local_addr()?)
     }
 
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.peer_addr()?)
     }
 
-    fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.inner.set_read_timeout(dur)
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.inner.set_read_timeout(dur)?)
     }
 
-    fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
-        self.inner.set_write_timeout(dur)
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.inner.set_write_timeout(dur)?)
     }
 
-    fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.inner.shutdown(how)
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        Ok(self.inner.shutdown(how)?)
     }
 }
 
@@ -397,12 +397,12 @@ impl AsyncWrite for TokioTcpConn {
 
 #[cfg(feature = "async")]
 impl AsyncTcpConn for TokioTcpConn {
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.local_addr()?)
     }
 
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.inner.peer_addr()?)
     }
 }
 
@@ -509,6 +509,95 @@ pub(crate) fn split_ipv4_ipv6(ips: &[IpAddr]) -> (Option<std::net::Ipv4Addr>, Op
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    // D3: TcpConn should return crate::Result (not io::Result) for consistency
+    // with Outbound trait. Consumers should be able to use ? on both dial_tcp()
+    // and TcpConn methods without two different error types.
+    fn _use_tcp_conn_with_unified_error(conn: &dyn TcpConn) -> Result<SocketAddr> {
+        // If TcpConn methods return crate::Result, this compiles with a single ?.
+        // If they return io::Result, this won't compile without map_err.
+        let addr = conn.local_addr()?;
+        Ok(addr)
+    }
+
+    #[cfg(feature = "async")]
+    fn _use_async_tcp_conn_with_unified_error(conn: &dyn AsyncTcpConn) -> Result<SocketAddr> {
+        let addr = conn.local_addr()?;
+        Ok(addr)
+    }
+
+    #[test]
+    fn test_tcp_conn_local_addr_returns_acl_error() {
+        // D3: Verify that TcpConn errors are AclError, not io::Error
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // local_addr should return crate::Result<SocketAddr>
+        let result = conn.local_addr();
+        assert!(result.is_ok());
+
+        // The result type should be crate::Result, meaning the error is AclError
+        let result: Result<SocketAddr> = conn.local_addr();
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_conn_set_read_timeout_returns_acl_error() {
+        // D3: Verify set_read_timeout returns crate::Result
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // set_read_timeout should return crate::Result<()>
+        let result: Result<()> = conn.set_read_timeout(Some(Duration::from_secs(1)));
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_conn_shutdown_returns_acl_error() {
+        // D3: Verify shutdown returns crate::Result
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let conn = StdTcpConn::new(stream);
+
+        // shutdown should return crate::Result<()>
+        let result: Result<()> = conn.shutdown(std::net::Shutdown::Both);
+        assert!(result.is_ok());
+
+        drop(conn);
+        let _ = handle.join();
+    }
 
     #[test]
     fn test_addr_from_socket_addr_v4() {

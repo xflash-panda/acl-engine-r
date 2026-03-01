@@ -606,24 +606,24 @@ impl Write for BufferedTcpConn {
 }
 
 impl TcpConn for BufferedTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.local_addr()?)
     }
 
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.peer_addr()?)
     }
 
-    fn set_read_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(dur)
+    fn set_read_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.stream.set_read_timeout(dur)?)
     }
 
-    fn set_write_timeout(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        self.stream.set_write_timeout(dur)
+    fn set_write_timeout(&self, dur: Option<Duration>) -> Result<()> {
+        Ok(self.stream.set_write_timeout(dur)?)
     }
 
-    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
-        self.stream.shutdown(how)
+    fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        Ok(self.stream.shutdown(how)?)
     }
 }
 
@@ -694,12 +694,12 @@ impl Unpin for AsyncBufferedTcpConn {}
 
 #[cfg(feature = "async")]
 impl AsyncTcpConn for AsyncBufferedTcpConn {
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.local_addr()
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.local_addr()?)
     }
 
-    fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        self.stream.peer_addr()
+    fn peer_addr(&self) -> Result<SocketAddr> {
+        Ok(self.stream.peer_addr()?)
     }
 }
 
