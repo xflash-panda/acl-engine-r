@@ -84,6 +84,7 @@ fn main() {
 | 后缀 | `suffix:example.com` | 匹配域名及其所有子域名 |
 | GeoIP | `geoip:cn` | 按国家匹配 IP |
 | GeoSite | `geosite:google` | 域名列表匹配 |
+| GeoSite 属性 | `geosite:google@cn` | 带属性过滤的域名列表匹配 |
 | 全部 | `all` 或 `*` | 匹配所有流量 |
 
 ### 协议/端口规格
@@ -106,31 +107,51 @@ file: /path/to/extra_rules.acl
 ### 规则示例
 
 ```
-# 私有网络直连
-direct(192.168.0.0/16)
+# === IP/CIDR 匹配 ===
+direct(192.168.1.1)              # 单个 IP 精确匹配
+direct(192.168.0.0/16)           # IPv4 CIDR 范围
 direct(10.0.0.0/8)
 direct(172.16.0.0/12)
+direct(fc00::/7)                 # IPv6 CIDR 范围
 
-# 国内 IP 直连
-direct(geoip:cn)
+# === 域名匹配 ===
+direct(example.com)              # 精确匹配 (仅匹配 example.com)
+proxy(*.google.com)              # 通配符匹配 (子域名，不含根域名)
+proxy(suffix:github.com)         # 后缀匹配 (根域名 + 所有子域名)
 
-# 特定域名走代理
-proxy(*.google.com)
-proxy(*.youtube.com)
-proxy(geosite:netflix)
+# === GeoIP 匹配 (需要 GeoIP 数据) ===
+direct(geoip:cn)                 # 中国 IP 直连
+direct(geoip:private)            # 私有/保留 IP 直连
 
-# 阻止 QUIC 协议
-reject(all, udp/443)
+# === GeoSite 匹配 (需要 GeoSite 数据) ===
+proxy(geosite:google)            # Google 相关域名
+proxy(geosite:netflix)           # Netflix 域名
+proxy(geosite:openai)            # OpenAI 域名
+direct(geosite:cn)               # 中国网站直连
+proxy(geosite:google@cn)         # GeoSite 属性过滤
+reject(geosite:category-ads)     # 屏蔽广告域名
 
-# DNS 劫持到本地
-direct(all, udp/53, 127.0.0.1)
+# === 协议/端口过滤 ===
+reject(all, udp/443)             # 阻止 QUIC 协议
+proxy(all, tcp/22)               # SSH 走代理
+direct(all, tcp/80-90)           # 端口范围匹配
+proxy(all, */8080)               # 任意协议指定端口
 
-# 引入外部规则文件
+# === 地址 + 端口组合 ===
+proxy(suffix:example.com, tcp/443)
+direct(geoip:cn, tcp/80)
+
+# === DNS 劫持 ===
+direct(all, udp/53, 114.114.114.114)
+
+# === 引入外部规则文件 ===
 file: /etc/acl/custom_rules.acl
 
-# 默认规则 (放在最后)
+# === 默认规则 (放在最后) ===
 proxy(all)
 ```
+
+> 完整配置示例参见 [acl-example.yaml](acl-example.yaml)
 
 ## 高级用法
 
