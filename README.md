@@ -71,6 +71,8 @@ fn main() {
 出口名(地址[, 协议/端口][, 劫持地址])
 ```
 
+出口名支持字母、数字、下划线、连字符和点号（如 `my-proxy`、`us.west`）。
+
 ### 地址类型
 
 | 类型 | 示例 | 说明 |
@@ -93,6 +95,14 @@ fn main() {
 | `*/80` | 所有协议，端口 80 |
 | `tcp/8000-9000` | TCP 端口范围 8000-9000 |
 
+### 文件引入
+
+支持通过 `file:` 指令引入外部规则文件，最大嵌套深度 10 层：
+
+```
+file: /path/to/extra_rules.acl
+```
+
 ### 规则示例
 
 ```
@@ -114,6 +124,9 @@ reject(all, udp/443)
 
 # DNS 劫持到本地
 direct(all, udp/53, 127.0.0.1)
+
+# 引入外部规则文件
+file: /etc/acl/custom_rules.acl
 
 # 默认规则 (放在最后)
 proxy(all)
@@ -210,7 +223,8 @@ let engine = compile(&rules, &outbounds, NonZeroUsize::new(1024).unwrap(), &NilG
 
 ### 主要函数
 
-- `parse_rules(text: &str) -> Result<Vec<TextRule>>`: 解析规则文本
+- `parse_rules(text: &str) -> Result<Vec<TextRule>>`: 解析规则文本（支持 `file:` 引入）
+- `parse_rules_from_file(path) -> Result<Vec<TextRule>>`: 从文件解析规则
 - `compile(rules, outbounds, cache_size: NonZeroUsize, geo_loader) -> Result<CompiledRuleSet<O>>`: 编译规则
 - `CompiledRuleSet::match_host(host, protocol, port) -> Option<MatchResult<O>>`: 匹配主机
 
