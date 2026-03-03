@@ -42,3 +42,4 @@ vendor/
 # Claude
 .claude/
 CLAUDE.md
+sessions/

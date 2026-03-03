@@ -44,6 +44,14 @@ outbounds:
       # Enable TCP Fast Open for optimized connection establishment (Linux/macOS)
       fastOpen: false
 
+      # Enable TCP_NODELAY (disable Nagle's algorithm) for lower latency.
+      # Default: true
+      tcpNodelay: true
+
+      # TCP keepalive interval in seconds. Set to enable periodic keepalive probes.
+      # Default: 60 (seconds). Remove or set to null to disable keepalive.
+      tcpKeepalive: 60
+
   # SOCKS5 proxy outbound
   - name: proxy
     type: socks5
@@ -241,5 +249,6 @@ acl:
 # Outbound Types:   direct, reject, socks5, http/https
 #
 # Direct Mode:     auto, 64, 46, 6, 4
-# Direct Options:  mode, bindIPv4, bindIPv6, bindDevice (Linux), fastOpen (Linux/macOS)
+# Direct Options:  mode, bindIPv4, bindIPv6, bindDevice (Linux), fastOpen (Linux/macOS),
+#                  tcpNodelay (default: true), tcpKeepalive (default: 60, in seconds)
 # =============================================================================
