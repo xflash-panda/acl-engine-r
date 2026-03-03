@@ -39,7 +39,7 @@ pub enum DirectMode {
 }
 
 /// Options for creating a Direct outbound.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DirectOptions {
     /// IP version preference mode
     pub mode: DirectMode,
@@ -54,6 +54,28 @@ pub struct DirectOptions {
     pub fast_open: bool,
     /// Connection timeout
     pub timeout: Option<Duration>,
+    /// Enable TCP_NODELAY (disable Nagle's algorithm). Default: true.
+    pub tcp_nodelay: bool,
+    /// TCP keepalive interval. Default: 60s. None = don't set keepalive.
+    pub tcp_keepalive: Option<Duration>,
+}
+
+/// Default keepalive interval for direct connections (60 seconds).
+pub(crate) const DEFAULT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+
+impl Default for DirectOptions {
+    fn default() -> Self {
+        Self {
+            mode: DirectMode::default(),
+            bind_ip4: None,
+            bind_ip6: None,
+            bind_device: None,
+            fast_open: false,
+            timeout: None,
+            tcp_nodelay: true,
+            tcp_keepalive: Some(DEFAULT_TCP_KEEPALIVE),
+        }
+    }
 }
 
 /// Direct outbound that connects directly to the target.
@@ -68,31 +90,23 @@ pub struct Direct {
     bind_device: Option<String>,
     fast_open: bool,
     timeout: Duration,
+    tcp_nodelay: bool,
+    tcp_keepalive: Option<Duration>,
 }
 
 impl Direct {
     /// Create a new Direct outbound with default settings.
     pub fn new() -> Self {
-        Self {
-            mode: DirectMode::Auto,
-            bind_ip4: None,
-            bind_ip6: None,
-            bind_device: None,
-            fast_open: false,
-            timeout: DEFAULT_DIALER_TIMEOUT,
-        }
+        Self::with_options(DirectOptions::default()).unwrap()
     }
 
     /// Create a new Direct outbound with the given mode.
     pub fn with_mode(mode: DirectMode) -> Self {
-        Self {
+        Self::with_options(DirectOptions {
             mode,
-            bind_ip4: None,
-            bind_ip6: None,
-            bind_device: None,
-            fast_open: false,
-            timeout: DEFAULT_DIALER_TIMEOUT,
-        }
+            ..Default::default()
+        })
+        .unwrap()
     }
 
     /// Create a new Direct outbound with the given options.
@@ -109,6 +123,8 @@ impl Direct {
             bind_device: opts.bind_device,
             fast_open: opts.fast_open,
             timeout: opts.timeout.unwrap_or(DEFAULT_DIALER_TIMEOUT),
+            tcp_nodelay: opts.tcp_nodelay,
+            tcp_keepalive: opts.tcp_keepalive,
         })
     }
 
@@ -214,7 +230,33 @@ impl Direct {
             })?
         };
 
+        self.apply_tcp_options_to_stream(&stream);
         Ok(stream)
+    }
+
+    /// Apply tcp_nodelay and tcp_keepalive to a connected std TcpStream.
+    fn apply_tcp_options_to_stream(&self, stream: &TcpStream) {
+        let sock = socket2::SockRef::from(stream);
+        sock.set_tcp_nodelay(self.tcp_nodelay).ok();
+        if let Some(interval) = self.tcp_keepalive {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(interval)
+                .with_interval(interval);
+            sock.set_tcp_keepalive(&keepalive).ok();
+        }
+    }
+
+    /// Apply tcp_nodelay and tcp_keepalive to a connected tokio TcpStream.
+    #[cfg(feature = "async")]
+    fn apply_tcp_options_to_tokio_stream(&self, stream: &TokioTcpStream) {
+        let sock = socket2::SockRef::from(stream);
+        sock.set_tcp_nodelay(self.tcp_nodelay).ok();
+        if let Some(interval) = self.tcp_keepalive {
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(interval)
+                .with_interval(interval);
+            sock.set_tcp_keepalive(&keepalive).ok();
+        }
     }
 
     /// Get the bind IP for the given target IP.
@@ -407,6 +449,7 @@ impl Direct {
                 })?
         };
 
+        self.apply_tcp_options_to_tokio_stream(&stream);
         Ok(stream)
     }
 
@@ -770,6 +813,59 @@ mod tests {
         assert!(direct.bind_ip6.is_none());
         assert!(direct.bind_device.is_none());
         assert!(!direct.fast_open);
+        assert!(direct.tcp_nodelay);
+        assert_eq!(direct.tcp_keepalive, Some(DEFAULT_TCP_KEEPALIVE));
+    }
+
+    #[test]
+    fn test_direct_options_default_tcp_settings() {
+        let opts = DirectOptions::default();
+        assert!(opts.tcp_nodelay, "tcp_nodelay should default to true");
+        assert_eq!(
+            opts.tcp_keepalive,
+            Some(DEFAULT_TCP_KEEPALIVE),
+            "tcp_keepalive should default to 60s"
+        );
+    }
+
+    #[test]
+    fn test_direct_with_mode_has_same_defaults_as_new() {
+        let d_new = Direct::new();
+        let d_mode = Direct::with_mode(DirectMode::Auto);
+        assert_eq!(d_new.tcp_nodelay, d_mode.tcp_nodelay);
+        assert_eq!(d_new.tcp_keepalive, d_mode.tcp_keepalive);
+        assert_eq!(d_new.timeout, d_mode.timeout);
+        assert_eq!(d_new.fast_open, d_mode.fast_open);
+    }
+
+    #[test]
+    fn test_direct_with_options_custom_tcp_nodelay_false() {
+        let opts = DirectOptions {
+            tcp_nodelay: false,
+            ..Default::default()
+        };
+        let direct = Direct::with_options(opts).unwrap();
+        assert!(!direct.tcp_nodelay);
+    }
+
+    #[test]
+    fn test_direct_with_options_custom_tcp_keepalive_none() {
+        let opts = DirectOptions {
+            tcp_keepalive: None,
+            ..Default::default()
+        };
+        let direct = Direct::with_options(opts).unwrap();
+        assert!(direct.tcp_keepalive.is_none());
+    }
+
+    #[test]
+    fn test_direct_with_options_custom_tcp_keepalive_value() {
+        let opts = DirectOptions {
+            tcp_keepalive: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        let direct = Direct::with_options(opts).unwrap();
+        assert_eq!(direct.tcp_keepalive, Some(Duration::from_secs(30)));
     }
 
     #[test]
@@ -960,6 +1056,108 @@ mod tests {
             addr,
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)), 0)
         );
+    }
+
+    #[test]
+    fn test_tcp_options_applied_nodelay_true() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let direct = Direct::new(); // tcp_nodelay=true by default
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = direct
+            .dial_tcp_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .unwrap();
+        assert!(stream.nodelay().unwrap(), "nodelay should be set to true");
+        drop(stream);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_options_applied_nodelay_false() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let direct = Direct::with_options(DirectOptions {
+            tcp_nodelay: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = direct
+            .dial_tcp_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .unwrap();
+        assert!(
+            !stream.nodelay().unwrap(),
+            "nodelay should be explicitly set to false"
+        );
+        drop(stream);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_options_applied_keepalive() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let direct = Direct::new(); // tcp_keepalive=Some(60s) by default
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = direct
+            .dial_tcp_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        let keepalive = sock.keepalive().unwrap();
+        assert!(keepalive, "keepalive should be enabled");
+        drop(stream);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_tcp_options_no_keepalive() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let direct = Direct::with_options(DirectOptions {
+            tcp_keepalive: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+
+        let stream = direct
+            .dial_tcp_ip(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+            .unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        let keepalive = sock.keepalive().unwrap();
+        assert!(
+            !keepalive,
+            "keepalive should not be enabled when set to None"
+        );
+        drop(stream);
+        let _ = handle.join();
     }
 
     #[test]
